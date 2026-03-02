@@ -472,8 +472,8 @@ actions:
 
 - Use `KubeExec` when you need the application's running environment (credentials, Unix sockets, etc.)
 - Use `KubeTask` when you need a specific tool image or isolation from the app container
+- If you use kubetask to execute kubectl command first you need an image that include kubectl which is not the case of gcr.io/kasten-images/kanister-tools instead build you own image as explained in [Example Dockerfile](#example-dockerfile). You also need to do it in the kasten-io namespace otherwise the default storage account use by the kubetask won't have the necessary RBAC authorization.
 - Use `KubeOps` to create/patch/delete Kubernetes resources (PVCs, Pods, ConfigMaps, etc.). To run a command against an existing PVC, use `KubeOps` to create a pod with the PVC pre-mounted, `WaitV2` to wait for it to be ready, and `KubeExec` to execute inside it
-
 ---
 
 ## The dump-tool image

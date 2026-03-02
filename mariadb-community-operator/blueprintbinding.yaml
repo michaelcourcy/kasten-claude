@@ -1,0 +1,19 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: mariadb-community-operator-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: mariadb-community-operator-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: k8s.mariadb.com
+              resource: mariadbs
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

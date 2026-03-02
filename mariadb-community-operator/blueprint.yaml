@@ -1,0 +1,108 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: mariadb-community-operator-blueprint
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    # Called by Kasten BEFORE PVC snapshots are initiated.
+    # Starts a background mariadb session that holds FLUSH TABLES WITH READ LOCK
+    # for the duration of the snapshot. The session stays alive via DO SLEEP(3600)
+    # until backupPosthook kills the process. This guarantees the lock is actually
+    # held when Kasten takes the PVC snapshot — not just at flush time.
+    #
+    # Why FLUSH TABLES WITH READ LOCK:
+    #   - InnoDB user tables: crash-consistent via WAL regardless, but the flush
+    #     reduces recovery time by minimising dirty pages.
+    #   - MyISAM system tables (mysql.*): no WAL — the lock is essential to prevent
+    #     partially written system table pages from being captured in the snapshot.
+    # FLUSH LOGS: rotates the binary log to a clean position.
+    phases:
+      - func: KubeExec
+        name: quiesceMariaDB
+        args:
+          namespace: "{{ .Object.metadata.namespace }}"
+          pod: "{{ .Object.metadata.name }}-0"
+          container: mariadb
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              rm -f /tmp/mariadb-lock.pid /tmp/mariadb-lock.log
+              nohup mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" \
+                -e "FLUSH TABLES WITH READ LOCK; FLUSH LOGS; DO SLEEP(3600);" \
+                > /tmp/mariadb-lock.log 2>&1 &
+              LOCK_PID=$!
+              echo "$LOCK_PID" > /tmp/mariadb-lock.pid
+              sleep 2
+              if kill -0 "$LOCK_PID" 2>/dev/null; then
+                echo "Lock acquired (PID=$LOCK_PID)"
+              else
+                echo "ERROR: Failed to acquire lock"
+                cat /tmp/mariadb-lock.log
+                exit 1
+              fi
+
+  restorePrehook:
+    # Called by Kasten BEFORE PVC restore.
+    # The MariaDB operator actively reconciles the StatefulSet, keeping replicas=1.
+    # Kasten cannot scale down the StatefulSet to replace the PVC while the operator
+    # is running — the operator immediately scales it back up.
+    # Solution: delete the MariaDB CR so the operator stops managing the StatefulSet.
+    # The StatefulSet (and pod) are garbage collected. The PVC is released, and Kasten
+    # can then replace it with the snapshot. Kasten then restores the MariaDB CR
+    # manifest; the operator recreates the StatefulSet, which finds the restored PVC.
+    phases:
+      - func: KubeTask
+        name: prepareForRestore
+        # KubeTask MUST run in kasten-io namespace so the pod uses the Kasten
+        # service account, which has permissions to delete custom resources
+        # in any namespace. Running in the app namespace would use a service account
+        # without those cross-namespace permissions.
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              NS="{{ .Object.metadata.namespace }}"
+              NAME="{{ .Object.metadata.name }}"
+              echo "Deleting MariaDB CR $NAME in $NS to release operator control"
+              kubectl delete mariadb "$NAME" -n "$NS" --ignore-not-found=true
+              echo "Waiting for StatefulSet to be deleted"
+              kubectl wait statefulset/"$NAME" -n "$NS" --for=delete --timeout=120s 2>/dev/null || true
+              echo "Waiting for pod to be deleted"
+              kubectl wait pod/"${NAME}-0" -n "$NS" --for=delete --timeout=120s 2>/dev/null || true
+              echo "Waiting for PVC protection finalizer to be released"
+              sleep 5
+              echo "Restore preparation complete"
+
+  backupPosthook:
+    # Called by Kasten AFTER all PVC snapshots are ready.
+    # Kills the background lock-holding process, which closes the mariadb session
+    # and releases the FLUSH TABLES WITH READ LOCK automatically.
+    # UNLOCK TABLES is a safety fallback in case the PID file is missing.
+    phases:
+      - func: KubeExec
+        name: unquiesceMariaDB
+        args:
+          namespace: "{{ .Object.metadata.namespace }}"
+          pod: "{{ .Object.metadata.name }}-0"
+          container: mariadb
+          command:
+            - bash
+            - -c
+            - |
+              if [ -f /tmp/mariadb-lock.pid ]; then
+                LOCK_PID=$(cat /tmp/mariadb-lock.pid)
+                kill "$LOCK_PID" 2>/dev/null && echo "Lock process $LOCK_PID killed" \
+                  || echo "Process already gone"
+                rm -f /tmp/mariadb-lock.pid /tmp/mariadb-lock.log
+              else
+                echo "No PID file found — releasing via SQL"
+              fi
+              mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" -e "UNLOCK TABLES;" 2>/dev/null || true
+              echo "Unquiesce complete"
