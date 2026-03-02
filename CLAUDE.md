@@ -80,8 +80,10 @@ Execute the chosen backup/restore strategy by hand — using `kubectl exec`, `ku
 - Deleting the test data after a backup and then restoring it retrieves the expected records.
 
 Use these primitives to emulate the Kasten environment without a running Kasten instance:
-- **PVC backup**: use a CSI snapshot to emulate what Kasten does to application PVCs. Follow [this example](https://github.com/michaelcourcy/test-csi-snapshot) if you don't know how to create csi snapshot 
+- **PVC backup**: use a CSI snapshot to emulate what Kasten does to application PVCs. Follow [this example](https://github.com/michaelcourcy/test-csi-snapshot) if you don't know how to create csi snapshot. Always make sure that you wait for snapshots to be ready before you test the backupPosthook. 
 - **Object storage**: deploy a MinIO instance in a dedicated namespace to emulate an S3 endpoint (needed for *Use vendor operator data mover* patterns).
+
+
 
 ### Step 4 — Implement the blueprint and document dependencies
 
@@ -94,7 +96,7 @@ Write the Blueprint (and BlueprintBinding if needed). Document all deployment pr
 
 Run a full backup/restore cycle through Kasten:
 - Ensure the workload is bound through the kasten annotation, a blueprintbinding or a policy hook
-- Create a backup policy (without an export) and trigger a runaction.
+- Create a backup policy on demand (without an export) and trigger a runaction.
 - Check in the kanister logs that the blueprint executed as expected, check the status of the runaction is completed
 - Corrupt or delete the test data.
 - Restore from the restore point and verify that:
@@ -179,6 +181,9 @@ You have full autonomy to build container images and push them to the `michaelco
 
 ## Cluster context
 
-Use the current `kubectl` context. The cluster is a dedicated test environment — 
+Use the current `kubectl` context. The cluster is a dedicated test environment —
 treat all namespaces as expendable unless named `kasten-io` or `kube-system`.
 
+### Storage classes
+
+**Always use a storage class that that supports csi snapshot when deploying test workloads that need to be snapshotted by Kasten. For instance the default `gp2` class uses the legacy in-tree driver and will fail with "cannot find CSI PersistentVolumeSource" when a VolumeSnapshot is attempted.
