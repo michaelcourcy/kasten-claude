@@ -82,11 +82,94 @@ docker build --build-arg KASTEN_VERSION=<version> -t michaelcourcy/kasten-tools:
 docker push michaelcourcy/kasten-tools:<version>
 ```
 
+## Deploying the test workload
+
+### 1 — Install mariadb-operator
+
+```bash
+helm repo add mariadb-operator https://helm.mariadb.com/mariadb-operator
+helm repo update
+helm install mariadb-operator mariadb-operator/mariadb-operator \
+  --namespace mariadb-operator --create-namespace \
+  --wait
+```
+
+### 2 — Deploy MariaDB
+
+```bash
+kubectl create namespace mariadb-test
+kubectl apply -f operator/mariadb-root-secret.yaml
+kubectl apply -f operator/mariadb.yaml
+# Wait for the instance to be ready
+kubectl wait mariadb/mariadb -n mariadb-test --for=condition=Ready --timeout=120s
+```
+
+### 3 — Create test data
+
+```bash
+kubectl exec -n mariadb-test mariadb-0 -c mariadb -- bash -c '
+mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" -e "
+  CREATE DATABASE IF NOT EXISTS test;
+  USE test;
+  CREATE TABLE IF NOT EXISTS employees (id INT, name VARCHAR(50), dept VARCHAR(50));
+  INSERT INTO employees VALUES
+    (1, '"'"'Alice'"'"', '"'"'Engineering'"'"'),
+    (2, '"'"'Bob'"'"',   '"'"'Marketing'"'"'),
+    (3, '"'"'Carol'"'"', '"'"'Engineering'"'"');
+  SELECT * FROM employees;
+"'
+```
+
+Expected output:
+```
+id  name   dept
+1   Alice  Engineering
+2   Bob    Marketing
+3   Carol  Engineering
+```
+
+### 4 — Deploy the blueprint and binding
+
+```bash
+kubectl apply -f blueprint.yaml
+kubectl apply -f blueprintbinding.yaml
+```
+
+### 5 — Verify the restore (after backup)
+
+After a restore, re-run the SELECT to confirm data is recovered:
+
+```bash
+kubectl exec -n mariadb-test mariadb-0 -c mariadb -- bash -c '
+mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" -e "USE test; SELECT * FROM employees;"'
+```
+
+## Removing the test workload
+
+```bash
+# Remove the blueprint and binding
+kubectl delete -f blueprintbinding.yaml --ignore-not-found
+kubectl delete -f blueprint.yaml --ignore-not-found
+
+# Delete the MariaDB instance (operator garbage-collects the StatefulSet and pod;
+# the PVC is retained by default — delete it explicitly)
+kubectl delete -f operator/mariadb.yaml --ignore-not-found
+kubectl delete pvc storage-mariadb-0 -n mariadb-test --ignore-not-found
+
+# Delete the namespace and the root-password secret
+kubectl delete namespace mariadb-test --ignore-not-found
+
+# Uninstall mariadb-operator (only if no other MariaDB instances exist in the cluster)
+helm uninstall mariadb-operator -n mariadb-operator
+kubectl delete namespace mariadb-operator --ignore-not-found
+```
+
 ## Files
 
 | File | Description |
 |------|-------------|
-| `operator/` | Helm values and MariaDB CR for the test deployment |
+| `operator/mariadb-root-secret.yaml` | Kubernetes Secret with the MariaDB root password |
+| `operator/mariadb.yaml` | MariaDB CR for the test deployment |
 | `blueprint.yaml` | Kasten Blueprint |
 | `blueprintbinding.yaml` | BlueprintBinding targeting all MariaDB CRs |
 | `images/kasten-tools/Dockerfile` | Dockerfile for `michaelcourcy/kasten-tools` |

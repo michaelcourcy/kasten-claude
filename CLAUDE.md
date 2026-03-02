@@ -72,8 +72,8 @@ The choice must balance implementation complexity (backup **and** restore), and 
 
 Deploy the target application in a test namespace. Create a representative minimum dataset that will let you validate a restore (e.g. a known set of records, files, or keys that you can verify after recovery). For the speed of the development lifecycle this is very important to create a limited dataset (Under 5Kb). Later once the whole blueprint works you can try performance test by increasing the size of the dataset. But this is out of the scope of this activity. 
 
-The way you deploy the workload and how you create test data should be documented in the README.md so tha
-user can test it on their own.
+The way you deploy the workload and how you create test data should be documented in the README.md so that
+user can test it on their own. Also you must describe how to remove the workload and its dependencies.
 
 ### Step 3 — Validate the strategy manually, without a blueprint
 

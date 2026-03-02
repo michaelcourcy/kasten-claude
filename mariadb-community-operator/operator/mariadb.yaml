@@ -1,0 +1,20 @@
+apiVersion: k8s.mariadb.com/v1alpha1
+kind: MariaDB
+metadata:
+  name: mariadb
+  namespace: mariadb-test
+spec:
+  replicas: 1
+  rootPasswordSecretKeyRef:
+    name: mariadb-root-secret
+    key: password
+  storage:
+    size: 1Gi
+    storageClassName: ebs-sc   # must be a CSI storage class — gp2 (in-tree) does not support VolumeSnapshots
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
