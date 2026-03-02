@@ -105,7 +105,8 @@ image name, base image, and what was added in the `README.md`.
 
 Run a full backup/restore cycle through Kasten:
 - Ensure the workload is bound through the kasten annotation, a blueprintbinding or a policy hook
-- Create a backup policy on demand (without an export) and trigger a runaction.
+- Create a backup policy on demand with location profile for Kanister actions (Export Location Profile 
+is optional and useless in this context) and trigger a runaction.
 - Check in the kanister logs that the blueprint executed as expected, check the status of the runaction is completed
 - Corrupt or delete the test data.
 - Restore from the restore point and verify that:
