@@ -93,6 +93,9 @@ Write the Blueprint (and BlueprintBinding if needed). Document all deployment pr
 - Extra operator configuration required (e.g. enabling a backup API, creating a backup user).
 - Extra Helm values or manifests that must be applied before the blueprint works.
 
+**Keep the "Blueprint actions" table in `README.md` in sync with the blueprint YAML at all times.**
+Every action defined in the blueprint (`backupPrehook`, `backupPosthook`, `restorePrehook`, `restorePosthook`, etc.) must have a row in that table describing what it does. No action may exist in the YAML without a corresponding row, and no row may exist without a corresponding action in the YAML.
+
 If a custom container image is needed (e.g. a tool image for `KubeTask`), commit its `Dockerfile`
 in a subdirectory of the blueprint folder: `<blueprint-dir>/images/<image-name>/Dockerfile`.
 **Never reference a custom image in a blueprint without a committed Dockerfile.** Document the

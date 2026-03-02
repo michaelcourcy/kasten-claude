@@ -60,6 +60,7 @@ The blueprint is bound to the **MariaDB custom resource** via a BlueprintBinding
 |--------|-------------|
 | `backupPrehook` | `FLUSH TABLES WITH READ LOCK; FLUSH LOGS;` — quiesces MariaDB |
 | `backupPosthook` | `UNLOCK TABLES;` — unquiesces after Kasten PVC snapshot is ready |
+| `restorePrehook` | Deletes the MariaDB CR so the operator stops reconciling, allowing Kasten to replace the PVC; waits for the StatefulSet to be garbage-collected before restore proceeds |
 
 ## Dependencies
 
