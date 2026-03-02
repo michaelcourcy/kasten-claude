@@ -92,6 +92,11 @@ Write the Blueprint (and BlueprintBinding if needed). Document all deployment pr
 - Extra operator configuration required (e.g. enabling a backup API, creating a backup user).
 - Extra Helm values or manifests that must be applied before the blueprint works.
 
+If a custom container image is needed (e.g. a tool image for `KubeTask`), commit its `Dockerfile`
+in a subdirectory of the blueprint folder: `<blueprint-dir>/images/<image-name>/Dockerfile`.
+**Never reference a custom image in a blueprint without a committed Dockerfile.** Document the
+image name, base image, and what was added in the `README.md`.
+
 ### Step 5 — Test the blueprint end-to-end
 
 Run a full backup/restore cycle through Kasten:
