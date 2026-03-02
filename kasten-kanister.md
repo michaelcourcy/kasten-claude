@@ -456,6 +456,15 @@ actions:
             apiVersion: v1
             resource: pods
             name: "{{ .StatefulSet.Name }}-restore-pod"
+      - func: KubeOps
+        name: deleteRestorePVC
+        args:
+          namespace: "{{ .StatefulSet.Namespace }}"
+          op: delete
+          resource:
+            apiVersion: v1
+            resource: persistentvolumeclaims
+            name: "{{ .StatefulSet.Name }}-dump"
 ```
 
 ---
@@ -468,7 +477,7 @@ actions:
 | `KubeTask` | Spin up a **new temporary pod** with any image to run a command — **cannot mount existing PVCs**; use `KubeOps` + `WaitV2` + `KubeExec` instead |
 | `KubeExecAll` | Run in parallel across **multiple pods/containers** |
 | `KubeOps` | Create, patch, or delete Kubernetes resources (PVCs, ConfigMaps, etc.) |
-| `MultiContainerRun` | Two containers sharing an `emptyDir` volume (generate + export pattern) |
+| `WaitV2` | Wait for a condition to be true on a kubernetes resource |
 
 - Use `KubeExec` when you need the application's running environment (credentials, Unix sockets, etc.)
 - Use `KubeTask` when you need a specific tool image or isolation from the app container
@@ -479,7 +488,7 @@ actions:
 ## The dump-tool image
 
 Wherever a blueprint template shows `<dump-tool-image>`, you need an image that provides:
-- **`kando`** — the Kanister CLI, required for `kando output` (emitting phase outputs) and `kando location` commands. It ships in the official Kasten image `gcr.io/kasten-images/kanister-tools:<kasten-version>`.
+- **`kando`** — the Kanister CLI, required for `kando output` (emitting phase outputs). It ships in the official Kasten image `gcr.io/kasten-images/kanister-tools:<kasten-version>`.
 - **Application-specific dump tools** (e.g. `mongodump`, `pg_dump`, `mysqldump`) added on top.
 
 ### Why build on `kanister-tools`
@@ -561,7 +570,7 @@ We can list the different blueprint patterns observed in the field. We use the w
 - **Example**: no example
 - **Pro**: Database snapshot allows efficient incrementality by appending files at 
 each snapshot
-- **Cons**: only feasible if the database snapshot can run remotely.
+- **Cons**: only feasible if the database snapshot can run remotely. You also need to manage the creation and deletion of the temporary PVC and dump pod.
 - **Filter PVC**: Yes — you can take only the temporary PVC.
 
 ### 4. database dump on a temporary pvc
