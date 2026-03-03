@@ -73,7 +73,11 @@ The choice must balance implementation complexity (backup **and** restore), and 
 Deploy the target application in a test namespace. Create a representative minimum dataset that will let you validate a restore (e.g. a known set of records, files, or keys that you can verify after recovery). For the speed of the development lifecycle this is very important to create a limited dataset (Under 5Kb). Later once the whole blueprint works you can try performance test by increasing the size of the dataset. But this is out of the scope of this activity. 
 
 The way you deploy the workload and how you create test data should be documented in the README.md so that
-user can test it on their own. Also you must describe how to remove the workload and its dependencies.
+user can test it on their own. Also you must describe how to remove the workload and its dependencies. 
+Describe also the deletion of the restorepointcontent created for the clean up :
+```
+kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=<NAMESPACE USED FOR THE TEST>
+```
 
 ### Step 3 — Validate the strategy manually, without a blueprint
 
@@ -101,12 +105,20 @@ in a subdirectory of the blueprint folder: `<blueprint-dir>/images/<image-name>/
 **Never reference a custom image in a blueprint without a committed Dockerfile.** Document the
 image name, base image, and what was added in the `README.md`.
 
+Do not assume that the base image contains jq, yq or kubectl, most of the time you have to add them.
+
 ### Step 5 — Test the blueprint end-to-end
 
 Run a full backup/restore cycle through Kasten:
 - Ensure the workload is bound through the kasten annotation, a blueprintbinding or a policy hook
-- Create a backup policy on demand with location profile for Kanister actions (Export Location Profile 
+- Create a backup policy on demand with location profile for Kanister actions (Export Location Profile
 is optional and useless in this context) and trigger a runaction.
+
+**Never create a Kanister ActionSet directly to test a blueprint.** Kasten sets up the ActionSet
+context differently from a manually created one — for example, `.Namespace.Name` is only populated
+when Kasten invokes a policy hook, not in a hand-crafted ActionSet. A manual ActionSet will
+silently resolve template variables to empty strings, causing incorrect behaviour. Always trigger
+testing through a Kasten RunAction.
 - Check in the kanister logs that the blueprint executed as expected, check the status of the runaction is completed
 - Corrupt or delete the test data.
 - Restore from the restore point and verify that:
