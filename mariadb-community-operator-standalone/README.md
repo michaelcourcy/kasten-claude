@@ -163,6 +163,9 @@ kubectl delete namespace mariadb-test --ignore-not-found
 # Uninstall mariadb-operator (only if no other MariaDB instances exist in the cluster)
 helm uninstall mariadb-operator -n mariadb-operator
 kubectl delete namespace mariadb-operator --ignore-not-found
+
+# Delete the restorepoint content for this namespace 
+kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=mariadb-test
 ```
 
 ## Files

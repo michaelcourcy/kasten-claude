@@ -1,0 +1,115 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: pvc-info-blueprint
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    # Called by Kasten as a policy preHook, before any PVC snapshots are initiated.
+    # Collects name, storage class, capacity, access modes, and bound PV details
+    # (including the CSI volume handle) for every PVC in the namespace, then writes
+    # the result as a YAML file inside a ConfigMap named "pvc-info-snapshot" in the
+    # target namespace.  Because PVCs are excluded from the backup but namespace
+    # resources are not, this ConfigMap is captured in the restore point and gives
+    # teams the information needed to manually re-provision volumes if required.
+    #
+    # Uses only kubectl -o jsonpath and bash built-ins — no jq or python required.
+    phases:
+      - func: KubeTask
+        name: collectPVCInfo
+        # KubeTask MUST run in kasten-io so the pod inherits the Kasten service account,
+        # which has get/list permissions on PVCs and PVs cluster-wide, and can apply
+        # ConfigMaps into any namespace.
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Namespace.Name }}"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              CM_NAME="pvc-info-snapshot"
+              YAML_FILE="/tmp/pvc-info.yaml"
+
+              echo "Collecting PVC/PV information for namespace: $NS"
+
+              printf '%s\n' \
+                "# PVC and PV information snapshot" \
+                "# Captured by Kasten backupPrehook policy hook." \
+                "# Use this to recover volume info when PVCs are excluded from the backup." \
+                "namespace: $NS" \
+                "capturedAt: $TIMESTAMP" \
+                "pvcs:" > "$YAML_FILE"
+
+              PVC_NAMES=$(kubectl get pvc -n "$NS" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+
+              if [ -z "$PVC_NAMES" ]; then
+                printf '  []\n' >> "$YAML_FILE"
+                echo "No PVCs found in namespace $NS"
+              else
+                while IFS= read -r PVC_NAME; do
+                  [ -z "$PVC_NAME" ] && continue
+
+                  STORAGE_CLASS=$(kubectl get pvc "$PVC_NAME" -n "$NS" \
+                    -o jsonpath='{.spec.storageClassName}' 2>/dev/null || echo "none")
+                  PHASE=$(kubectl get pvc "$PVC_NAME" -n "$NS" \
+                    -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+                  REQUESTED=$(kubectl get pvc "$PVC_NAME" -n "$NS" \
+                    -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null || echo "unknown")
+                  CAPACITY=$(kubectl get pvc "$PVC_NAME" -n "$NS" \
+                    -o jsonpath='{.status.capacity.storage}' 2>/dev/null || echo "unknown")
+                  # Collect access modes; jsonpath appends a trailing comma, strip with bash
+                  ACCESS_RAW=$(kubectl get pvc "$PVC_NAME" -n "$NS" \
+                    -o jsonpath='{range .status.accessModes[*]}{@}{","}{end}' 2>/dev/null || true)
+                  ACCESS_MODES="${ACCESS_RAW%,}"
+                  PV_NAME=$(kubectl get pvc "$PVC_NAME" -n "$NS" \
+                    -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
+
+                  printf '  - name: %s\n'             "$PVC_NAME"         >> "$YAML_FILE"
+                  printf '    storageClass: %s\n'     "$STORAGE_CLASS"    >> "$YAML_FILE"
+                  printf '    phase: %s\n'            "$PHASE"            >> "$YAML_FILE"
+                  printf '    requestedStorage: %s\n' "$REQUESTED"        >> "$YAML_FILE"
+                  printf '    capacity: %s\n'         "$CAPACITY"         >> "$YAML_FILE"
+                  printf '    accessModes: [%s]\n'    "$ACCESS_MODES"     >> "$YAML_FILE"
+                  printf '    boundPV: %s\n'          "${PV_NAME:-none}"  >> "$YAML_FILE"
+
+                  if [ -n "$PV_NAME" ]; then
+                    PV_CAP=$(kubectl get pv "$PV_NAME" \
+                      -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || echo "unknown")
+                    RECLAIM=$(kubectl get pv "$PV_NAME" \
+                      -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' 2>/dev/null || echo "unknown")
+                    CSI_DRIVER=$(kubectl get pv "$PV_NAME" \
+                      -o jsonpath='{.spec.csi.driver}' 2>/dev/null || true)
+                    CSI_HANDLE=$(kubectl get pv "$PV_NAME" \
+                      -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null || true)
+
+                    printf '    pv:\n'                               >> "$YAML_FILE"
+                    printf '      name: %s\n'        "$PV_NAME"     >> "$YAML_FILE"
+                    printf '      capacity: %s\n'    "$PV_CAP"      >> "$YAML_FILE"
+                    printf '      reclaimPolicy: %s\n' "$RECLAIM"   >> "$YAML_FILE"
+
+                    if [ -n "$CSI_DRIVER" ]; then
+                      printf '      csi:\n'                                  >> "$YAML_FILE"
+                      printf '        driver: %s\n'      "$CSI_DRIVER"      >> "$YAML_FILE"
+                      printf '        volumeHandle: %s\n' "$CSI_HANDLE"     >> "$YAML_FILE"
+                    fi
+                  fi
+
+                  echo "  Captured: $PVC_NAME -> ${PV_NAME:-none}"
+                done <<< "$PVC_NAMES"
+              fi
+
+              echo "--- Generated YAML ---"
+              cat "$YAML_FILE"
+              echo "----------------------"
+
+              # Create or update the ConfigMap (idempotent via apply)
+              kubectl create configmap "$CM_NAME" \
+                -n "$NS" \
+                --from-file=pvc-info.yaml="$YAML_FILE" \
+                --dry-run=client -o yaml | kubectl apply -f -
+
+              echo "ConfigMap '$CM_NAME' created/updated in namespace $NS"
