@@ -97,6 +97,17 @@ Write the Blueprint (and BlueprintBinding if needed). Document all deployment pr
 - Extra operator configuration required (e.g. enabling a backup API, creating a backup user).
 - Extra Helm values or manifests that must be applied before the blueprint works.
 
+**Always include a versions table** in the `README.md` documenting the exact versions used when the blueprint was developed and tested. Blueprint behaviour is often version-sensitive (operator APIs change, database backup semantics differ across releases). The table must cover at minimum:
+
+| Component | Version |
+|---|---|
+| Kubernetes | e.g. `1.32` (EKS) |
+| Kasten | e.g. `8.5.2` |
+| Operator / Helm chart | e.g. `mariadb-operator 25.10.4` |
+| Database / Application | e.g. `MariaDB 11.8.5` |
+
+Omit the operator row for workloads deployed without an operator (plain Helm chart only).
+
 **Keep the "Blueprint actions" table in `README.md` in sync with the blueprint YAML at all times.**
 Every action defined in the blueprint (`backupPrehook`, `backupPosthook`, `restorePrehook`, `restorePosthook`, etc.) must have a row in that table describing what it does. No action may exist in the YAML without a corresponding row, and no row may exist without a corresponding action in the YAML.
 

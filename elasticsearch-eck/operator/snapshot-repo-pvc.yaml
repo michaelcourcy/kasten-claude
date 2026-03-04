@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: elasticsearch-snapshot-repo
+  namespace: elasticsearch-test
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  # Must be a RWX storage class that supports CSI snapshots.
+  # Replace with the appropriate class for your environment.
+  storageClassName: nfs-csi-1

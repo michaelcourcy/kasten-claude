@@ -1,0 +1,293 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: elasticsearch-eck-blueprint
+  namespace: kasten-io
+actions:
+
+  backupPrehook:
+    # Called by Kasten BEFORE PVC snapshots are initiated.
+    # Phase 1 (WaitV2): Wait for the Elasticsearch cluster to reach Ready/healthy state.
+    # Phase 2 (KubeTask): Register the filesystem snapshot repository at /mnt/snapshot-repo
+    #   (permanent RWX PVC mounted on all ES nodes — registration is idempotent), delete
+    #   the previous kasten-snapshot for idempotency, take a new ES native snapshot of
+    #   user indices only ("*,-.*" excludes system indices starting with "."), and wait
+    #   for completion. Kasten then CSI-snapshots all PVCs including the repo PVC.
+    #
+    # KubeTask runs in the APPLICATION namespace: all operations are curl calls to the
+    # Elasticsearch HTTP API (no kubectl). Running in the app namespace avoids potential
+    # network policy restrictions on cross-namespace traffic to the ES service.
+    phases:
+      - func: WaitV2
+        name: waitForESReady
+        args:
+          timeout: 10m
+          conditions:
+            anyOf:
+              - condition: '{{ if and (or (eq .status.health "green") (eq .status.health "yellow")) (eq .status.phase "Ready") }}true{{ else }}false{{ end }}'
+                objectReference:
+                  apiVersion: v1
+                  group: elasticsearch.k8s.elastic.co
+                  resource: elasticsearches
+                  name: "{{ .Object.metadata.name }}"
+                  namespace: "{{ .Object.metadata.namespace }}"
+      - func: KubeTask
+        name: esSnapshot
+        objects:
+          esSecret:
+            kind: Secret
+            name: "{{ .Object.metadata.name }}-es-elastic-user"
+            namespace: "{{ .Object.metadata.namespace }}"
+        args:
+          # Run in app namespace: only curl calls to the ES service (no kubectl needed).
+          # Avoids cross-namespace network policy issues.
+          namespace: "{{ .Object.metadata.namespace }}"
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NAME="{{ .Object.metadata.name }}"
+              ES_URL="https://${NAME}-es-http.{{ .Object.metadata.namespace }}.svc:9200"
+              ES_PASS='{{ index .Phases.esSnapshot.Secrets.esSecret.Data "elastic" | toString }}'
+
+              echo "=== Elasticsearch backup prehook: taking native snapshot ==="
+
+              # Register the filesystem repository — idempotent (safe to re-register)
+              echo "Registering snapshot repository at /mnt/snapshot-repo"
+              curl -sk -u "elastic:${ES_PASS}" -X PUT \
+                "${ES_URL}/_snapshot/kasten-repo" \
+                -H 'Content-Type: application/json' \
+                -d '{"type": "fs", "settings": {"location": "/mnt/snapshot-repo"}}' \
+                | jq -c .
+
+              # Delete the previous snapshot if it exists (idempotency for retries).
+              # Note: ?ignore_unavailable=true is NOT a valid parameter for the snapshot DELETE API
+              # in ES 8.x. Instead, capture the response and only ignore snapshot_missing_exception.
+              echo "Deleting previous kasten-snapshot if present"
+              DEL=$(curl -sk -u "elastic:${ES_PASS}" -X DELETE \
+                "${ES_URL}/_snapshot/kasten-repo/kasten-snapshot")
+              ERR_TYPE=$(echo "${DEL}" | jq -r '.error.type // ""')
+              if [ -n "${ERR_TYPE}" ] && [ "${ERR_TYPE}" != "snapshot_missing_exception" ]; then
+                echo "ERROR: Failed to delete snapshot: ${DEL}"
+                exit 1
+              fi
+              echo "Previous snapshot deleted (or did not exist)"
+
+              # Take a new snapshot of user indices only.
+              # "*,-.*" means all indices except those starting with "." (system/internal
+              # indices such as .ds-ilm-history-*, .security-*, .kibana-*). Excluding
+              # them avoids restoring outdated system state on top of the running cluster.
+              echo "Taking Elasticsearch snapshot (user indices only, wait_for_completion=true)"
+              SNAP=$(curl -sk -u "elastic:${ES_PASS}" -X PUT \
+                "${ES_URL}/_snapshot/kasten-repo/kasten-snapshot?wait_for_completion=true" \
+                -H 'Content-Type: application/json' \
+                -d '{"indices": "*,-.*", "ignore_unavailable": true, "include_global_state": false}')
+
+              STATE=$(echo "${SNAP}" | jq -r '.snapshot.state // "unknown"')
+              echo "Snapshot state  : ${STATE}"
+              echo "Snapshot indices: $(echo "${SNAP}" | jq -c '.snapshot.indices')"
+              echo "Snapshot shards : $(echo "${SNAP}" | jq -c '.snapshot.shards')"
+
+              if [ "${STATE}" != "SUCCESS" ]; then
+                echo "ERROR: Snapshot did not complete successfully"
+                exit 1
+              fi
+              echo "=== ES native snapshot completed successfully ==="
+
+  backupPosthook:
+    # Called by Kasten AFTER all PVC snapshots are ready.
+    # Logs the final status of the ES snapshot now captured in the restore point.
+    # KubeTask runs in the app namespace (curl-only, no kubectl).
+    phases:
+      - func: KubeTask
+        name: esSnapshotStatus
+        objects:
+          esSecret:
+            kind: Secret
+            name: "{{ .Object.metadata.name }}-es-elastic-user"
+            namespace: "{{ .Object.metadata.namespace }}"
+        args:
+          namespace: "{{ .Object.metadata.namespace }}"
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              NAME="{{ .Object.metadata.name }}"
+              ES_URL="https://${NAME}-es-http.{{ .Object.metadata.namespace }}.svc:9200"
+              ES_PASS='{{ index .Phases.esSnapshotStatus.Secrets.esSecret.Data "elastic" | toString }}'
+
+              echo "=== Elasticsearch backup posthook: verifying final snapshot status ==="
+              curl -sk -u "elastic:${ES_PASS}" \
+                "${ES_URL}/_snapshot/kasten-repo/kasten-snapshot" | \
+                jq -c '.snapshots[0] | {state, indices, shards}'
+              echo "=== Kasten has captured all PVCs including the snapshot repo PVC ==="
+
+  restorePrehook:
+    # Called by Kasten BEFORE PVC restore.
+    # NOTE: As of Kasten 8.5.x there is a known bug where restorePrehook is never
+    # triggered by the executor (the phase runs as a no-op). The code below is correct
+    # and will work once the bug is fixed. See the open support case for details.
+    #
+    # The ECK operator continuously reconciles Elasticsearch StatefulSets. Without
+    # intervention, ECK would immediately recreate pods after Kasten scales them down,
+    # blocking PVC replacement.
+    # Solution: add the ECK pause annotation to stop reconciliation, then scale down
+    # all Elasticsearch StatefulSets so Kasten can safely replace PVC contents.
+    # KubeTask runs in kasten-io: uses kubectl for cross-namespace CR annotation and
+    # StatefulSet scaling — requires the Kasten service account RBAC permissions.
+    phases:
+      - func: KubeTask
+        name: pauseECK
+        args:
+          # Run in kasten-io: uses kubectl to patch CRs and scale StatefulSets.
+          # Kasten service account has the required cluster-wide RBAC permissions.
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              NAME="{{ .Object.metadata.name }}"
+
+              echo "=== Elasticsearch restore prehook: pausing ECK operator ==="
+
+              # Pause ECK reconciliation for this Elasticsearch CR
+              kubectl annotate elasticsearches.elasticsearch.k8s.elastic.co "${NAME}" \
+                -n "${NS}" common.k8s.elastic.co/pause=true --overwrite
+              echo "ECK reconciliation paused for ${NAME} in ${NS}"
+
+              # Scale down all Elasticsearch StatefulSets to release PVCs
+              echo "Scaling down Elasticsearch StatefulSets"
+              kubectl scale statefulset -n "${NS}" \
+                -l "elasticsearch.k8s.elastic.co/cluster-name=${NAME}" \
+                --replicas=0
+
+              # Wait for all pods to terminate (ignore if already gone)
+              echo "Waiting for all Elasticsearch pods to terminate"
+              kubectl wait pod -n "${NS}" \
+                -l "elasticsearch.k8s.elastic.co/cluster-name=${NAME}" \
+                --for=delete --timeout=180s 2>/dev/null || true
+
+              echo "=== Restore preparation complete: all ES pods terminated ==="
+
+  restorePosthook:
+    # Called by Kasten AFTER PVC restore.
+    # Phase 1 (KubeTask, kasten-io): Remove the ECK pause annotation so ECK resumes
+    #   reconciliation and scales Elasticsearch back to the desired replica count.
+    # Phase 2 (WaitV2): Wait for the Elasticsearch cluster to be healthy again.
+    # Phase 3 (KubeTask, app namespace): Register the snapshot repository (idempotent),
+    #   close existing user indices (so ES can overwrite them), and run an ES native
+    #   restore from kasten-snapshot. The snapshot only contains user indices ("*,-.*"),
+    #   so no filtering is needed — all snapshot indices are restored.
+    phases:
+      - func: KubeTask
+        name: resumeECK
+        args:
+          # Run in kasten-io: uses kubectl to remove the CR annotation.
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              NAME="{{ .Object.metadata.name }}"
+
+              echo "=== Elasticsearch restore posthook phase 1: resuming ECK ==="
+
+              # Remove the pause annotation so ECK resumes reconciliation.
+              # ECK will scale StatefulSets back to the count defined in the CR.
+              kubectl annotate elasticsearches.elasticsearch.k8s.elastic.co "${NAME}" \
+                -n "${NS}" 'common.k8s.elastic.co/pause-' --overwrite 2>/dev/null || \
+              kubectl annotate elasticsearches.elasticsearch.k8s.elastic.co "${NAME}" \
+                -n "${NS}" 'common.k8s.elastic.co/pause-' 2>/dev/null || true
+              echo "ECK reconciliation resumed for ${NAME}"
+
+      - func: WaitV2
+        name: waitForESRestored
+        args:
+          timeout: 15m
+          conditions:
+            anyOf:
+              - condition: '{{ if and (or (eq .status.health "green") (eq .status.health "yellow")) (eq .status.phase "Ready") }}true{{ else }}false{{ end }}'
+                objectReference:
+                  apiVersion: v1
+                  group: elasticsearch.k8s.elastic.co
+                  resource: elasticsearches
+                  name: "{{ .Object.metadata.name }}"
+                  namespace: "{{ .Object.metadata.namespace }}"
+
+      - func: KubeTask
+        name: esRestore
+        objects:
+          esSecret:
+            kind: Secret
+            name: "{{ .Object.metadata.name }}-es-elastic-user"
+            namespace: "{{ .Object.metadata.namespace }}"
+        args:
+          # Run in app namespace: curl-only calls to the ES service, no kubectl.
+          namespace: "{{ .Object.metadata.namespace }}"
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NAME="{{ .Object.metadata.name }}"
+              ES_URL="https://${NAME}-es-http.{{ .Object.metadata.namespace }}.svc:9200"
+              ES_PASS='{{ index .Phases.esRestore.Secrets.esSecret.Data "elastic" | toString }}'
+
+              echo "=== Elasticsearch restore posthook phase 3: ES native restore ==="
+
+              # Register the snapshot repository — idempotent
+              echo "Registering snapshot repository on restored repo PVC"
+              curl -sk -u "elastic:${ES_PASS}" -X PUT \
+                "${ES_URL}/_snapshot/kasten-repo" \
+                -H 'Content-Type: application/json' \
+                -d '{"type": "fs", "settings": {"location": "/mnt/snapshot-repo"}}' \
+                | jq -c .
+
+              # Get the list of indices in the snapshot (all user indices, no system ones)
+              echo "Getting index list from kasten-snapshot"
+              SNAP_INDICES=$(curl -sk -u "elastic:${ES_PASS}" \
+                "${ES_URL}/_snapshot/kasten-repo/kasten-snapshot" | \
+                jq -r '.snapshots[0].indices[]?' | tr '\n' ',' | sed 's/,$//' || echo "")
+              echo "Snapshot indices: ${SNAP_INDICES:-none}"
+
+              if [ -n "${SNAP_INDICES}" ]; then
+                # Close each index so ES restore can overwrite it.
+                # Elasticsearch restore requires target indices to be closed (not open).
+                echo "Closing existing indices before restore"
+                for IDX in $(echo "${SNAP_INDICES}" | tr ',' '\n'); do
+                  echo "  Closing index: ${IDX}"
+                  curl -sk -u "elastic:${ES_PASS}" -X POST \
+                    "${ES_URL}/${IDX}/_close?ignore_unavailable=true" > /dev/null 2>&1 || true
+                done
+
+                # Run ES native restore from kasten-snapshot (synchronous).
+                # The snapshot only contains user indices (captured with "*,-.*"),
+                # so all snapshot indices are restored with no additional filtering.
+                echo "Running ES native restore from kasten-snapshot"
+                RESTORE=$(curl -sk -u "elastic:${ES_PASS}" -X POST \
+                  "${ES_URL}/_snapshot/kasten-repo/kasten-snapshot/_restore?wait_for_completion=true" \
+                  -H 'Content-Type: application/json' \
+                  -d '{"ignore_unavailable": true, "include_global_state": false}')
+                echo "Restore result: $(echo "${RESTORE}" | jq -c .snapshot)"
+
+                FAILED=$(echo "${RESTORE}" | jq '.snapshot.shards.failed // 1')
+                if [ "${FAILED}" != "0" ]; then
+                  echo "ERROR: Some shards failed to restore"
+                  exit 1
+                fi
+                echo "ES native restore completed for indices: ${SNAP_INDICES}"
+              else
+                echo "No indices found in snapshot — nothing to restore"
+              fi
+
+              echo "=== Elasticsearch restore posthook complete ==="

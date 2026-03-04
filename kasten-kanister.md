@@ -111,7 +111,7 @@ The context object is the Kubernetes resource the blueprint is bound to:
 | `.Phases.<phaseName>.Secrets.<objName>.Data.<key>` | Secret value — declared via `objects` at phase level |
 | `.Phases.<phaseName>.ConfigMaps.<objName>.Data.<key>` | ConfigMap value — declared via `objects` at phase level |
 | `.Phases.<name>.Output.<key>` | Output from a previous phase **within the same action execution** |
-| `.ArtifactsIn.<artifactName>.KeyValue.<key>` | Artifact value passed from a backup action — only available in restore actions (`restorePrehook`, `restore`, `restorePosthook`) via `inputArtifactNames` |
+| `.ArtifactsIn.<artifactName>.KeyValue.<key>` | Artifact value passed from a backup action — only available in restore actions and delete actions (`restorePrehook`, `restore`, `restorePosthook`) via `inputArtifactNames` |
 
 In the Kasten context, Secrets and ConfigMaps are declared under an `objects` field **at the phase level**, not at the action level. Kasten resolves the object at runtime using the template expression for `name` and `namespace`:
 
@@ -477,11 +477,13 @@ actions:
 | `KubeTask` | Spin up a **new temporary pod** with any image to run a command — **cannot mount existing PVCs**; use `KubeOps` + `WaitV2` + `KubeExec` instead |
 | `KubeExecAll` | Run in parallel across **multiple pods/containers** |
 | `KubeOps` | Create, patch, or delete Kubernetes resources (PVCs, ConfigMaps, etc.) |
-| `WaitV2` | Wait for a condition to be true on a kubernetes resource |
+| `WaitV2` | Wait for a condition to be true on a kubernetes resource. The condition is a Go template evaluated against the **full resource object** (not just `.status`). Use `.status.<field>` notation to access status fields. Verify the correct syntax with: `kubectl get <resource> -n <ns> <name> -o go-template='<condition>'` — it should return `true` when the condition is met. Example for Elasticsearch: `{{ if and (or (eq .status.health "green") (eq .status.health "yellow")) (eq .status.phase "Ready") }}true{{ else }}false{{ end }}`. **`objectReference` format**: `apiVersion` is the version ONLY (e.g. `v1`), NOT the combined `group/version`. For CRDs, provide the API group separately in the `group` field. Example for a core resource (`apps/v1 deployments`): `apiVersion: v1, group: apps`. Example for a CRD (`elasticsearch.k8s.elastic.co/v1 elasticsearches`): `apiVersion: v1, group: elasticsearch.k8s.elastic.co`. Core resources (Pods, PVCs, etc.) have no group: `apiVersion: v1` with no `group` field. |
 
 - Use `KubeExec` when you need the application's running environment (credentials, Unix sockets, etc.)
 - Use `KubeTask` when you need a specific tool image or isolation from the app container
-- If you use kubetask to execute kubectl command first you need an image that include kubectl which is not the case of gcr.io/kasten-images/kanister-tools instead build you own image as explained in [Example Dockerfile](#example-dockerfile). You also need to do it in the kasten-io namespace otherwise the default storage account use by the kubetask won't have the necessary RBAC authorization.
+- **KubeTask namespace choice** — two distinct rules:
+  - **`kubectl` operations** (patching CRs, scaling StatefulSets, managing resources across namespaces): run the KubeTask in the **`kasten-io` namespace**. The pod inherits the Kasten service account which has cluster-wide RBAC permissions. The base `gcr.io/kasten-images/kanister-tools` image does NOT include `kubectl` — you must build a custom image that adds it (see [Example Dockerfile](#example-dockerfile)).
+  - **Network calls to in-cluster services** (curl to a database HTTP API, gRPC, etc.): run the KubeTask in the **application namespace** (`{{ .Object.metadata.namespace }}`). Network policies may restrict cross-namespace traffic; running in the same namespace as the target service avoids policy violations. No special RBAC is needed for network calls.
 - Use `KubeOps` to create/patch/delete Kubernetes resources (PVCs, Pods, ConfigMaps, etc.). To run a command against an existing PVC, use `KubeOps` to create a pod with the PVC pre-mounted, `WaitV2` to wait for it to be ready, and `KubeExec` to execute inside it
 ---
 
@@ -637,7 +639,57 @@ You have to change the workload configuration to introduce the permanent PVC
 - **Cons**: You lose control of the data mover and Kasten is no longer responsible for backup immutability, unless the vendor stores the backup in a PVC (e.g. the Ansible Automation Platform operator).
 - **Filter PVC**: No PVC is involved unless the vendor creates a dedicated backup PVC.
 
+## Use delete action when using pattern 9 and 10
 
+In patterns 9 and 10, Kasten is no longer the data mover. When Kasten deletes a restore point, it
+does **not** automatically clean up the external backup that was created by the blueprint (e.g. an
+RDS snapshot, an Atlas backup, a CNPG `Backup` CR). To clean up the external backup, implement a
+`delete` action in the blueprint. Kasten calls it automatically when the restore point is deleted.
+
+### How the delete action receives the backup identifier
+
+The `backup` (or `backupPrehook` / `backupPosthook`) action must emit the external backup identifier
+into the restore point using `outputArtifacts`. The `delete` action then retrieves it via
+`inputArtifactNames` and `.ArtifactsIn.<artifactName>.KeyValue.<key>`.
+
+```yaml
+actions:
+  backup:
+    outputArtifacts:
+      externalBackup:
+        keyValue:
+          backupId: "{{ .Phases.triggerBackup.Output.backupId }}"
+    phases:
+      - func: KubeTask
+        name: triggerBackup
+        args:
+          # ... trigger external backup and emit its ID:
+          # kando output backupId <id>
+
+  delete:
+    inputArtifactNames:
+      - externalBackup
+    phases:
+      - func: KubeTask
+        name: deleteExternalBackup
+        args:
+          namespace: "{{ .Namespace.Name }}"
+          image: <tool-image>
+          command:
+            - bash
+            - -c
+            - |
+              BACKUP_ID="{{ .ArtifactsIn.externalBackup.KeyValue.backupId }}"
+              # call external API to delete the backup identified by BACKUP_ID
+```
+
+### Execution context for the delete action
+
+The `delete` action does **not** run in the context of the original application object — that object
+may have been deleted long before the restore point is retired. Instead, it runs in the Kasten
+namespace context. Use `{{ .Namespace.Name }}` to refer to the Kasten namespace (works whether
+Kasten is installed in `kasten-io` or any other namespace), and run KubeTask phases in that same
+namespace.
  
 ## References
 

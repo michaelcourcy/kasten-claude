@@ -1,5 +1,12 @@
 # PVC Info Blueprint
 
+## Tested versions
+
+| Component | Version |
+|---|---|
+| Kubernetes | 1.32 (EKS) |
+| Kasten | 8.5.2 |
+
 ## Purpose
 
 Some teams configure Kasten backup policies to **exclude PVCs** from namespace backups

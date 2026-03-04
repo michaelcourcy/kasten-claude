@@ -1,0 +1,49 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: elasticsearch-sample
+  namespace: elasticsearch-test
+spec:
+  version: 8.17.0
+  nodeSets:
+    - name: default
+      # 3 nodes: all mount the same snapshot-repo PVC (ReadWriteMany).
+      # A single-node cluster could use ReadWriteOnce, but 3 nodes is used
+      # here to validate the multi-node scenario that requires RWX.
+      count: 3
+      config:
+        # Required for the filesystem snapshot repository.
+        # All nodes must have this path configured at startup.
+        path.repo:
+          - /mnt/snapshot-repo
+        # Disable memory-mapped files (required on many Kubernetes nodes
+        # where vm.max_map_count cannot be increased).
+        node.store.allow_mmap: false
+      podTemplate:
+        spec:
+          volumes:
+            - name: snapshot-repo
+              persistentVolumeClaim:
+                claimName: elasticsearch-snapshot-repo
+          containers:
+            - name: elasticsearch
+              volumeMounts:
+                - name: snapshot-repo
+                  mountPath: /mnt/snapshot-repo
+              resources:
+                requests:
+                  memory: 1Gi
+                  cpu: 500m
+                limits:
+                  memory: 2Gi
+                  cpu: 1
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+            storageClassName: ebs-sc

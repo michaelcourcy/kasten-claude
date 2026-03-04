@@ -1,5 +1,14 @@
 # Kasten Blueprint — MariaDB Community Operator (Standalone)
 
+## Tested versions
+
+| Component | Version |
+|---|---|
+| Kubernetes | 1.32 (EKS) |
+| Kasten | 8.5.2 |
+| mariadb-operator (Helm chart) | 25.10.4 |
+| MariaDB | 11.8.5 |
+
 ## Scope
 
 This blueprint targets **standalone MariaDB instances** (replicas: 1) managed by the
