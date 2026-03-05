@@ -628,7 +628,7 @@ You have to change the workload configuration to introduce the permanent PVC
 - **Principle**: Bind the blueprint to a Secret that provides connection information for a managed database, invoke an external API to create a backup, and store the backup identifier in the restore point alongside the Secret manifest.
 - **Example**: [RDS](https://github.com/kanisterio/blueprints/tree/main/aws-rds-postgres), [Firestore](https://github.com/michaelcourcy/kasten-firestore) or [MongoDB Atlas](https://github.com/kanisterio/blueprints/tree/main/mongodb-atlas)
 - **Pro**: All backup complexity is handed off to the cloud provider.
-- **Cons**: You lose control of the data mover and Kasten is no longer responsible for backup immutability.
+- **Cons**: You lose control of the data mover and Kasten is no longer responsible for backup immutability. 
 - **Filter PVC**: No PVC is involved.
 
 ### 10. Use vendor operator data mover to handle the backup
@@ -636,7 +636,7 @@ You have to change the workload configuration to introduce the permanent PVC
 - **Principle**: Invoke the vendor operator API to trigger a backup.
 - **Example**: [CNPG](https://github.com/michaelcourcy/kasten-cnpg), [K8ssandra Medusa](https://docs.kasten.io/latest/kanister/k8ssandra/policy/) or [Crunchy Postgres](https://docs.kasten.io/latest/kanister/pgo/logical)
 - **Pro**: All backup complexity is handed off to the operator.
-- **Cons**: You lose control of the data mover and Kasten is no longer responsible for backup immutability, unless the vendor stores the backup in a PVC (e.g. the Ansible Automation Platform operator).
+- **Cons**: You lose control of the data mover and Kasten is no longer responsible for backup immutability, unless the vendor stores the backup in a PVC (e.g. the Ansible Automation Platform operator). Often you need to add specific configuration on each resource and if you copy and paste without paying attention you can get backup collision.
 - **Filter PVC**: No PVC is involved unless the vendor creates a dedicated backup PVC.
 
 ## Use delete action when using pattern 9 and 10
