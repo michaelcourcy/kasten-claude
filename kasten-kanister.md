@@ -63,16 +63,19 @@ A blueprint attached to a high-level custom resource (e.g., an EDB `Cluster`) wi
 > ready when the fix ships. In the meantime, document the equivalent manual steps in each
 > blueprint's `README.md` so operators know what to run before triggering a Kasten restore.
 
-## The backup and restore workflows managed by kasten 
+## The backup and restore workflow managed by kasten 
 
 ### Backup
 
-Owned PVCs means the PVCs owned by the resources on which the blueprint apply.
+Owned PVCs means the PVCs owned by the resources on which the blueprint apply. 
 
-- BackupAction.Prehook
+If the resource blueprint define backup and restore action then only the PVCs manifest 
+are captured but not the data on the PVC.
+
+- BackupAction.Prehook 
 - Resource.backupPrehook 
-- Owned PVCs snapshot start OR Resource.backupHook/Resource.restoreHook starts if defined 
-- Owned PVCs snapshot ready OR Resource.backupHook/Resource.restoreHook finish if defined
+- Owned PVCs snapshot start OR Resource.backupHook starts if defined 
+- Owned PVCs snapshot ready OR Resource.backupHook finish if defined
 - Resource.backupPosthook 
 - BackupAction.Posthook or BackupAction.PosthookError
 
@@ -81,10 +84,10 @@ Owned PVCs means the PVCs owned by the resources on which the blueprint apply.
 - RestoreAction.Prehook
 - Resource.restorePrehook
 - Deletion of Owned PVC 
-- Restore of Owned PVC OR recreation of empty pvc if Resource.backupHook/Resource.restoreHook defined 
+- Restore of Owned PVC OR recreation of empty PVC (manifest only) if Resource.restoreHook defined 
 - Wait for all resource restored (including CR) and all pods ready in the restorepoint
 - Resource.restoreHook executed if defined 
-- resource.restorePostHook
+- Resource.restorePostHook
 - RestoreAction.PostHook or RestoreAction.PostHookError
 
 
