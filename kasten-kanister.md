@@ -77,18 +77,18 @@ are captured but not the data on the PVC.
 - Owned PVCs snapshot start OR Resource.backupHook starts if defined 
 - Owned PVCs snapshot ready OR Resource.backupHook finish if defined
 - Resource.backupPosthook 
-- BackupAction.Posthook or BackupAction.PosthookError
+- BackupAction.posthook or BackupAction.posthookError
 
 ### Restore 
 
-- RestoreAction.Prehook
+- RestoreAction.prehook
 - Resource.restorePrehook
 - Deletion of Owned PVC 
 - Restore of Owned PVC OR recreation of empty PVC (manifest only) if Resource.restoreHook defined 
 - Wait for all resource restored (including CR) and all pods ready in the restorepoint
 - Resource.restoreHook executed if defined 
 - Resource.restorePostHook
-- RestoreAction.PostHook or RestoreAction.PostHookError
+- RestoreAction.postHook or RestoreAction.postHookError
 
 
 ### Assigning a blueprint — Manual annotation
