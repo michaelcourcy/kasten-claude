@@ -52,9 +52,41 @@ A blueprint attached to a high-level custom resource (e.g., an EDB `Cluster`) wi
 |---|---|---|
 | `restorePrehook` | **Before** the attached PVCs are restored | Pre-restore preparation |
 | `restore` | When the blueprint fully manages data movement | Avoid in Kasten context |
-| `restorePosthook` | **After** the PVCs are restored | Post-restore initialization, cache warming |
+| `restorePosthook` | **After** the PVCs are restored and after restore of CR metadata and before the hook.onSuccess or hook.onFailure actions associated with the restore action/policy | Post-restore initialization, cache warming |
 
 > **Any action name other than these six is silently ignored by Kasten.**
+
+> **Known limitation (Kasten ≤ 8.5.x)** — `restorePrehook` is defined in the Kasten
+> specification but is **not yet triggered** by the executor in current releases. The action
+> is silently skipped during restore. Kasten engineering has confirmed this will be implemented
+> in a near-future release. Always implement `restorePrehook` in your blueprints so they are
+> ready when the fix ships. In the meantime, document the equivalent manual steps in each
+> blueprint's `README.md` so operators know what to run before triggering a Kasten restore.
+
+## The backup and restore workflows managed by kasten 
+
+### Backup
+
+Owned PVCs means the PVCs owned by the resources on which the blueprint apply.
+
+- BackupAction.Prehook
+- Resource.backupPrehook 
+- Owned PVCs snapshot start OR Resource.backupHook/Resource.restoreHook starts if defined 
+- Owned PVCs snapshot ready OR Resource.backupHook/Resource.restoreHook finish if defined
+- Resource.backupPosthook 
+- BackupAction.Posthook or BackupAction.PosthookError
+
+### Restore 
+
+- RestoreAction.Prehook
+- Resource.restorePrehook
+- Deletion of Owned PVC 
+- Restore of Owned PVC OR recreation of empty pvc if Resource.backupHook/Resource.restoreHook defined 
+- Wait for all resource restored (including CR) and all pods ready in the restorepoint
+- Resource.restoreHook executed if defined 
+- resource.restorePostHook
+- RestoreAction.PostHook or RestoreAction.PostHookError
+
 
 ### Assigning a blueprint — Manual annotation
 

@@ -19,7 +19,7 @@ Kasten only recognises these six names. Any other action name is silently ignore
 | `backupPrehook` | Before PVC snapshots are initiated| Quiesce, or create dump PVC |
 | `backup` | Blueprint manages data movement | **Avoid** — use PVC snapshots |
 | `backupPosthook` | After PVC snapshots are ready | Unquiesce, or delete dump PVC |
-| `restorePrehook` | Before PVC restore | Pre-restore preparation |
+| `restorePrehook` | Before PVC restore | Pre-restore preparation (**not yet triggered** in Kasten ≤ 8.5.x — always implement for when the fix ships; document manual steps in `README.md`) |
 | `restore` | Blueprint manages data movement | **Avoid** |
 | `restorePosthook` | After PVC restore | Post-restore init, cache warming |
 
@@ -107,6 +107,8 @@ Write the Blueprint (and BlueprintBinding if needed). Document all deployment pr
 | Database / Application | e.g. `MariaDB 11.8.5` |
 
 Omit the operator row for workloads deployed without an operator (plain Helm chart only).
+
+**`restorePrehook` is not yet triggered in Kasten ≤ 8.5.x.** Always implement it in the blueprint (for forward compatibility), and add a prominent warning section in the `README.md` with the equivalent manual steps the operator must run before triggering a Kasten restore until the fix ships.
 
 **Keep the "Blueprint actions" table in `README.md` in sync with the blueprint YAML at all times.**
 Every action defined in the blueprint (`backupPrehook`, `backupPosthook`, `restorePrehook`, `restorePosthook`, etc.) must have a row in that table describing what it does. No action may exist in the YAML without a corresponding row, and no row may exist without a corresponding action in the YAML.

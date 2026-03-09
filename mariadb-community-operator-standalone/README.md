@@ -71,6 +71,43 @@ The blueprint is bound to the **MariaDB custom resource** via a BlueprintBinding
 | `backupPosthook` | `UNLOCK TABLES;` — unquiesces after Kasten PVC snapshot is ready |
 | `restorePrehook` | Deletes the MariaDB CR so the operator stops reconciling, allowing Kasten to replace the PVC; waits for the StatefulSet to be garbage-collected before restore proceeds |
 
+## Known limitation — `restorePrehook` not yet triggered (Kasten ≤ 8.5.x)
+
+> **Warning**: As of Kasten 8.5.x, the `restorePrehook` blueprint action is defined but
+> **never triggered** by the Kasten executor during restore. Kasten engineering has confirmed
+> this will be fixed in a near-future release. The `restorePrehook` is implemented in the
+> blueprint so it will work automatically once the fix ships.
+>
+> Until then, **run the steps below manually before triggering a Kasten restore** for this
+> namespace. Failing to do so will leave the MariaDB operator running while Kasten tries to
+> replace the PVC. The operator will immediately recreate the PVC after Kasten deletes it,
+> causing the restore to time out.
+
+### Manual pre-restore steps (required until the fix ships)
+
+Replace `mariadb-test` and `mariadb` with your actual namespace and MariaDB CR name:
+
+```bash
+# Delete the MariaDB CR so the operator stops reconciling the StatefulSet.
+# Kasten will restore the CR manifest; the operator will then recreate the
+# StatefulSet against the restored PVC.
+kubectl delete mariadb mariadb -n mariadb-test --ignore-not-found=true
+
+# Wait for the StatefulSet and pod to be fully deleted before triggering restore
+kubectl wait statefulset/mariadb -n mariadb-test --for=delete --timeout=120s 2>/dev/null || true
+kubectl wait pod/mariadb-0 -n mariadb-test --for=delete --timeout=120s 2>/dev/null || true
+
+# Small grace period for PVC finalizer release
+sleep 5
+echo "Ready — trigger the Kasten restore now."
+```
+
+Once these commands complete, trigger the Kasten restore. After the restore point is applied,
+Kasten restores the MariaDB CR manifest and the operator recreates the StatefulSet against
+the restored PVC automatically.
+
+---
+
 ## Dependencies
 
 - mariadb-operator installed in the cluster (Helm chart `mariadb-operator/mariadb-operator`)

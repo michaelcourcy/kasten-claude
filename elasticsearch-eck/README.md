@@ -77,6 +77,44 @@ the appropriate class for your environment.
 | `restorePrehook` | Annotates the Elasticsearch CR with `common.k8s.elastic.co/pause: "true"` to halt ECK reconciliation; scales down all Elasticsearch StatefulSets so Kasten can safely replace PVC contents |
 | `restorePosthook` | Removes the pause annotation to resume ECK reconciliation; waits for the cluster to reach green or yellow health; registers the snapshot repository on the restored repo PVC; closes existing indices; runs ES native restore from `kasten-snapshot`; waits for completion |
 
+## Known limitation — `restorePrehook` not yet triggered (Kasten ≤ 8.5.x)
+
+> **Warning**: As of Kasten 8.5.x, the `restorePrehook` blueprint action is defined but
+> **never triggered** by the Kasten executor during restore. Kasten engineering has confirmed
+> this will be fixed in a near-future release. The `restorePrehook` is implemented in the
+> blueprint so it will work automatically once the fix ships.
+>
+> Until then, **run the steps below manually before triggering a Kasten restore** for this
+> namespace. Failing to do so will leave the ECK operator running while Kasten tries to
+> replace the PVCs. ECK will immediately recreate pods, blocking PVC replacement and causing
+> the restore to fail.
+
+### Manual pre-restore steps (required until the fix ships)
+
+Replace `elasticsearch-test` and `elasticsearch-sample` with your actual namespace and
+Elasticsearch CR name:
+
+```bash
+# Pause ECK reconciliation so the operator stops managing the StatefulSets
+kubectl annotate elasticsearches.elasticsearch.k8s.elastic.co elasticsearch-sample \
+  -n elasticsearch-test common.k8s.elastic.co/pause=true --overwrite
+
+# Scale down all Elasticsearch StatefulSets to release PVCs for replacement
+kubectl scale statefulset -n elasticsearch-test \
+  -l "elasticsearch.k8s.elastic.co/cluster-name=elasticsearch-sample" \
+  --replicas=0
+
+# Wait for all pods to terminate before triggering the Kasten restore
+kubectl wait pod -n elasticsearch-test \
+  -l "elasticsearch.k8s.elastic.co/cluster-name=elasticsearch-sample" \
+  --for=delete --timeout=180s 2>/dev/null || true
+
+echo "Ready — trigger the Kasten restore now."
+```
+
+Once these commands complete, trigger the Kasten restore. The `restorePosthook` will
+remove the pause annotation and resume ECK reconciliation automatically.
+
 ---
 
 ## Prerequisites
