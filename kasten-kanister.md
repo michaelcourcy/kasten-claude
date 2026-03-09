@@ -67,7 +67,7 @@ A blueprint attached to a high-level custom resource (e.g., an EDB `Cluster`) wi
 
 ### Backup
 
-Owned PVCs means the PVCs owned by the resources on which the blueprint apply. 
+Owned PVCs means the PVCs owned by the resource on which the blueprint apply. 
 
 If the resource blueprint define backup and restore action then only the PVCs manifest 
 are captured but not the data on the PVC.
