@@ -77,7 +77,7 @@ are captured but not the data on the PVC.
 - Owned PVCs snapshot start OR Resource.backupHook starts if defined 
 - Owned PVCs snapshot ready OR Resource.backupHook finish if defined
 - Resource.backupPosthook 
-- BackupAction.posthook or BackupAction.posthookError
+- BackupAction.postHook or BackupAction.postHookError
 
 ### Restore 
 
