@@ -177,7 +177,7 @@ This is useful when a restore action needs information that was only known at ba
 ```yaml
 actions:
   backupPrehook:
-    type: StatefulSet
+    
     outputArtifacts:
       appMeta:
         keyValue:
@@ -189,7 +189,7 @@ actions:
           # ... phase that emits dbName via: kando output dbName <value>
 
   restorePosthook:
-    type: StatefulSet
+    
     inputArtifactNames:
       - appMeta
     phases:
@@ -257,7 +257,7 @@ metadata:
   namespace: kasten-io
 actions:
   backupPrehook:
-    type: StatefulSet
+    
     phases:
       - func: KubeExec
         name: quiesceApp
@@ -275,7 +275,7 @@ actions:
 
   backupPosthook:
     # Called by Kasten after all PVC snapshots are ready.
-    type: StatefulSet
+    
     phases:
       - func: KubeExec
         name: unquiesceApp
@@ -286,7 +286,7 @@ actions:
           command: [sh, -c, "<unquiesce command>"]
 
   restorePosthook:
-    type: StatefulSet
+    
     phases:
       - func: KubeExec
         name: postRestoreInit
@@ -307,7 +307,7 @@ metadata:
   namespace: kasten-io
 actions:
   backupPrehook:
-    type: StatefulSet
+    
     phases:
       # Idempotent cleanup: remove any pod/PVC left over from a previous failed
       # run so that the create steps below don't fail on already-existing resources.
@@ -415,7 +415,7 @@ actions:
           name: "{{ .StatefulSet.Name }}-dump-pod"
 
   backupPosthook:
-    type: StatefulSet
+    
     phases:
       - func: KubeOps
         name: deleteDumpPVC
@@ -428,7 +428,7 @@ actions:
             name: "{{ .StatefulSet.Name }}-dump"
 
   restorePosthook:
-    type: StatefulSet
+    
     phases:
       # Same pattern as backupPrehook: KubeOps creates the pod with the
       # restored dump PVC pre-mounted, WaitV2 confirms readiness, KubeExec
