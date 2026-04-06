@@ -23,7 +23,7 @@ Kasten only recognises these six names. Any other action name is silently ignore
 | `restore` | Blueprint manages data movement | **Avoid** |
 | `restorePosthook` | After PVC restore | Post-restore init, cache warming |
 
-For policy hooks (namespace context), any action name is valid — convention is the same names above. See [kasten-kanister.md](kasten-kanister.md#invocation-mode-2--policy-hooks).
+For action hooks (namespace context), any action name is valid — convention is the same names above. See [kasten-kanister.md](kasten-kanister.md#invocation-mode-2--action-hooks).
 
 ---
 
@@ -108,13 +108,13 @@ Do not assume that the base image contains jq, yq or kubectl, most of the time y
 ### Step 5 — Test the blueprint end-to-end
 
 Run a full backup/restore cycle through Kasten:
-- Ensure the workload is bound through the kasten annotation, a blueprintbinding or a policy hook
+- Ensure the workload is bound through the kasten annotation, a blueprintbinding or an action hook
 - Create a backup policy on demand with location profile for Kanister actions (Export Location Profile
 is optional and useless in this context) and trigger a runaction.
 
 **Never create a Kanister ActionSet directly to test a blueprint.** Kasten sets up the ActionSet
 context differently from a manually created one — for example, `.Namespace.Name` is only populated
-when Kasten invokes a policy hook, not in a hand-crafted ActionSet. A manual ActionSet will
+when Kasten invokes an action hook, not in a hand-crafted ActionSet. A manual ActionSet will
 silently resolve template variables to empty strings, causing incorrect behaviour. Always trigger
 testing through a Kasten RunAction.
 - Check in the kanister logs that the blueprint executed as expected, check the status of the runaction is completed

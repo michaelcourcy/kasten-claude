@@ -35,7 +35,7 @@ The ConfigMap contains a single key `pvc-info.yaml` whose value is a YAML docume
 
 ```yaml
 # PVC and PV information snapshot
-# Captured by Kasten backupPrehook policy hook.
+# Captured by Kasten backupPrehook action hook.
 # Use this to recover volume info when PVCs are excluded from the backup.
 namespace: my-app
 capturedAt: 2026-03-03T10:15:00Z

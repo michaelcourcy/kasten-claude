@@ -5,7 +5,7 @@
 Kasten K10 uses [Kanister](https://kanister.io) Blueprints — Kubernetes Custom Resources — to execute application-specific logic around backup and restore operations. In the Kasten context, blueprints serve two purposes:
 
 1. **Application hooks** — attached to a resource (StatefulSet, Deployment, custom resource, etc.) via annotation or BlueprintBinding. Kasten calls reserved action names at fixed points in its backup/restore lifecycle.
-2. **Policy hooks** — invoked directly by a Kasten policy (preHook, postHook, postHook on error). The context is the namespace, not a specific resource.
+2. **Action hooks** — defined in the spec of a Kasten Action (BackupAction, RestoreAction, or ExportAction). ImportAction does not support hooks. The context is the namespace, not a specific resource.
 
 ---
 
@@ -204,23 +204,23 @@ actions:
               <use db name in post-restore initialization>
 ```
 
-> **This mechanism is only available for resource-bound blueprints (annotation / BlueprintBinding). It is not available for policy hooks**, which are not associated with a specific restore point.
+> **This mechanism is only available for resource-bound blueprints (annotation / BlueprintBinding).** Action hooks cannot create output artifacts or consume input artifacts.
 
 ---
 
-## Invocation Mode 2 — Policy Hooks
+## Invocation Mode 2 — Action Hooks
 
-A Kasten policy can directly reference a blueprint as a hook (preHook, onSuccess, onFailure). The blueprint is then bound to the namespace itself — it is called at the policy level. See [Kasten policy hooks documentation](https://docs.kasten.io/latest/kanister/hooks).
+A Kasten Action (BackupAction, RestoreAction, or ExportAction — ImportAction does not support hooks) can define blueprint hooks (`preHook`, `onSuccess`, `onFailure`) in its spec. The blueprint is bound to the namespace, not to a specific resource. See [Kasten action hooks documentation](https://docs.kasten.io/latest/kanister/hooks).
 
-Any action name is valid for policy hooks. Recommended convention:
+Any action name is valid for action hooks. Recommended convention:
 
 | Action | Trigger |
 |---|---|
-| `backupPrehook` | Before the backup policy runs, snapshots are not initiated |
+| `backupPrehook` | Before the backup runs, snapshots are not initiated |
 | `backupPosthook` | After a successful backup, snapshots are completed |
 | `backupPosthookOnFailure` | After a failed backup |
 
-### Template context for policy hooks
+### Template context for action hooks
 
 The context is the **namespace**, not a specific resource:
 
@@ -729,7 +729,7 @@ namespace.
 ## References
 
 - [Kasten K10 Blueprints Documentation](https://docs.kasten.io/latest/usage/blueprints.html)
-- [Kasten Policy Hooks](https://docs.kasten.io/latest/kanister/hooks)
+- [Kasten Action Hooks](https://docs.kasten.io/latest/kanister/hooks)
 - [Blueprint Bindings API](https://docs.kasten.io/latest/usage/blueprint_bindings.html)
 - [Kanister Functions Reference](https://docs.kanister.io/functions.html)
 - [Kanister Template Parameters](https://docs.kanister.io/templates.html)
