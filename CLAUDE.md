@@ -179,6 +179,31 @@ Test commands before writing YAML:
 kubectl run debug-pod -n <app-namespace> --image=<tool-image> --restart=Never --rm -it -- bash
 ```
 
+### Cancelling a running action
+
+To cancel a RunAction (or any BackupAction, RestoreAction, etc.) create a `CancelAction`
+resource. CancelActions are write-only and not persisted — use `kubectl create`, not `apply`.
+
+```bash
+# Cancel a RunAction named <action-name> in namespace kasten-io
+kubectl create -f - --validate=false <<EOF
+apiVersion: actions.kio.kasten.io/v1alpha1
+kind: CancelAction
+metadata:
+  generateName: cancel-
+  namespace: kasten-io
+spec:
+  subject:
+    kind: RunAction
+    name: <action-name>
+    namespace: kasten-io
+EOF
+```
+
+The same pattern works for `BackupAction`, `RestoreAction`, `ExportAction`, etc. — just change
+`spec.subject.kind`. Cancellation is best-effort; check the target action's `.status.state`
+afterwards to confirm. See https://docs.kasten.io/latest/api/actions#api-cancel-action.
+
 ## Cluster autonomy
 
 You have full, unrestricted access to the Kubernetes cluster reachable via `kubectl`.
