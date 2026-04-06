@@ -70,6 +70,7 @@ The goal of this step is to fully validate the chosen backup/restore workflow fo
 Execute each operation using `kubectl exec`, `kubectl cp`, or direct API calls. Use these primitives to emulate what Kasten does at each stage:
 - **PVC backup**: use a CSI snapshot to emulate what Kasten does to application PVCs. Follow [this example](https://github.com/michaelcourcy/test-csi-snapshot) if you don't know how to create csi snapshot. Always make sure that you wait for snapshots to be ready before you test the backupPosthook.
 - **Object storage**: deploy a MinIO instance in a dedicated namespace to emulate an S3 endpoint (needed for *Use vendor operator data mover* patterns). You can find an example for deploying minio [here](https://github.com/michaelcourcy/kasten-s3troubleshooting?tab=readme-ov-file#test-with-a-minio-instance).
+- **Custom image**: if the backup/restore commands require tools not available in a standard base image, build and push a custom image at this step (see [The dump-tool image](kasten-kanister.md#the-dump-tool-image)). The image is needed here to validate that the commands execute correctly in a Kubernetes context — as a sidecar of the workload, or as a standalone pod attached or not to a PVC depending on the pattern. Do not defer image building to Step 4: if the image is wrong, Step 3 will catch it before any blueprint is written.
 
 Verify that:
 - Deleting the test data after a backup and then restoring it retrieves the expected records.
