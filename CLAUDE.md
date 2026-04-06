@@ -126,7 +126,7 @@ testing through a Kasten RunAction.
 
 Iterate until success without coming back to step 1 unless you discover step 1 can not be implemented.
 
-**If Step 3 succeeds but Step 5 fails, do not change the pattern.** Step 5 is purely an automation of Step 3 — if the blueprint does not behave as the validated workflow did, there is a blueprint or Kasten integration issue, not a strategy issue. Stop, explain the discrepancy to the user, and work through it together before considering any change of pattern.
+**If Step 3 succeeds but Step 5 fails, do not change the pattern.** Step 5 is purely the test of the automation of Step 3 — if the blueprint does not behave as the validated workflow did, there is a blueprint or Kasten integration issue, not a strategy issue. Stop, explain the discrepancy to the user, and work through it together before considering any change of pattern.
 
 
 ---
