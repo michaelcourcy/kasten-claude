@@ -196,11 +196,13 @@ Write, overwrite, and delete files in the project directory freely without confi
 
 ## Container image builds and pushes
 
-You have full autonomy to build container images and push them to the `michaelcourcy` Docker Hub repository without asking for confirmation.
-- Tag images as `michaelcourcy/<image-name>:<tag>`
+You have full autonomy to build container images and push them without asking for confirmation.
+- Before building, run `docker info` or inspect `~/.docker/config.json` to discover which registry the user is authenticated to, and use that as the image prefix (e.g. `docker.io/<username>`, `ghcr.io/<org>`, a private registry hostname, etc.).
 - Run `docker build`, `docker tag`, and `docker push` freely
 - Choose the base image and tag strategy that best fits the use case
 - The registry credentials are already configured in the local Docker daemon (`docker login` has been done)
+- If you cannot determine the registry from the Docker config, ask the user before pushing.
+
 
 ## Cluster context
 
