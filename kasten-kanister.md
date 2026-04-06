@@ -151,7 +151,7 @@ The context object is the Kubernetes resource the blueprint is bound to:
 | `.Phases.<name>.Output.<key>` | Output from a previous phase **within the same action execution** |
 | `.ArtifactsIn.<artifactName>.KeyValue.<key>` | Artifact value passed from a backup action — only available in restore actions and delete actions (`restorePrehook`, `restore`, `restorePosthook`) via `inputArtifactNames` |
 
-In the Kasten context, Secrets and ConfigMaps are declared under an `objects` field **at the phase level**, not at the action level. Kasten resolves the object at runtime using the template expression for `name` and `namespace`:
+In the Kasten context, Secrets and ConfigMaps are declared under an `objects` field **at the phase level**, not at the action level. Kasten resolves the object at runtime using the template expression for `name` and `namespace`, for instance if the name of secret is also the name of the statefulset:
 
 ```yaml
 phases:
@@ -248,266 +248,9 @@ Do not use in Kasten blueprints:
 
 ---
 
-## Blueprint YAML Examples
-
-### Pattern 1 — Quiesce / Unquiesce
-
-```yaml
-apiVersion: cr.kanister.io/v1alpha1
-kind: Blueprint
-metadata:
-  name: <app>-blueprint
-  namespace: kasten-io
-actions:
-  backupPrehook:
-    
-    phases:
-      - func: KubeExec
-        name: quiesceApp
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          pod: "{{ index .StatefulSet.Pods 0 }}"
-          container: <container>
-          command: [sh, -c, "<quiesce command>"]
-    # NOTE: do NOT use deferPhase here for unquiescing.
-    # deferPhase runs at the end of backupPrehook, BEFORE Kasten takes PVC snapshots.
-    # Unquiescing in deferPhase would defeat the purpose of quiescing entirely.
-    # Unquiesce belongs exclusively in backupPosthook, which Kasten calls after snapshots.
-    # If backupPrehook fails and the app is partially quiesced, Kasten aborts the backup.
-    # Design quiesce commands to be atomic or safe to retry.
-
-  backupPosthook:
-    # Called by Kasten after all PVC snapshots are ready.
-    
-    phases:
-      - func: KubeExec
-        name: unquiesceApp
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          pod: "{{ index .StatefulSet.Pods 0 }}"
-          container: <container>
-          command: [sh, -c, "<unquiesce command>"]
-
-  restorePosthook:
-    
-    phases:
-      - func: KubeExec
-        name: postRestoreInit
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          pod: "{{ index .StatefulSet.Pods 0 }}"
-          container: <container>
-          command: [sh, -c, "<post-restore initialization>"]
-```
-
-### Pattern 2 — Dump to PVC
-
-```yaml
-apiVersion: cr.kanister.io/v1alpha1
-kind: Blueprint
-metadata:
-  name: <app>-dump-blueprint
-  namespace: kasten-io
-actions:
-  backupPrehook:
-    
-    phases:
-      # Idempotent cleanup: remove any pod/PVC left over from a previous failed
-      # run so that the create steps below don't fail on already-existing resources.
-      - func: KubeTask
-        name: cleanupPreviousRun
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          image: <kubectl-image>
-          command:
-            - bash
-            - -c
-            - |
-              kubectl delete pod {{ .StatefulSet.Name }}-dump-pod \
-                -n {{ .StatefulSet.Namespace }} --ignore-not-found=true
-              kubectl delete pvc {{ .StatefulSet.Name }}-dump \
-                -n {{ .StatefulSet.Namespace }} --ignore-not-found=true
-      - func: KubeOps
-        name: createDumpPVC
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          resource:
-            apiVersion: v1
-            resource: persistentvolumeclaims
-          spec:
-            apiVersion: v1
-            kind: PersistentVolumeClaim
-            metadata:
-              name: "{{ .StatefulSet.Name }}-dump"
-              namespace: "{{ .StatefulSet.Namespace }}"
-            spec:
-              accessModes: [ReadWriteOnce]
-              resources:
-                requests:
-                  storage: 10Gi
-      # KubeTask cannot mount an existing PVC — use KubeOps to create a pod
-      # with the PVC pre-mounted, WaitV2 to confirm readiness, then KubeExec.
-      - func: KubeOps
-        name: createDumpPod
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          resource:
-            apiVersion: v1
-            resource: pods
-          spec:
-            apiVersion: v1
-            kind: Pod
-            metadata:
-              name: "{{ .StatefulSet.Name }}-dump-pod"
-              namespace: "{{ .StatefulSet.Namespace }}"
-            spec:
-              restartPolicy: Never
-              containers:
-                - name: dump
-                  image: <dump-tool-image>
-                  command: ["sleep", "infinity"]
-                  volumeMounts:
-                    - name: dump-pvc
-                      mountPath: /dump
-              volumes:
-                - name: dump-pvc
-                  persistentVolumeClaim:
-                    claimName: "{{ .StatefulSet.Name }}-dump"
-      - func: WaitV2
-        name: waitForDumpPod
-        args:
-          timeout: 5m
-          conditions:
-            anyOf:
-              - condition: '{{ $available := false }}{{ range .Conditions }}{{ if and (eq .Type "Ready") (eq .Status "True") }}{{ $available = true }}{{ end }}{{ end }}{{ $available }}'
-                objectReference:
-                  apiVersion: v1
-                  resource: pods
-                  name: "{{ .StatefulSet.Name }}-dump-pod"
-                  namespace: "{{ .StatefulSet.Namespace }}"
-      - func: KubeExec
-        name: dumpData
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          pod: "{{ .StatefulSet.Name }}-dump-pod"
-          container: dump
-          command:
-            - bash
-            - -c
-            - |
-              <run dump command into /dump>
-              kando output dumpCompleted true
-
-    deferPhase:
-      # Runs after backupPrehook regardless of success or failure.
-      # Only clean up the ephemeral pod here (--ignore-not-found is safe whether
-      # the pod was created or not, or was already deleted by deleteDumpPod).
-      # Do NOT delete the dump PVC here: deferPhase runs before Kasten takes
-      # any snapshot, so deleting the PVC here would prevent it from being
-      # captured in the restore point. If backupPrehook fails, Kasten aborts
-      # the backup entirely and takes no snapshots, so an incomplete dump PVC
-      # left behind is harmless. backupPosthook deletes the PVC on success.
-      func: KubeOps
-      name: cleanupDumpPod
-      args:
-        namespace: "{{ .StatefulSet.Namespace }}"
-        op: delete
-        resource:
-          apiVersion: v1
-          resource: pods
-          name: "{{ .StatefulSet.Name }}-dump-pod"
-
-  backupPosthook:
-    
-    phases:
-      - func: KubeOps
-        name: deleteDumpPVC
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          op: delete
-          resource:
-            apiVersion: v1
-            resource: persistentvolumeclaims
-            name: "{{ .StatefulSet.Name }}-dump"
-
-  restorePosthook:
-    
-    phases:
-      # Same pattern as backupPrehook: KubeOps creates the pod with the
-      # restored dump PVC pre-mounted, WaitV2 confirms readiness, KubeExec
-      # runs the replay, then KubeOps deletes the pod.
-      - func: KubeOps
-        name: createRestorePod
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          resource:
-            apiVersion: v1
-            resource: pods
-          spec:
-            apiVersion: v1
-            kind: Pod
-            metadata:
-              name: "{{ .StatefulSet.Name }}-restore-pod"
-              namespace: "{{ .StatefulSet.Namespace }}"
-            spec:
-              restartPolicy: Never
-              containers:
-                - name: restore
-                  image: <dump-tool-image>
-                  command: ["sleep", "infinity"]
-                  volumeMounts:
-                    - name: dump-pvc
-                      mountPath: /dump
-              volumes:
-                - name: dump-pvc
-                  persistentVolumeClaim:
-                    claimName: "{{ .StatefulSet.Name }}-dump"
-      - func: WaitV2
-        name: waitForRestorePod
-        args:
-          timeout: 5m
-          conditions:
-            anyOf:
-              - condition: '{{ $available := false }}{{ range .Conditions }}{{ if and (eq .Type "Ready") (eq .Status "True") }}{{ $available = true }}{{ end }}{{ end }}{{ $available }}'
-                objectReference:
-                  apiVersion: v1
-                  resource: pods
-                  name: "{{ .StatefulSet.Name }}-restore-pod"
-                  namespace: "{{ .StatefulSet.Namespace }}"
-      - func: KubeExec
-        name: restoreFromDump
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          pod: "{{ .StatefulSet.Name }}-restore-pod"
-          container: restore
-          command:
-            - bash
-            - -c
-            - |
-              <replay dump from /dump into the application>
-      - func: KubeOps
-        name: deleteRestorePod
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          op: delete
-          resource:
-            apiVersion: v1
-            resource: pods
-            name: "{{ .StatefulSet.Name }}-restore-pod"
-      - func: KubeOps
-        name: deleteRestorePVC
-        args:
-          namespace: "{{ .StatefulSet.Namespace }}"
-          op: delete
-          resource:
-            apiVersion: v1
-            resource: persistentvolumeclaims
-            name: "{{ .StatefulSet.Name }}-dump"
-```
-
----
-
 ## Key Kanister Functions
+
+This is a list of fuctions that are commonly used in a blueprint, and how to use them in the Kasten context. 
 
 | Function | When to Use |
 |---|---|
@@ -570,6 +313,23 @@ ENTRYPOINT ["/bin/sh"]
 This produces an image with: `kando`, `kubectl`, `helm`, `yq`, `jq`, `tar`, `nc`. Add your application dump tool (e.g. `mongodump`) with an additional `RUN` layer.
 
 ### Usage in blueprint phases
+
+**KubeTask** — when you only need to run a command and don't need to mount an existing PVC:
+
+```yaml
+- func: KubeTask
+  name: runCommand
+  args:
+    namespace: "{{ .StatefulSet.Namespace }}"
+    image: <your-registry>/kasten-tools:<kasten-version>  # built from the Dockerfile above
+    command:
+      - bash
+      - -c
+      - |
+        <your command here>
+```
+
+**KubeOps + WaitV2 + KubeExec** — when you need to mount an existing PVC (KubeTask cannot do this):
 
 ```yaml
 - func: KubeOps
