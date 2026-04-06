@@ -75,8 +75,6 @@ Execute each operation using `kubectl exec`, `kubectl cp`, or direct API calls. 
 Verify that:
 - Deleting the test data after a backup and then restoring it retrieves the expected records.
 
-**If Step 3 succeeds but Step 4 fails, do not change the pattern.** Step 4 is purely an automation of Step 3 — if the blueprint does not behave as the validated workflow did, there is a blueprint or Kasten integration issue, not a strategy issue. Stop, explain the discrepancy to the user, and work through it together before considering any change of pattern.
-
 ### Step 4 — Implement the blueprint and document dependencies
 
 Write the Blueprint (and BlueprintBinding if needed). Document all deployment prerequisites in the `README.md`:
@@ -100,7 +98,7 @@ Omit the operator row for workloads deployed without an operator (plain Helm cha
 **Keep the "Blueprint actions" table in `README.md` in sync with the blueprint YAML at all times.**
 Every action defined in the blueprint (`backupPrehook`, `backupPosthook`, `restorePrehook`, `restorePosthook`, etc.) must have a row in that table describing what it does. No action may exist in the YAML without a corresponding row, and no row may exist without a corresponding action in the YAML.
 
-If a custom container image is needed (e.g. a tool image for `KubeTask`), commit its `Dockerfile`
+If a custom container image is needed (e.g. a tool image for `KubeTask` or a kubeOps that create a pod), commit its `Dockerfile`
 in a subdirectory of the blueprint folder: `<blueprint-dir>/images/<image-name>/Dockerfile`.
 **Never reference a custom image in a blueprint without a committed Dockerfile.** Document the
 image name, base image, and what was added in the `README.md`.
@@ -127,6 +125,9 @@ testing through a Kasten RunAction.
     3. the test data is recovered correctly.
 
 Iterate until success without coming back to step 1 unless you discover step 1 can not be implemented.
+
+**If Step 3 succeeds but Step 5 fails, do not change the pattern.** Step 5 is purely an automation of Step 3 — if the blueprint does not behave as the validated workflow did, there is a blueprint or Kasten integration issue, not a strategy issue. Stop, explain the discrepancy to the user, and work through it together before considering any change of pattern.
+
 
 ---
 
