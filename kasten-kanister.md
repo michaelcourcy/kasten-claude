@@ -359,7 +359,7 @@ We can list the different blueprint patterns observed in the field. We use the w
 ### 2. Quiesce
 
 - **Principle**: Ensure that data is flushed to disk using a database primitive and that all transactions are persisted on the volumes before backing them up.
-- **Example**: [MongoDB](https://docs.kasten.io/latest/kanister/mongodb/install_app_cons) or [PostgreSQL](https://docs.kasten.io/latest/kanister/postgresql/install_app_cons)
+- **Example**:  [mariadb-community-operator-standalone](./mariadb-community-operator-standalone/), [MongoDB](https://docs.kasten.io/latest/kanister/mongodb/install_app_cons) or [PostgreSQL](https://docs.kasten.io/latest/kanister/postgresql/install_app_cons)
 - **Pro**: Backup is incremental and backup time remains constant as the database grows (unlike a dump strategy).
 - **Cons**: When restoring database volumes you cannot be granular (e.g. restore only one database or specific tables/collections).
 - **Filter PVC**: No — you must take all application volumes.
@@ -387,7 +387,7 @@ each snapshot
 - **Principle**: Same as 3 but the pvc is permanent. You
 choose 5 over 3 when the snapshot can not be done without having the pvc attached
 to the database pod (for instance cassandra) but you prefer 3 because 5 implies changing the workload configuration.
-- **Example**: https://github.com/kastendevhub/enterprise-blueprint/tree/main/k8ssandra-non-incremental
+- **Example**: [elsaticsearch-eck](./elasticsearch-eck/)
 - **Pro**: Database snapshot allows efficient incrementality by appending files at 
 each snapshot
 - **Cons**: You have to change the workload configuration to introduce the permanent 
