@@ -25,3 +25,8 @@ that was present in the namespace. Create a blueprint that you invoke from a pol
 ## Elastic search operator
 
 Can you make a blueprint for elasticsearch cluster deployed with the official operator https://www.elastic.co/docs/deploy-manage/deploy/cloud-on-k8s
+
+## Couchbase 
+
+Can you make a blueprint for couchbase based on the installation described here 
+https://docs.couchbase.com/operator/current/install-kubernetes.html

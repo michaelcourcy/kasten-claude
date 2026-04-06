@@ -27,22 +27,6 @@ For policy hooks (namespace context), any action name is valid — convention is
 
 ---
 
-## Pattern 1 — Quiesce / Unquiesce
-
-- `backupPrehook`: quiesce the app
-- `backupPosthook`: unquiesce — called by Kasten **after** PVC snapshots are ready
-- **Do not use `deferPhase` for unquiescing.** `deferPhase` runs at the end of `backupPrehook`, before Kasten initiates any snapshot. Unquiescing there would defeat the purpose of quiescing entirely. If `backupPrehook` fails and the app is left partially quiesced, Kasten aborts the backup — design the quiesce command to be atomic or safe to retry.
-
-## Pattern 2 — Dump to PVC (when crash-consistent snapshot is not possible)
-
-- `backupPrehook`: first delete any pod/PVC left from a previous failed run (idempotency), then create the dump PVC with `KubeOps`, run the dump into it, emit `kando output dumpCompleted true`
-- Kasten initiates the snapshots of all PVCs **including the dump PVC** as part of the restore point, and waits for them to be ready.
-- `backupPosthook`: delete the dump PVC (already captured in restore point)
-- `deferPhase` in `backupPrehook`: delete the ephemeral dump **pod** only (with `--ignore-not-found`). **Never delete the dump PVC here** — `deferPhase` runs before Kasten initiates any snapshot, so deleting the PVC would prevent it from being captured. If `backupPrehook` fails, Kasten aborts the backup and initiates no snapshots, so an incomplete dump PVC left behind is harmless.
-- `restorePosthook`: replay the dump from the restored PVC into the application
-
----
-
 ## Blueprint development workflow
 
 Follow these five steps in order when developing a new blueprint.
@@ -79,16 +63,18 @@ Describe also the deletion of the restorepointcontent created for the clean up :
 kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=<NAMESPACE USED FOR THE TEST>
 ```
 
-### Step 3 — Validate the strategy manually, without a blueprint
+### Step 3 — Validate the backup/restore workflow without a blueprint
 
-Execute the chosen backup/restore strategy by hand — using `kubectl exec`, `kubectl cp`, or direct API calls — before touching any YAML blueprint. Verify that:
+The goal of this step is to fully validate the chosen backup/restore workflow for the target workload, **without the complexity of a blueprint or Kasten policy**. Step 4 then automates exactly what was validated here. These are two separate concerns: first prove the workflow works, then encode it.
+
+Execute each operation using `kubectl exec`, `kubectl cp`, or direct API calls. Use these primitives to emulate what Kasten does at each stage:
+- **PVC backup**: use a CSI snapshot to emulate what Kasten does to application PVCs. Follow [this example](https://github.com/michaelcourcy/test-csi-snapshot) if you don't know how to create csi snapshot. Always make sure that you wait for snapshots to be ready before you test the backupPosthook.
+- **Object storage**: deploy a MinIO instance in a dedicated namespace to emulate an S3 endpoint (needed for *Use vendor operator data mover* patterns). You can find an example for deploying minio [here](https://github.com/michaelcourcy/kasten-s3troubleshooting?tab=readme-ov-file#test-with-a-minio-instance).
+
+Verify that:
 - Deleting the test data after a backup and then restoring it retrieves the expected records.
 
-Use these primitives to emulate the Kasten environment without a running Kasten instance:
-- **PVC backup**: use a CSI snapshot to emulate what Kasten does to application PVCs. Follow [this example](https://github.com/michaelcourcy/test-csi-snapshot) if you don't know how to create csi snapshot. Always make sure that you wait for snapshots to be ready before you test the backupPosthook. 
-- **Object storage**: deploy a MinIO instance in a dedicated namespace to emulate an S3 endpoint (needed for *Use vendor operator data mover* patterns).
-
-
+**If Step 3 succeeds but Step 4 fails, do not change the pattern.** Step 4 is purely an automation of Step 3 — if the blueprint does not behave as the validated workflow did, there is a blueprint or Kasten integration issue, not a strategy issue. Stop, explain the discrepancy to the user, and work through it together before considering any change of pattern.
 
 ### Step 4 — Implement the blueprint and document dependencies
 
