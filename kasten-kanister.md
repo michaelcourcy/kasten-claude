@@ -72,23 +72,26 @@ Owned PVCs means the PVCs owned by the resource on which the blueprint apply.
 If the resource blueprint define backup and restore action then only the PVCs manifest 
 are captured but not the data on the PVC.
 
-- BackupAction.Prehook 
-- Resource.backupPrehook 
-- Owned PVCs snapshot start OR Resource.backupHook starts if defined 
-- Owned PVCs snapshot ready OR Resource.backupHook finish if defined
-- Resource.backupPosthook 
-- BackupAction.postHook or BackupAction.postHookError
+- BackupAction.preHook 
+- for each resource in the namespace
+  - Resource.backupPrehook 
+  - Owned PVCs snapshot start OR Resource.backupHook starts if defined (one exclude the other)
+  - Owned PVCs snapshot ready OR Resource.backupHook finish if defined (one exclude the other)
+  - Resource.backupPosthook 
+- BackupAction.onSuccess or BackupAction.onFailure
 
 ### Restore 
 
-- RestoreAction.prehook
-- Resource.restorePrehook
-- Deletion of Owned PVC 
-- Restore of Owned PVC OR recreation of empty PVC (manifest only) if Resource.restoreHook defined 
-- Wait for all resource restored (including CR) and all pods ready in the restorepoint
-- Resource.restoreHook executed if defined 
-- Resource.restorePostHook
-- RestoreAction.postHook or RestoreAction.postHookError
+- RestoreAction.preHook
+- for each resource in the restorePoint
+  - Resource.restorePrehook
+  - Deletion of Owned PVC 
+  - Restore of Owned PVC OR recreation of empty PVC (manifest only) if Resource.restoreHook defined 
+- Wait for all resource restored (including CR) to be ready 
+- for each resource in the restorePoint
+  - Resource.restoreHook
+  - Resource.restorePostHook
+- RestoreAction.onSuccess or RestoreAction.onFailure
 
 
 ### Assigning a blueprint — Manual annotation
