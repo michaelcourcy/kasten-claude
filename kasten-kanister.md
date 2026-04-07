@@ -38,6 +38,59 @@ Discovery works as follows:
 
 A blueprint attached to a high-level custom resource (e.g., an EDB `Cluster`) will correctly scope hook execution to all PVCs in that ownership subtree, even if pods and PVCs are several levels below.
 
+> **Critical timing constraint — PVC discovery runs before `backupPrehook`.**
+> Kasten discovers and registers all PVCs for snapshotting **at backup-action start**, before
+> `backupPrehook` executes. Any PVC created during `backupPrehook` is therefore invisible to the
+> snapshot phase and will **not** appear in the restore point. This has a direct impact on pattern
+> selection:
+>
+> - **Permanent PVCs** pre-exist at discovery time → they are correctly snapshotted. A
+>   BlueprintBinding on the workload that owns (or mounts) the PVC is sufficient.
+> - **Temporary PVCs** (created inside `backupPrehook`) are never discovered → they are never
+>   snapshotted. The only way to make a temporary PVC visible to Kasten is to create it inside a
+>   **BackupAction preHook** (action hook), which runs before PVC discovery. See
+>   [Invocation Mode 2 — Action Hooks](#invocation-mode-2--action-hooks) and the warning in the
+>   [temporary PVC patterns](#temporary-pvc-patterns--action-hook-required) section.
+>
+> Note: Kasten also snapshots **orphan PVCs** (PVCs not mounted by any running pod). However,
+> since there is no ownership chain to attach a blueprint to, no `backupPrehook` runs for orphan
+> PVCs through a BlueprintBinding. If backup data must be written to the PVC before the snapshot,
+> you must either use a keeper Deployment (sub-case B below) or an action preHook. An orphan PVC
+> with no prehook is only valid when the PVC already holds valid, up-to-date backup data that
+> does not need to be refreshed before snapshotting.
+
+### Permanent PVC discovery — two sub-cases
+
+A permanent PVC is always pre-existing when Kasten runs its discovery pass. However, a
+BlueprintBinding targets a **workload resource**, not a PVC directly. How Kasten links the PVC
+to a BlueprintBinding depends on whether the PVC is mounted by the target workload:
+
+**Sub-case A — PVC mounted by the workload pod (preferred)**
+
+The permanent backup PVC is added to the workload's pod spec as an extra volume mount. Kasten
+discovers it transitively through the owner reference chain. The BlueprintBinding targets the
+workload CR (StatefulSet, Deployment, or custom resource). No extra deployment is needed.
+The `backupPrehook` uses `KubeExec` to run backup commands directly in the workload pod, or
+spawns a short-lived pod via `KubeTask` if a separate tool image is needed.
+Example: Elasticsearch ECK, where the snapshot repository PVC is declared in the Elasticsearch CR.
+
+**Sub-case B — PVC not mounted by the workload pod (dedicated keeper Deployment)**
+
+The permanent backup PVC exists as a standalone resource, not mounted by the workload's pods at
+rest. Create a **keeper Deployment** that runs the backup tool image (e.g. `couchbase/server:7.6.6`
+for Couchbase, or a custom image containing the database dump tool) and mounts the backup PVC
+permanently. This serves two purposes:
+
+- Kasten discovers the PVC through the Deployment's ownership chain and snapshots it every run.
+- The `backupPrehook` uses `KubeExec` into the keeper pod to run backup commands directly —
+  no need to create/delete a temporary pod per backup cycle, and no `ReadWriteOnce` conflict
+  because the PVC is already mounted by the keeper.
+
+Apply a BlueprintBinding to this keeper Deployment (not to the main workload CR). The keeper
+Deployment does not need to do anything at runtime — it simply keeps the PVC mounted so Kasten
+can discover it and so that `KubeExec` has a stable target. Use a lightweight long-running command
+such as `sleep infinity` if the image does not have a natural entrypoint.
+
 ### Reserved action names — Backup
 
 | Action | When Kasten calls it | Typical use |
@@ -348,76 +401,110 @@ This produces an image with: `kando`, `kubectl`, `helm`, `yq`, `jq`, `tar`, `nc`
 
 We can list the different blueprint patterns observed in the field. We use the word `dump` for a logical backup (e.g. `mysqldump` or `mongodump`) and `database snapshot` for an application-aware snapshot (e.g. Cassandra `nodetool snapshot` or the Elasticsearch snapshot API).
 
+The patterns are ordered so that **permanent PVC patterns come before temporary PVC patterns**.
+This ordering reflects a deliberate trade-off in favour of the **Single Responsibility Principle
+(SRP)** and **Open/Closed Principle (OCP)** of software architecture:
+
+- **Permanent PVC patterns (1–5)** work with BlueprintBinding — each workload type gets its own
+  blueprint, and adding a new workload type never requires modifying an existing blueprint.
+- **Temporary PVC patterns (6–8)** require a BackupAction preHook (action hook), because PVC
+  discovery runs before `backupPrehook` and a PVC created during `backupPrehook` is never
+  snapshotted. Action hooks are namespace-scoped: one blueprint handles all workloads in the
+  namespace, which violates SRP and OCP. See the warning block in patterns 6–8.
+
 ### 1. Fence and quiesce a replica
 
 - **Principle**: Fence (halt) replication synchronization and quiesce a replica to take a backup of the application volumes.
 - **Example**: [EDB](https://github.com/kastendevhub/enterprise-blueprint/tree/main/edb) or [Kafka with Mirror Maker](https://github.com/michaelcourcy/kafka-kasten)
 - **Pro**: No impact on the primary, because only a replica is quiesced.
 - **Cons**: At restore time, the operator must be able to promote the replica to primary, or you have to manually reconfigure your workload.
+- **BlueprintBinding**: Yes — attach to the workload CR.
 - **Filter PVC**: Yes — you can take only the replica volumes.
 
 ### 2. Quiesce
 
 - **Principle**: Ensure that data is flushed to disk using a database primitive and that all transactions are persisted on the volumes before backing them up.
-- **Example**:  [mariadb-community-operator-standalone](./mariadb-community-operator-standalone/), [MongoDB](https://docs.kasten.io/latest/kanister/mongodb/install_app_cons) or [PostgreSQL](https://docs.kasten.io/latest/kanister/postgresql/install_app_cons)
+- **Example**: [mariadb-community-operator-standalone](./mariadb-community-operator-standalone/), [MongoDB](https://docs.kasten.io/latest/kanister/mongodb/install_app_cons) or [PostgreSQL](https://docs.kasten.io/latest/kanister/postgresql/install_app_cons)
 - **Pro**: Backup is incremental and backup time remains constant as the database grows (unlike a dump strategy).
 - **Cons**: When restoring database volumes you cannot be granular (e.g. restore only one database or specific tables/collections).
+- **BlueprintBinding**: Yes — attach to the workload CR.
 - **Filter PVC**: No — you must take all application volumes.
 
-### 3. database snapshot on a temporary pvc
+### 3. Database snapshot on a permanent PVC (sub-case A — PVC mounted by workload)
 
-- **Principle**: Create a temporary PVC and write the database snapshot on it before it is protected by Kasten.
-- **Example**: no example
-- **Pro**: Database snapshot allows efficient incrementality by appending files at 
-each snapshot
-- **Cons**: only feasible if the database snapshot can run remotely. You also need to manage the creation and deletion of the temporary PVC and dump pod.
-- **Filter PVC**: Yes — you can take only the temporary PVC.
-
-### 4. database dump on a temporary pvc
-
-- **Principle**: Create a temporary PVC and a dump pod that writes the dump or database snapshot to the PVC before it is protected by Kasten.
-- **Example**: [Mongoce](https://github.com/kastendevhub/enterprise-blueprint/tree/main/maximo/mongoce)
-- **Pro**: A dump enables granular restore
-- **Cons**: No incrementality — as the dump grows over time, backup time grows too. You also need to manage the creation and deletion of the temporary PVC and dump pod.
-- **Filter PVC**: Yes — you can take only the temporary PVC.
-
-
-### 5. database snapshot on a permanent pvc
-
-- **Principle**: Same as 3 but the pvc is permanent. You
-choose 5 over 3 when the snapshot can not be done without having the pvc attached
-to the database pod (for instance cassandra) but you prefer 3 because 5 implies changing the workload configuration.
-- **Example**: [elsaticsearch-eck](./elasticsearch-eck/)
-- **Pro**: Database snapshot allows efficient incrementality by appending files at 
-each snapshot
-- **Cons**: You have to change the workload configuration to introduce the permanent 
-PVC
+- **Principle**: The workload is configured to mount a permanent backup PVC. The `backupPrehook` runs the database snapshot tool via `KubeExec` into the workload pod (or a sidecar). The PVC is pre-existing when Kasten runs its discovery pass.
+- **Example**: [elasticsearch-eck](./elasticsearch-eck/)
+- **Pro**: Database snapshot allows efficient incrementality by appending files at each snapshot. BlueprintBinding works because the PVC is discovered through the workload's ownership chain.
+- **Cons**: Requires changing the workload configuration to mount the backup PVC.
+- **BlueprintBinding**: Yes — attach to the workload CR.
 - **Filter PVC**: Yes — you can take only the permanent PVC used for the snapshot.
 
+### 4. Database dump or snapshot on a permanent PVC (sub-case B — keeper Deployment)
 
-### 6. database dump on a permanent pvc
+- **Principle**: A dedicated keeper Deployment mounts the backup PVC permanently and runs the backup tool image (e.g. the database server image that includes the backup tool). The `backupPrehook` uses `KubeExec` into the keeper pod to write the dump or snapshot to the PVC. Kasten discovers the PVC through the keeper Deployment's ownership chain.
+- **Example**: [couchbase-operator](./couchbase-operator/) (future evolution — current implementation uses a temporary backup pod instead)
+- **Pro**: No change to the main workload configuration. PVC is always discovered because the keeper keeps it mounted. `KubeExec` avoids temporary pod lifecycle management. BlueprintBinding attaches to the keeper Deployment.
+- **Cons**: Requires deploying an extra Deployment alongside the workload. The keeper image must include the backup tool (e.g. `couchbase/server:<version>` for `cbbackupmgr`).
+- **BlueprintBinding**: Yes — attach to the keeper Deployment.
+- **Filter PVC**: Yes — you can take only the permanent PVC used for the backup.
 
-- **Principle**: Same as 4 but the pvc is permanent. You choose 6 over 4 when the dump can not be done without having the pvc attached to the database pod (for instance mssql dump) but you prefer 4 because 6 implies changing the workload configuration.
-- **Example**: https://github.com/kastendevhub/enterprise-blueprint/tree/main/dh2i
-- **Pro**: A dump enables granular restore
-- **Cons**: No incrementality — as the dump grows over time, backup time grows too. 
-You have to change the workload configuration to introduce the permanent PVC
-- **Filter PVC**: Yes — you can take only the permanent PVC used for the dump.
-
-### 7. Create logical dump or database snapshot on PVC already used by the database
+### 5. Create logical dump or database snapshot on PVC already used by the database
 
 - **Principle**: When no extra PVC is acceptable and the dump can safely coexist on the database volumes without exhausting storage.
 - **Example**: no example
-- **Pro**: No change of the workload configuration, no creation of the database storage
-- **Cons**: This is dangerous for the database storage and putting the data on extra pvc should be always preferred when possible
-- **Filter PVC**: No — You have to take all the database PVCs
+- **Pro**: No change of the workload configuration, no creation of extra storage.
+- **Cons**: This is dangerous for the database storage and putting the data on an extra PVC should always be preferred when possible.
+- **BlueprintBinding**: Yes — attach to the workload CR.
+- **Filter PVC**: No — you must take all the database PVCs.
+
+---
+
+### Temporary PVC patterns — Action Hook required
+
+> ⚠️ **Patterns 6, 7, and 8 create a PVC during `backupPrehook`. Because Kasten's PVC discovery
+> runs before `backupPrehook`, this PVC will never be included in the restore point when invoked
+> via a BlueprintBinding resource hook.**
+>
+> The **only** supported approach for these patterns is a **BackupAction preHook** (action hook),
+> which runs before PVC discovery. This comes with significant architectural constraints:
+>
+> - **Context is namespace-only**: `{{ .Namespace.Name }}` is the only available template
+>   variable. No `.Object`, `.StatefulSet`, or any resource-level field is available. The blueprint
+>   must discover workloads in the namespace by itself (e.g. via `kubectl get`).
+> - **No BlueprintBinding**: The hook is configured per-policy in the BackupAction spec, not via a
+>   BlueprintBinding.
+> - **SRP violation**: A single action hook blueprint handles all workloads in the namespace. Adding
+>   a new workload type that also needs a temporary PVC requires modifying the same blueprint —
+>   violating the Open/Closed Principle. To limit this impact, **deploy only one type of workload
+>   per namespace** when using these patterns.
+>
+> Only choose patterns 6–8 when patterns 1–5 are technically infeasible.
+
+### 6. Database snapshot on a temporary PVC
+
+- **Principle**: Create a temporary PVC inside a BackupAction preHook (before PVC discovery) and write the database snapshot to it. Kasten discovers and snapshots the PVC, then the `backupPosthook` (or `onSuccess` hook) deletes the temporary PVC.
+- **Example**: no example
+- **Pro**: Database snapshot allows efficient incrementality by appending files at each snapshot.
+- **Cons**: Requires a BackupAction preHook; BlueprintBinding cannot be used. See warning above.
+- **BlueprintBinding**: No — must use BackupAction preHook.
+- **Filter PVC**: Yes — you can take only the temporary PVC.
+
+### 7. Logical dump on a temporary PVC
+
+- **Principle**: Create a temporary PVC inside a BackupAction preHook and write the logical dump to it. Kasten discovers and snapshots the PVC, then the `onSuccess` hook deletes it.
+- **Example**: [Mongoce](https://github.com/kastendevhub/enterprise-blueprint/tree/main/maximo/mongoce)
+- **Pro**: A dump enables granular restore.
+- **Cons**: No incrementality — as the dump grows over time, backup time grows too. Requires a BackupAction preHook; BlueprintBinding cannot be used. See warning above.
+- **BlueprintBinding**: No — must use BackupAction preHook.
+- **Filter PVC**: Yes — you can take only the temporary PVC.
 
 ### 8. Create dump of an external database on a temporary PVC
 
-- **Principle**: For databases that live outside the cluster but the logical dump can be created on the kubernetes cluster.
+- **Principle**: For databases that live outside the cluster but whose logical dump can be created inside the cluster. Create a temporary PVC inside a BackupAction preHook, write the dump to it, let Kasten snapshot it, then delete it.
 - **Example**: https://github.com/prcerda/K10-SampleApps/blob/main/PostgreSQL-External/postgresql-ext-blueprint-alldbs.yaml
-- **Pro**: Include external database in the kasten backup
-- **Cons**: No incrementality — as the dump grows over time, backup time grows too. 
+- **Pro**: Includes an external database in the Kasten backup.
+- **Cons**: No incrementality. Requires a BackupAction preHook; BlueprintBinding cannot be used. See warning above.
+- **BlueprintBinding**: No — must use BackupAction preHook.
 - **Filter PVC**: Yes — you can take only the temporary PVC.
 
 

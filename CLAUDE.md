@@ -35,22 +35,43 @@ Follow these five steps in order when developing a new blueprint.
 
 Select the backup pattern from the list in [kasten-kanister.md](kasten-kanister.md#blueprint-patterns). For workloads where **Kasten is the data mover**, apply them in this preferred order — stop at the first one that is technically feasible for the target database:
 
+**Permanent PVC patterns — BlueprintBinding supported:**
+
 1. **Fence and quiesce a replica** — best choice when a replica exists; zero primary impact.
 2. **Quiesce** — preferred when crash-consistent snapshots are sufficient and incrementality matters (backup time stays constant as data grows).
-3. **database snapshot on a temporary pvc** — use database snapshots (e.g. Cassandra, Elasticsearch) to leverage incrementality because they append new snapshot files
-4. **Logical dump on a temporary pvc** — use when a logical dump is needed for granular restore or because quiescing is not possible. Choose 3 over 4 if possible because for plain dump there is no incrementality. 
-5. **database snapshot on a permanent pvc** — same as 3 but the pvc is permanent. You 
-choose 5 over 3 when the database snapshot can not be done without having the pvc attached to the database pod (for instance cassandra) but you prefer 3 because 5 implies changing the workload configuration.
-6. **Logical dump or database snapshot on a permanent pvc** — same as 4 but the pvc is permanent. You choose 6 over 4 when the dump can not be done without having the pvc attached to the database pod (for instance mssql dump) but you prefer 4 because 6 implies changing the workload configuration.
-7. **Create logical dump or database snapshot on PVC already used by the database** — when no extra PVC is acceptable and the dump can safely coexist on the database volumes without exhausting storage. This is dangerous for the database storage and putting the data on extra pvc should be always preferred when possible
-8. **Create dump of an external database on a temporary PVC** — for databases that live outside the cluster but the logical dump can be created on the kubernetes cluster.
+3. **Database snapshot on a permanent PVC (sub-case A — PVC mounted by workload)** — the workload mounts a dedicated backup PVC; `backupPrehook` uses `KubeExec` to run the snapshot tool in the workload pod. PVC pre-exists at discovery time. BlueprintBinding on the workload CR.
+4. **Database dump or snapshot on a permanent PVC (sub-case B — keeper Deployment)** — a dedicated Deployment that runs the backup tool image mounts the backup PVC permanently; `backupPrehook` uses `KubeExec` into the keeper pod. PVC pre-exists at discovery time. BlueprintBinding on the keeper Deployment.
+5. **Create logical dump or database snapshot on PVC already used by the database** — when no extra PVC is acceptable and the dump can safely coexist on the database volumes without exhausting storage. Dangerous; an extra PVC should always be preferred when possible.
+
+> **Why permanent PVC patterns are ranked first:** Kasten's PVC discovery runs **before**
+> `backupPrehook` executes. Permanent PVCs pre-exist at discovery time and are correctly
+> snapshotted. They work with BlueprintBinding, which gives each workload type its own blueprint
+> and preserves the **Single Responsibility Principle (SRP)** and **Open/Closed Principle (OCP)**:
+> adding a new workload type never requires modifying an existing blueprint.
+
+**Temporary PVC patterns — BackupAction preHook required, BlueprintBinding NOT supported:**
+
+> ⚠️ Any PVC created during `backupPrehook` will **not** be included in the restore point,
+> because PVC discovery runs before `backupPrehook`. The only way to include a temporary PVC
+> in a restore point is to create it inside a **BackupAction preHook** (action hook), which runs
+> before PVC discovery. This means:
+> - Context is namespace-only (`{{ .Namespace.Name }}` only — no object-level fields).
+> - One action hook blueprint covers all workloads in the namespace — a **SRP violation**.
+> - Adding a second workload type requiring a temporary PVC requires modifying the same blueprint —
+>   an **OCP violation**.
+> - **Only deploy one type of workload per namespace** when using these patterns.
+> Only choose patterns 6–8 when patterns 1–5 are technically infeasible.
+
+6. **Database snapshot on a temporary PVC** — database snapshot tool writes to a temporary PVC created in a BackupAction preHook before discovery. Incrementality via append-only snapshot files.
+7. **Logical dump on a temporary PVC** — dump tool writes to a temporary PVC created in a BackupAction preHook. No incrementality.
+8. **Create dump of an external database on a temporary PVC** — for databases outside the cluster whose dump can be created inside the cluster. No incrementality.
 
 When **Kasten is not the data mover**, two additional patterns apply. These are not ranked against the list above — they are the only valid options when the database is managed or when the operator owns the backup mechanism:
 
 9. **Trigger a dump of a managed database** — for cloud-managed databases (RDS, Firestore, MongoDB Atlas, etc.); the cloud provider owns immutability.
 10. **Use vendor operator data mover** — when the operator has a built-in backup API (CNPG, K8ssandra Medusa, Crunchy Postgres, etc.); the operator owns immutability.
 
-The choice must balance implementation complexity (backup **and** restore), and whether incrementality is critical (patterns 1–2 and 3-5 with append-only database snapshots are incremental; plain dump patterns are not). **Document the chosen pattern and its rationale in a `README.md` before writing any code. This must be reviewed before development begins.**
+The choice must balance implementation complexity (backup **and** restore), and whether incrementality is critical (patterns 1–4 with append-only snapshots are incremental; plain dump patterns are not). **Document the chosen pattern and its rationale in a `README.md` before writing any code. This must be reviewed before development begins.**
 
 ### Step 2 — Deploy the workload and create test data
 
