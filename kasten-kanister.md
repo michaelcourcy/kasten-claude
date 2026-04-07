@@ -123,8 +123,10 @@ are captured but not the data on the PVC. `backup` and `restore` is used when th
 the datamoving but : 
 - it has conscequence on security because you lose immutability 
 - you can not use the policy datamover, for instance if you use VBR as the target then the blueprint still use 
-kopia as the datamover
+kopia as the datamover.
 - you don't have incrementality 
+
+It's why we discourage the use of `backup` and `restore` action in the Kasten context. 
 
 Owned PVCs means the PVCs owned by the resource on which the blueprint apply. 
 
@@ -468,7 +470,7 @@ This ordering reflects a deliberate trade-off in favour of the **Single Responsi
 
 ### Temporary PVC patterns — Action Hook required
 
-> ⚠️ **Patterns 6, 7, and 8 create a PVC during `backupPrehook`. Because Kasten's PVC discovery
+> ⚠️ **Patterns 6, 7, and 8 create a PVC during action `preHook` (hence before the discovery of the namespace). Because Kasten's PVC discovery
 > runs before `backupPrehook`, this PVC will never be included in the restore point when invoked
 > via a BlueprintBinding resource hook.**
 >
