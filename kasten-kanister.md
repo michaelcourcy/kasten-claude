@@ -95,17 +95,17 @@ such as `sleep infinity` if the image does not have a natural entrypoint.
 
 | Action | When Kasten calls it | Typical use |
 |---|---|---|
-| `backupPrehook` | **Before** the attached PVCs snapshots are initiated | Quiesce the application, or create a dump PVC |
+| `backupPrehook` | **Before** the attached PVCs snapshots are initiated and before the preHook associated action| Quiesce the application, or create a dump PVC |
 | `backup` | When the blueprint fully manages data movement (no PVC snapshot) | Avoid in Kasten context — use PVC snapshots instead |
-| `backupPosthook` | **After** the PVC snapshots are ready | Unquiesce the application, or delete the temporary dump PVC |
+| `backupPosthook` | **After** the PVC snapshots are ready and before the onSuccess/onFailure associated action | Unquiesce the application, or delete the temporary dump PVC |
 
 ### Reserved action names — Restore
 
 | Action | When Kasten calls it | Typical use |
 |---|---|---|
-| `restorePrehook` | **Before** the attached PVCs are restored | Pre-restore preparation |
+| `restorePrehook` | **Before** the attached PVCs are restored and before the preHook associated action| Pre-restore preparation |
 | `restore` | When the blueprint fully manages data movement | Avoid in Kasten context |
-| `restorePosthook` | **After** the PVCs are restored and after restore of CR metadata and before the hook.onSuccess or hook.onFailure actions associated with the restore action/policy | Post-restore initialization, cache warming |
+| `restorePosthook` | **After** the PVCs are restored and after restore of CR metadata and before the onSuccess/onFailure associated action | Post-restore initialization, cache warming |
 
 > **Any action name other than these six is silently ignored by Kasten.**
 
