@@ -222,8 +222,48 @@ EOF
 ```
 
 The same pattern works for `BackupAction`, `RestoreAction`, `ExportAction`, etc. — just change
-`spec.subject.kind`. Cancellation is best-effort; check the target action's `.status.state`
-afterwards to confirm. See https://docs.kasten.io/latest/api/actions#api-cancel-action.
+`spec.subject.kind`. **The `namespace` in `spec.subject` must match the namespace the action lives
+in** — for `RestoreAction` that is the **application namespace**, not `kasten-io`. Cancellation is
+best-effort; check the target action's `.status.state` afterwards to confirm. See
+https://docs.kasten.io/latest/api/actions#api-cancel-action.
+
+### Triggering a RestoreAction
+
+`RestorePoint` objects live in the **application namespace**. `RestoreAction` must also be created
+in the application namespace. A **Location profile** must be explicitly included in the spec
+whenever the restore will execute blueprint phases (restorePosthook etc.); without it Kasten cannot
+run Kanister operations.
+
+```bash
+# List available restore points for an app
+kubectl get restorepoint -n <APP_NAMESPACE>
+
+# Trigger a restore (replace placeholders)
+kubectl create -f - --validate=false <<EOF
+apiVersion: actions.kio.kasten.io/v1alpha1
+kind: RestoreAction
+metadata:
+  generateName: restore-
+  namespace: <APP_NAMESPACE>
+spec:
+  subject:
+    apiVersion: apps.kio.kasten.io/v1alpha1
+    kind: RestorePoint
+    name: <RESTORE_POINT_NAME>
+    namespace: <APP_NAMESPACE>
+  targetNamespace: <APP_NAMESPACE>
+  profile:
+    name: <LOCATION_PROFILE_NAME>   # must be type=Location, e.g. "us-east-1"
+    namespace: kasten-io
+EOF
+```
+
+> **Profile type**: the profile must be of type `Location` (S3, GCS, Azure Blob, etc.), not
+> `Infra`. Check with: `kubectl get profile <name> -n kasten-io -o jsonpath='{.spec.type}'`
+
+> **Policy requirement**: for the backup policy to supply a Kanister-compatible profile during
+> restores triggered via the policy, the `backupParameters.profile` must reference a `Location`
+> profile, not an `Infra` profile.
 
 ## Cluster autonomy
 

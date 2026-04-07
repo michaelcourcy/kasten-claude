@@ -208,12 +208,19 @@ The context object is the Kubernetes resource the blueprint is bound to:
 | `.Deployment.Namespace` | Namespace of the Deployment |
 | `.Deployment.Pods` | List of pod names |
 | `.Object.metadata.name` | Name of the annotated Kubernetes object |
+| `.Object.metadata.namespace` | Namespace of the annotated object — works for **any** bound resource type; prefer this over `.Deployment.Namespace` or `.StatefulSet.Namespace` when the blueprint must cover multiple resource types |
 | `.Phases.<phaseName>.Secrets.<objName>.Data.<key>` | Secret value — declared via `objects` at phase level |
 | `.Phases.<phaseName>.ConfigMaps.<objName>.Data.<key>` | ConfigMap value — declared via `objects` at phase level |
 | `.Phases.<name>.Output.<key>` | Output from a previous phase **within the same action execution** |
 | `.ArtifactsIn.<artifactName>.KeyValue.<key>` | Artifact value passed from a backup action — only available in restore actions and delete actions (`restorePrehook`, `restore`, `restorePosthook`) via `inputArtifactNames` |
 
-In the Kasten context, Secrets and ConfigMaps are declared under an `objects` field **at the phase level**, not at the action level. Kasten resolves the object at runtime using the template expression for `name` and `namespace`, for instance if the name of secret is also the name of the statefulset:
+> **`.Namespace.Name` is NOT available in resource-bound blueprints.** It is only populated
+> when Kasten invokes an **action hook** (policy preHook / onSuccess / onFailure). In
+> annotation- or BlueprintBinding-bound blueprints, `.Namespace.Name` resolves to an empty
+> string. Use `.Object.metadata.namespace`, `.Deployment.Namespace`, or
+> `.StatefulSet.Namespace` instead.
+
+In the Kasten context, Secrets and ConfigMaps are declared under an `objects` field **at the phase level**, not at the action level. There is **no separate `configMaps:` field** — both Secrets and ConfigMaps use `objects:` with their respective `kind:` value (`Secret` or `ConfigMap`). Kasten resolves the object at runtime using the template expression for `name` and `namespace`, for instance if the name of secret is also the name of the statefulset:
 
 ```yaml
 phases:

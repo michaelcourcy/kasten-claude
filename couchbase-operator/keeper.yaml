@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kasten-backup
+  namespace: couchbase-test
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: ebs-sc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: couchbase-backup-keeper
+  namespace: couchbase-test
+  labels:
+    app: couchbase-backup-keeper
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: couchbase-backup-keeper
+  template:
+    metadata:
+      labels:
+        app: couchbase-backup-keeper
+    spec:
+      containers:
+      - name: couchbase-backup
+        image: couchbase/server:7.6.6
+        command: ["/bin/bash", "-c", "sleep infinity"]
+        volumeMounts:
+        - name: backup
+          mountPath: /backup
+      volumes:
+      - name: backup
+        persistentVolumeClaim:
+          claimName: kasten-backup

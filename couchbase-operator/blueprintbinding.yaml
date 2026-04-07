@@ -1,0 +1,24 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: couchbase-blueprintbinding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: couchbase-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: app
+          operator: In
+          values:
+            - couchbase-backup-keeper
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist
