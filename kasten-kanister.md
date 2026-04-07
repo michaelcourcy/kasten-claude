@@ -118,18 +118,25 @@ such as `sleep infinity` if the image does not have a natural entrypoint.
 
 ## The backup and restore workflow managed by kasten 
 
-### Backup
+If the resource blueprint define `backup` and `restore` action then only the PVCs manifest 
+are captured but not the data on the PVC. `backup` and `restore` is used when the blueprint handle 
+the datamoving but : 
+- it has conscequence on security because you lose immutability 
+- you can not use the policy datamover, for instance if you use VBR as the target then the blueprint still use 
+kopia as the datamover
+- you don't have incrementality 
 
 Owned PVCs means the PVCs owned by the resource on which the blueprint apply. 
 
-If the resource blueprint define backup and restore action then only the PVCs manifest 
-are captured but not the data on the PVC.
+Here is the backup and restore workflow :  
+
+### Backup
 
 - BackupAction.preHook 
 - for each resource in the namespace
   - Resource.backupPrehook 
-  - Owned PVCs snapshot start OR Resource.backupHook starts if defined (one exclude the other)
-  - Owned PVCs snapshot ready OR Resource.backupHook finish if defined (one exclude the other)
+  - Owned PVCs snapshot start OR Resource.backupHook starts if defined (one exclude the other see above)
+  - Owned PVCs snapshot ready OR Resource.backupHook finish if defined (one exclude the othersee above)
   - Resource.backupPosthook 
 - BackupAction.onSuccess or BackupAction.onFailure
 
