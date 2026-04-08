@@ -9,11 +9,11 @@
 | ECK operator (eck-operator) | 2.16.1 |
 | Elasticsearch | 8.17.0 |
 
-## Pattern: Database snapshot on a permanent PVC (Pattern 5)
+## Pattern: Database snapshot on a permanent PVC (Pattern 3 — sub-case A)
 
-**Why Pattern 5, not Pattern 3 (temporary PVC)?**
+**Why Pattern 3 (sub-case A), not Pattern 6 (temporary PVC)?**
 
-Pattern 3 (Elasticsearch native snapshot to a new temporary PVC per backup) would be preferred
+Pattern 6 (Elasticsearch native snapshot to a new temporary PVC per backup) would be preferred
 because Elasticsearch explicitly discourages filesystem-level PVC snapshots of its data volumes:
 <https://www.elastic.co/docs/deploy-manage/tools/snapshot-and-restore#other-backup-methods>
 
@@ -23,14 +23,11 @@ Elasticsearch CR, which triggers a rolling restart when changed. A per-backup te
 would require two rolling restarts per backup cycle (add PVC → snapshot → remove PVC), which is
 unacceptably disruptive.
 
-Pattern 5 is used instead: a **permanent snapshot repository PVC** is declared once in the
-Elasticsearch pod template as a one-time workload configuration change. This enables Elasticsearch
-native snapshots (consistent, append-only) while Kasten CSI-snapshots the repo PVC alongside the
-data PVCs. Kasten is the data mover; the ES native snapshot in the repo PVC is the primary restore
-artefact.
-
-This matches the CLAUDE.md guidance: *"You choose 5 over 3 when the database snapshot cannot be
-done without having the PVC attached to the database pod."*
+Pattern 3 (sub-case A) is used instead: a **permanent snapshot repository PVC** is declared once
+in the Elasticsearch pod template as a one-time workload configuration change. This enables
+Elasticsearch native snapshots (consistent, append-only) while Kasten CSI-snapshots the repo PVC
+alongside the data PVCs. Kasten is the data mover; the ES native snapshot in the repo PVC is the
+primary restore artefact.
 
 ### Snapshot repository PVC — storage class requirements
 
