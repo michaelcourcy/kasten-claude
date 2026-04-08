@@ -137,6 +137,10 @@ The snapshot repository PVC requires a RWX storage class that Kasten can snapsho
 - Kasten has a corresponding Retain-policy VolumeSnapshotClass registered.
 
 Update the `storageClassName` in `operator/snapshot-repo-pvc.yaml` to match your environment.
+The value used in this blueprint (`ebs-sc`) is the AWS EBS CSI class from the test environment.
+Replace it with a RWX-capable CSI class that has a matching `VolumeSnapshotClass` registered
+with Kasten (e.g. `azurefile-csi` on AKS, or an EFS-backed class on AWS).
+Do **not** use legacy in-tree classes — they do not support CSI snapshots.
 
 ### Custom tool image
 

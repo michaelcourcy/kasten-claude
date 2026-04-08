@@ -78,7 +78,16 @@ The choice must balance implementation complexity (backup **and** restore), and 
 Deploy the target application in a test namespace. Create a representative minimum dataset that will let you validate a restore (e.g. a known set of records, files, or keys that you can verify after recovery). For the speed of the development lifecycle this is very important to create a limited dataset (Under 5Kb). Later once the whole blueprint works you can try performance test by increasing the size of the dataset. But this is out of the scope of this activity. 
 
 The way you deploy the workload and how you create test data should be documented in the README.md so that
-user can test it on their own. Also you must describe how to remove the workload and its dependencies. 
+user can test it on their own. Also you must describe how to remove the workload and its dependencies.
+
+**Storage class in README examples**: whenever a `storageClassName` appears in a README deployment example, add a callout note immediately after the manifest reminding the reader that the value is cluster-specific and must be replaced with a CSI storage class that supports snapshots on their cluster. Example note:
+
+> **Storage class**: `ebs-sc` is the AWS EBS CSI storage class used in our test environment.
+> Replace it with a storage class that supports CSI snapshots on your cluster
+> (e.g. `managed-csi` on AKS, `standard-rwo` on GKE, your custom class on bare-metal, etc.).
+> The class must have a matching `VolumeSnapshotClass` registered with Kasten.
+> Do **not** use legacy in-tree classes (e.g. `gp2` on AWS) — they do not support CSI snapshots.
+
 Describe also the deletion of the restorepointcontent created for the clean up :
 ```
 kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=<NAMESPACE USED FOR THE TEST>

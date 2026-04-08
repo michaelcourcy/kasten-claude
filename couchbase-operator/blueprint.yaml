@@ -8,15 +8,6 @@ actions:
     phases:
     - func: KubeExec
       name: cbBackup
-      objects:
-        cbConfig:
-          kind: ConfigMap
-          name: couchbase-blueprint-config
-          namespace: "{{ .Deployment.Namespace }}"
-        cbAuth:
-          kind: Secret
-          name: couchbase-backup-auth
-          namespace: "{{ .Deployment.Namespace }}"
       args:
         namespace: "{{ .Deployment.Namespace }}"
         pod: "{{ index .Deployment.Pods 0 }}"
@@ -28,9 +19,6 @@ actions:
           set -e
           ARCHIVE=/backup/data
           REPO=kasten-repo
-          USERNAME="{{ index .Phases.cbBackup.Secrets.cbAuth.Data "username" | toString }}"
-          PASSWORD="{{ index .Phases.cbBackup.Secrets.cbAuth.Data "password" | toString }}"
-          CLUSTER="couchbase://{{ .Phases.cbBackup.ConfigMaps.cbConfig.Data.clusterName }}.{{ .Deployment.Namespace }}.svc.cluster.local"
 
           echo "=== Couchbase backup pre-hook ==="
           echo "Cluster: $CLUSTER"
@@ -114,11 +102,6 @@ actions:
     phases:
     - func: KubeTask
       name: resumeCluster
-      objects:
-        cbConfig:
-          kind: ConfigMap
-          name: couchbase-blueprint-config
-          namespace: "{{ .Object.metadata.namespace }}"
       args:
         namespace: kasten-io
         image: michaelcourcy/kasten-tools:8.5.2
@@ -128,7 +111,8 @@ actions:
         - |
           set -e
           NAMESPACE="{{ .Object.metadata.namespace }}"
-          CLUSTER_NAME="{{ .Phases.resumeCluster.ConfigMaps.cbConfig.Data.clusterName }}"
+          KEEPER_NAME="{{ .Deployment.Name }}"
+          CLUSTER_NAME="${KEEPER_NAME%-keeper}"
 
           echo "=== Couchbase restore post-hook: resuming cluster $CLUSTER_NAME ==="
           kubectl patch couchbasecluster "$CLUSTER_NAME" -n "$NAMESPACE" \
@@ -153,15 +137,6 @@ actions:
 
     - func: KubeExec
       name: cbRestore
-      objects:
-        cbConfig:
-          kind: ConfigMap
-          name: couchbase-blueprint-config
-          namespace: "{{ .Object.metadata.namespace }}"
-        cbAuth:
-          kind: Secret
-          name: couchbase-backup-auth
-          namespace: "{{ .Object.metadata.namespace }}"
       args:
         namespace: "{{ .Deployment.Namespace }}"
         pod: "{{ index .Deployment.Pods 0 }}"
@@ -173,9 +148,6 @@ actions:
           set -e
           ARCHIVE=/backup/data
           REPO=kasten-repo
-          USERNAME="{{ index .Phases.cbRestore.Secrets.cbAuth.Data "username" | toString }}"
-          PASSWORD="{{ index .Phases.cbRestore.Secrets.cbAuth.Data "password" | toString }}"
-          CLUSTER="couchbase://{{ .Phases.cbRestore.ConfigMaps.cbConfig.Data.clusterName }}.{{ .Object.metadata.namespace }}.svc.cluster.local"
 
           echo "=== Couchbase restore post-hook: restoring data ==="
           echo "Cluster: $CLUSTER"

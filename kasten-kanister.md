@@ -91,6 +91,32 @@ Deployment does not need to do anything at runtime — it simply keeps the PVC m
 can discover it and so that `KubeExec` has a stable target. Use a lightweight long-running command
 such as `sleep infinity` if the image does not have a natural entrypoint.
 
+**Multi-keeper namespaces — naming convention and env-var pattern**
+
+When a namespace contains more than one workload (e.g. two independent Couchbase clusters),
+deploy one keeper per workload. To keep a single blueprint reusable across all of them, follow
+these conventions:
+
+- **Naming**: name each keeper Deployment and its backup PVC after the workload it serves,
+  suffixed with `-keeper`. For example, the keeper for `cb-example` is named `cb-example-keeper`
+  and its PVC is also `cb-example-keeper`. This makes the relationship immediately visible.
+- **Generic component label**: add a stable component label (e.g. `couchbase-keeper: "true"`)
+  to every keeper Deployment. The BlueprintBinding targets this label — not the specific
+  deployment name — so one binding covers all keepers in the fleet.
+- **Env vars instead of `objects:`**: set `USERNAME`, `PASSWORD`, and `CLUSTER` directly in the
+  keeper Deployment's `env:` block (using `secretKeyRef` for credentials). Because `KubeExec`
+  runs inside the keeper pod, these variables are already present in the shell environment when
+  the backup script executes. The blueprint phases need no `objects:` block — no ConfigMap or
+  Secret is fetched at runtime — making the blueprint fully generic and free of workload-specific
+  object references.
+- **Cluster name derivation in KubeTask phases**: when a `KubeTask` phase (which runs in a
+  separate pod outside the keeper) needs the workload name, derive it from the keeper Deployment
+  name by stripping the `-keeper` suffix:
+  ```bash
+  KEEPER_NAME="{{ .Deployment.Name }}"
+  CLUSTER_NAME="${KEEPER_NAME%-keeper}"   # e.g. cb-example-keeper → cb-example
+  ```
+
 ### Reserved action names — Backup
 
 | Action | When Kasten calls it | Typical use |
@@ -428,6 +454,15 @@ This ordering reflects a deliberate trade-off in favour of the **Single Responsi
   snapshotted. Action hooks are namespace-scoped: one blueprint handles all workloads in the
   namespace, which violates SRP and OCP. See the warning block in patterns 6–8.
 
+What is true for PVC is also true for Custom Resource: any Custom Resource (for instance a cnpg.io.Backup object) 
+or PVC that you create during resource.backupPrehook won't be captured in the restore point because the identification 
+of the resource to backup happens before resource.backupPrehook. 
+
+But if you create the Custom Resource or the PVC in backupAction.preHook then the Custom Resource or
+the PVC will be included in the restore point.
+
+
+
 ### 1. Fence and quiesce a replica
 
 - **Principle**: Fence (halt) replication synchronization and quiesce a replica to take a backup of the application volumes.
@@ -458,10 +493,11 @@ This ordering reflects a deliberate trade-off in favour of the **Single Responsi
 ### 4. Database dump or snapshot on a permanent PVC (sub-case B — keeper Deployment)
 
 - **Principle**: A dedicated keeper Deployment mounts the backup PVC permanently and runs the backup tool image (e.g. the database server image that includes the backup tool). The `backupPrehook` uses `KubeExec` into the keeper pod to write the dump or snapshot to the PVC. Kasten discovers the PVC through the keeper Deployment's ownership chain.
-- **Example**: [couchbase-operator](./couchbase-operator/) (future evolution — current implementation uses a temporary backup pod instead)
+- **Example**: [couchbase-operator](./couchbase-operator/)
 - **Pro**: No change to the main workload configuration. PVC is always discovered because the keeper keeps it mounted. `KubeExec` avoids temporary pod lifecycle management. BlueprintBinding attaches to the keeper Deployment.
 - **Cons**: Requires deploying an extra Deployment alongside the workload. The keeper image must include the backup tool (e.g. `couchbase/server:<version>` for `cbbackupmgr`).
-- **BlueprintBinding**: Yes — attach to the keeper Deployment.
+- **BlueprintBinding**: Yes — attach to the keeper Deployment using a generic component label (e.g. `couchbase-keeper: "true"`) so one binding covers multiple keepers in the same namespace.
+- **Env vars**: Set `USERNAME`, `PASSWORD`, and `CLUSTER` as env vars on the keeper Deployment (using `secretKeyRef` for credentials). `KubeExec` phases inherit these from the pod environment — no `objects:` block needed in the blueprint. Follow the naming convention `<workload>-keeper` for both the Deployment and its PVC; `KubeTask` phases can recover the workload name by stripping the `-keeper` suffix from `{{ .Deployment.Name }}`.
 - **Filter PVC**: Yes — you can take only the permanent PVC used for the backup.
 
 ### 5. Create logical dump or database snapshot on PVC already used by the database

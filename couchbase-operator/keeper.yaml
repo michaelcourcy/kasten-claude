@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: kasten-backup
+  name: cb-example-keeper
   namespace: couchbase-test
 spec:
   accessModes:
@@ -14,28 +14,50 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: couchbase-backup-keeper
+  name: cb-example-keeper
   namespace: couchbase-test
   labels:
-    app: couchbase-backup-keeper
+    app: cb-example-keeper
+    couchbase-keeper: "true"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: couchbase-backup-keeper
+      app: cb-example-keeper
   template:
     metadata:
       labels:
-        app: couchbase-backup-keeper
+        app: cb-example-keeper
+        couchbase-keeper: "true"
     spec:
       containers:
       - name: couchbase-backup
         image: couchbase/server:7.6.6
         command: ["/bin/bash", "-c", "sleep infinity"]
+        env:
+        - name: USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: cb-example-auth
+              key: username
+        - name: PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cb-example-auth
+              key: password
+        - name: CLUSTER
+          value: "couchbase://cb-example.couchbase-test.svc.cluster.local"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
         volumeMounts:
         - name: backup
           mountPath: /backup
       volumes:
       - name: backup
         persistentVolumeClaim:
-          claimName: kasten-backup
+          claimName: cb-example-keeper

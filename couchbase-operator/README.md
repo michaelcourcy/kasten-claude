@@ -4,7 +4,7 @@
 
 **Pattern 4 — Database backup on a permanent PVC (sub-case B: keeper Deployment)**
 
-A dedicated `couchbase-backup-keeper` Deployment mounts the `kasten-backup` PVC permanently.
+A dedicated `cb-example-keeper` Deployment mounts the `cb-example-keeper` PVC permanently.
 The `backupPrehook` uses `KubeExec` to run `cbbackupmgr backup` inside the keeper pod,
 which connects to the Couchbase cluster over the network and writes an incremental backup to
 `/backup/data/kasten-repo`. Kasten then snapshots both the data PVC and the backup PVC.
@@ -23,6 +23,18 @@ On restore, Kasten restores the backup PVC from its snapshot. The `restorePostho
   without needing a BackupAction preHook.
 - The keeper Deployment provides a stable BlueprintBinding target, satisfying the
   Single Responsibility Principle (SRP) and Open/Closed Principle (OCP).
+
+**Naming convention and multi-keeper support**
+
+The keeper Deployment and its PVC are named after the workload they serve, suffixed with
+`-keeper` (`cb-example-keeper` for the `cb-example` cluster). When multiple Couchbase clusters
+exist in the same namespace, deploy one keeper per cluster following the same convention.
+
+The BlueprintBinding targets the label `couchbase-keeper: "true"` — not a specific deployment
+name — so a single binding covers every keeper in the fleet. Each keeper's `env:` block carries
+`USERNAME`, `PASSWORD`, and `CLUSTER` for its specific cluster. `KubeExec` phases inherit these
+variables from the pod environment, so the blueprint needs no `objects:` block and no per-cluster
+ConfigMap or Secret reference.
 
 **Backup is incremental:** `cbbackupmgr` performs a full backup on the first run,
 then incremental backups on subsequent runs. Each restore replays the full chain
@@ -89,7 +101,7 @@ spec:
   - metadata:
       name: data
     spec:
-      storageClassName: ebs-sc
+      storageClassName: ebs-sc   # adapt to your cluster — see note below
       resources:
         requests:
           storage: 5Gi
@@ -103,9 +115,11 @@ kubectl wait couchbasecluster cb-example -n couchbase-test \
   --timeout=300s
 ```
 
-> **Storage class**: `ebs-sc` uses the AWS EBS CSI driver and supports CSI snapshots,
-> which are required for Kasten. Do not use the default `gp2` class (in-tree driver,
-> no CSI snapshot support).
+> **Storage class**: `ebs-sc` is the AWS EBS CSI storage class used in our test environment.
+> Replace it with a CSI storage class that supports snapshots on your cluster
+> (e.g. `managed-csi` on AKS, `standard-rwo` on GKE).
+> The class must have a matching `VolumeSnapshotClass` registered with Kasten.
+> Do **not** use legacy in-tree classes (e.g. `gp2` on AWS) — they do not support CSI snapshots.
 
 ### Create test data
 
@@ -127,23 +141,11 @@ kubectl exec -n couchbase-test $CB_POD -- \
   -d 'statement=SELECT * FROM `default`' | python3 -m json.tool
 ```
 
-### Deploy the backup keeper and config
+### Deploy the backup keeper
 
 ```bash
-# Create the backup PVC and the keeper Deployment
+# Create the backup PVC and the keeper Deployment (credentials are injected via env vars)
 kubectl apply -f keeper.yaml
-
-# Create the ConfigMap that the blueprint reads for cluster connection info
-kubectl apply -n couchbase-test -f - <<'EOF'
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: couchbase-blueprint-config
-  namespace: couchbase-test
-data:
-  clusterName: cb-example
-  authSecret: cb-example-auth
-EOF
 ```
 
 ### Deploy the blueprint and BlueprintBinding
@@ -159,11 +161,11 @@ kubectl apply -f blueprintbinding.yaml
 
 | Action | Phase | Function | Description |
 |---|---|---|---|
-| `backupPrehook` | `cbBackup` | `KubeExec` | Creates backup repo if absent; runs `cbbackupmgr backup` (full on first run, incremental on subsequent runs) inside the keeper pod. Reads credentials from the Secret and connection info from the ConfigMap. |
+| `backupPrehook` | `cbBackup` | `KubeExec` | Creates backup repo if absent; runs `cbbackupmgr backup` (full on first run, incremental on subsequent runs) inside the keeper pod. Uses `$USERNAME`, `$PASSWORD`, `$CLUSTER` env vars injected into the keeper container. |
 | `backupPosthook` | `cbVerify` | `KubeExec` | Runs `cbbackupmgr info` to confirm the backup was written to the PVC before Kasten takes the PVC snapshot. |
 | `restorePrehook` | `quiesceNamespace` | `KubeTask` | Scales all Deployments and StatefulSets in the namespace to 0 replicas and force-kills any remaining pods. This stops the Couchbase operator from recreating workloads or PVCs while Kasten deletes and restores them. **Not triggered in Kasten ≤ 8.5.x — see warning below.** |
-| `restorePosthook` | `resumeCluster` | `KubeTask` | Patches `spec.paused=false`, then polls until the cluster is `Available`. |
-| `restorePosthook` | `cbRestore` | `KubeExec` | Runs `cbbackupmgr restore --force-updates` from the keeper pod to replay the full backup chain into the running Couchbase cluster. |
+| `restorePosthook` | `resumeCluster` | `KubeTask` | Derives the cluster name from the keeper Deployment name (strips `-keeper` suffix), patches `spec.paused=false`, then polls until the cluster is `Available`. |
+| `restorePosthook` | `cbRestore` | `KubeExec` | Clears stale archive locks then runs `cbbackupmgr restore --force-updates --restore-partial-backups` from the keeper pod. Uses `$USERNAME`, `$PASSWORD`, `$CLUSTER` env vars from the keeper container. |
 
 ---
 

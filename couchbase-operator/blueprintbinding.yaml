@@ -15,10 +15,10 @@ spec:
             - group: apps
               resource: deployments
       - labels:
-          key: app
+          key: couchbase-keeper
           operator: In
           values:
-            - couchbase-backup-keeper
+            - "true"
       - annotations:
           key: kanister.kasten.io/blueprint
           operator: DoesNotExist

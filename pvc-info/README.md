@@ -145,7 +145,7 @@ spec:
         name: data
       spec:
         accessModes: [ReadWriteOnce]
-        storageClassName: ebs-sc
+        storageClassName: ebs-sc   # adapt to your cluster — see note below
         resources:
           requests:
             storage: 1Gi
@@ -154,6 +154,12 @@ EOF
 # Wait for the PVC to be bound
 kubectl wait pvc/data-test-app-0 -n pvc-info-test --for=jsonpath='{.status.phase}'=Bound --timeout=120s
 ```
+
+> **Storage class**: `ebs-sc` is the AWS EBS CSI storage class used in the test environment.
+> Replace it with a CSI storage class that supports snapshots on your cluster
+> (e.g. `managed-csi` on AKS, `standard-rwo` on GKE).
+> The class must have a matching `VolumeSnapshotClass` registered with Kasten.
+> Do **not** use legacy in-tree classes (e.g. `gp2` on AWS) — they do not support CSI snapshots.
 
 ### Create the policy and trigger a RunAction
 
