@@ -161,11 +161,11 @@ kubectl apply -f blueprintbinding.yaml
 
 | Action | Phase | Function | Description |
 |---|---|---|---|
-| `backupPrehook` | `cbBackup` | `KubeExec` | Creates backup repo if absent; runs `cbbackupmgr backup` (full on first run, incremental on subsequent runs) inside the keeper pod. Uses `$USERNAME`, `$PASSWORD`, `$CLUSTER` env vars injected into the keeper container. |
+| `backupPrehook` | `cbBackup` | `KubeExec` | Creates backup repo if absent; runs `cbbackupmgr backup` (full on first run, incremental on subsequent runs) inside the keeper pod. Uses `$USERNAME`, `$PASSWORD`, `$CLUSTER` env vars injected into the keeper container. Calls `sync` after backup completes to flush the OS page cache to the EBS volume — without this, cbbackupmgr's sqlite index files may be 0-byte on the snapshot, causing "invalid Rift index" errors on restore. |
 | `backupPosthook` | `cbVerify` | `KubeExec` | Runs `cbbackupmgr info` to confirm the backup was written to the PVC before Kasten takes the PVC snapshot. |
 | `restorePrehook` | `quiesceNamespace` | `KubeTask` | Scales all Deployments and StatefulSets in the namespace to 0 replicas and force-kills any remaining pods. This stops the Couchbase operator from recreating workloads or PVCs while Kasten deletes and restores them. **Not triggered in Kasten ≤ 8.5.x — see warning below.** |
 | `restorePosthook` | `resumeCluster` | `KubeTask` | Derives the cluster name from the keeper Deployment name (strips `-keeper` suffix), patches `spec.paused=false`, then polls until the cluster is `Available`. |
-| `restorePosthook` | `cbRestore` | `KubeExec` | Clears stale archive locks then runs `cbbackupmgr restore --force-updates --restore-partial-backups` from the keeper pod. Uses `$USERNAME`, `$PASSWORD`, `$CLUSTER` env vars from the keeper container. |
+| `restorePosthook` | `cbRestore` | `KubeExec` | Polls the Couchbase REST API until it accepts connections (cluster `Available` status does not guarantee the REST API is ready). Clears stale archive locks, then runs `cbbackupmgr restore --force-updates --restore-partial-backups --purge` from the keeper pod. `--purge` clears any incomplete restore-progress state left in the backup PVC by a previous failed attempt. Uses `$USERNAME`, `$PASSWORD`, `$CLUSTER` env vars from the keeper container. |
 
 ---
 

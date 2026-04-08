@@ -43,6 +43,10 @@ actions:
 
           echo "Backup completed successfully."
 
+          # Flush OS page cache to disk so the EBS snapshot captures fully-written data.
+          # Without this, cbbackupmgr .rift index files may be incomplete in the snapshot.
+          sync
+
   backupPosthook:
     phases:
     - func: KubeExec
@@ -152,6 +156,21 @@ actions:
           echo "=== Couchbase restore post-hook: restoring data ==="
           echo "Cluster: $CLUSTER"
 
+          # The CouchbaseCluster status transitions to Available before the node is fully
+          # ready to accept client connections. Wait for the REST API to respond before
+          # attempting cbbackupmgr restore.
+          echo "Waiting for Couchbase REST API to be ready ..."
+          for i in $(seq 1 30); do
+            if curl -sf -u "$USERNAME:$PASSWORD" \
+                "http://$(echo $CLUSTER | sed 's|couchbase://||'):8091/pools/default" \
+                -o /dev/null 2>/dev/null; then
+              echo "  Attempt $i/30: REST API is ready."
+              break
+            fi
+            echo "  Attempt $i/30: not ready yet, waiting 10s ..."
+            sleep 10
+          done
+
           # Remove any stale lockfile and temp dir left by a previous process.
           # cbbackupmgr writes lock.lk and .tmp/<pid>-<token>/ at archive root.
           # After a pod restart the lock is always stale and must be cleared.
@@ -166,6 +185,7 @@ actions:
             --username "$USERNAME" \
             --password "$PASSWORD" \
             --force-updates \
-            --restore-partial-backups
+            --restore-partial-backups \
+            --purge
 
           echo "Restore completed successfully."

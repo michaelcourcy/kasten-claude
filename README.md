@@ -30,3 +30,7 @@ Can you make a blueprint for elasticsearch cluster deployed with the official op
 
 Can you make a blueprint for couchbase based on the installation described here 
 https://docs.couchbase.com/operator/current/install-kubernetes.html
+
+## Restest couchbase 
+
+Can you retest the couchbase solution end to end and start by cleaning up.
