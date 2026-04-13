@@ -34,3 +34,16 @@ https://docs.couchbase.com/operator/current/install-kubernetes.html
 ## Restest couchbase 
 
 Can you retest the couchbase solution end to end and start by cleaning up.
+
+## db2u on maximo
+
+Can you make a blueprint for backing up db2 on maximo with a dump. 
+You don't have to install the database and create test data they are already provided by maximo only use the current context and the db2u namespace. 
+For your restore test you should just find a description field and alter it in order to see that your alteration is reverted.
+It seems (but that needs confirmation) that a backup pvc already exist hence the pattern 3 (Database snapshot on a permanent PVC) comes naturally. 
+The starting point for the IBM documentation is here : https://www.ibm.com/docs/en/db2/11.5.x?topic=ad-backing-up-restoring-db2
+We want to be able to restore on another maximo instance hence we need also to manage the encryption keystore https://www.ibm.com/docs/en/db2/11.5.x?topic=ad-locating-keystore 
+but I don't know exactly what it is and how we should include this artifact in the backup/restore process, this you need to discover and explain. 
+You don't have to restore db2u in another maximo instance, but you must bring extra instruction on how it should be restored on another instance to ensure that 
+the client application that connect to this instance won't have to renew their truststore.
+
