@@ -176,23 +176,14 @@ kubectl apply -f blueprint.yaml
 kubectl apply -f blueprintbinding.yaml
 ```
 
-Annotate and label the `Db2uCluster` CR — both are required:
+Label the `Db2uCluster` CR :
 
 ```bash
-# 1. Bind the blueprint
-oc annotate db2ucluster <db2ucluster-name> -n db2u \
-  kanister.kasten.io/blueprint=db2u-maximo-blueprint
 
-# 2. Tell the restorePrehook which namespace holds the Maximo Manage workloads.
-#    This explicit label avoids fragile string derivation from the cluster name.
+#   This explicit label avoids fragile string derivation from the cluster name.
 oc label db2ucluster <db2ucluster-name> -n db2u \
   manage-namespace=<maximo-manage-namespace>
 
-# For the reference instance:
-oc annotate db2ucluster mas-instance1-workspace1-manage -n db2u \
-  kanister.kasten.io/blueprint=db2u-maximo-blueprint
-oc label db2ucluster mas-instance1-workspace1-manage -n db2u \
-  manage-namespace=mas-instance1-manage
 ```
 
 Verify:
@@ -211,141 +202,8 @@ kubectl get db2ucluster -n db2u \
    StatefulSet, calls `backupPrehook`, takes CSI snapshots, then calls `backupPosthook`.
 3. Check blueprint execution in the Kanister logs:
    ```bash
-   kubectl logs -n kasten-io -l component=executor --tail=10000 | grep -A 30 "db2OnlineBackup"
+   kubectl logs -n kasten-io -l component=kanister --tail=10000 -f | grep -oP "Out\":\"\K(.*?)\""
    ```
-
---- 
-
-## Restore steps 
-
-### Step 1 : scale down manage and db2u 
-
-**Manual pre-restore steps (required until the fix ships):**
-
-Before triggering a Kasten restore, manually scale down all workloads that hold DB2 connections.
-Two namespaces must be quiesced:
-
-1. **`mas-<instance-id>-manage`** — Maximo application pods that connect to DB2 as SYSADM. Without
-   scaling these down, Maximo reconnects immediately after each `FORCE APPLICATION`, and
-   `db2 deactivate db BLUDB` in `restorePosthook` stalls indefinitely.
-2. **`db2u`** — operator components and ancillary services that may hold connections or attempt
-   to reconcile while Kasten replaces the PVCs, leaving the restored PVCs in an inconsistent state.
-
-```bash
-# Read the manage namespace from the Db2uCluster label (same source as the blueprint)
-DB2U_NS=db2u
-
-for db2ucluster in $(kubectl get db2ucluster -o name -n $DB2U_NS)
-do 
-  MANAGE_NS=$(kubectl get $db2ucluster -n $DB2U_NS \
-    -o jsonpath='{.metadata.labels.manage-namespace}')
-
-  echo "Scaling down Maximo namespace: $MANAGE_NS"
-  kubectl scale deployment --all -n "$MANAGE_NS" --replicas=0
-  echo "Waiting 300s for all pods in $MANAGE_NS to terminate."
-  sleep 5
-  kubectl delete pod --all -n "$MANAGE_NS"
-  kubectl wait pod --all -n "$MANAGE_NS" --for=delete --timeout=300s 2>/dev/null || true
-  echo "Pods in $MANAGE_NS terminated."
-done
-
-echo "Scaling down DB2u namespace: $DB2U_NS"
-kubectl scale deployment --all -n "$DB2U_NS" --replicas=0 2>/dev/null || true
-kubectl scale statefulset --all -n "$DB2U_NS" --replicas=0 2>/dev/null || true
-for cronjob in $(kubectl get cronjob -o name -n "$DB2U_NS"); do kubectl patch $cronjob -n "$DB2U_NS" -p '{"spec":{"suspend":true}}'; done
-kubectl wait pod --all -n "$DB2U_NS" --for=delete --timeout=300s 2>/dev/null || true
-echo "DB2u pods terminated."
-```
-
-### Step 2 : only restore the backup pvc 
-
-In the restorepoint unselect all except the backup PVCs for the db2uclusters that you want to restore.
-
-Wait for completion of the restoreaction only the backup PVCs that you selected are restored.
-
-### Step 3 : restart only the db2u namespace 
-
-```bash 
-echo "Scaling up DB2u namespace: $DB2U_NS"
-kubectl scale deployment --all -n "$DB2U_NS" --replicas=1 2>/dev/null || true
-kubectl scale statefulset --all -n "$DB2U_NS" --replicas=1 2>/dev/null || true
-for cronjob in $(kubectl get cronjob -o name -n "$DB2U_NS"); do kubectl patch $cronjob -n "$DB2U_NS" -p '{"spec":{"suspend":false}}'; done
-echo "DB2u pods re-started."
-```
-
-Wait for all pods to be ready.
-
-### Step 4 : Execute the restoration of the database 
-
-> **Note on `keystore.sth`:** The `.sth` file is the stash file containing the obfuscated
-> keystore password. Both `keystore.p12` and `keystore.sth` must be transferred together.
-> If only `keystore.p12` is present, `db2 restore` will prompt interactively.
-
-Exec on the first pod of the db2u statefulset on which you want to apply your restore (eg: c-mas-instance1-workspace1-manage-db2u-0)
-and execute those commands : 
-
-```bash
-BACKUP_DIR=/mnt/backup/backup
-
-# Restore the encryption keystore to KEYSTORE_LOCATION.
-# KEYSTORE_LOCATION = /mnt/blumeta0/db2/keystore/keystore.p12 (meta PVC).
-# We overwrite with the keystore that was saved alongside the backup image
-# on the backup PVC.  This guarantees the decryption key matches the backup
-# image regardless of the state of the meta PVC after Kasten restore.
-su - db2inst1 -c "cp -f $BACKUP_DIR/keystore.p12 /mnt/blumeta0/db2/keystore/keystore.p12"
-su - db2inst1 -c "cp -f $BACKUP_DIR/keystore.sth /mnt/blumeta0/db2/keystore/keystore.sth"
-
-# Disconnect all clients and deactivate BLUDB.
-# Both commands are allowed to fail: the database may already be inactive
-# if DB2 crash recovery did not complete after the PVC restore.
-su - db2inst1 -c "db2 force applications all || true"
-su - db2inst1 -c "db2 deactivate db BLUDB || true"
-
-# Restore the database from the backup image.
-# db2 restore returns SQL2540W (exit 2) when restoring over an existing
-# database with the same name — expected and harmless.
-TIMESTAMP=$(su - db2inst1 -c "ls $BACKUP_DIR/BLUDB.*.001 | sort | tail -1 | xargs basename | cut -d. -f5")
-echo "Restoring BLUDB from backup timestamp: $TIMESTAMP ..."
-su - db2inst1 -c "db2 restore db BLUDB from $BACKUP_DIR taken at $TIMESTAMP without prompting" && RC=0 || RC=$?
-if [ "$RC" -ne 0 ] && [ "$RC" -ne 2 ]; then
-  echo "ERROR: db2 restore failed (exit $RC)"; exit $RC
-fi
-echo "Restore completed (RC=$RC — 0 or 2 both indicate success)."
-
-# Roll forward to end of backup.
-# INCLUDE LOGS embedded the required archive log files in the backup image.
-# db2 restore extracted those logs to the active log path.
-# Rolling forward to end-of-backup replays exactly those logs and stops the
-# database at the precise, consistent state it was in when the backup ended.
-# Changes committed between backup completion and the Kasten snapshot time
-# are intentionally not replayed.
-echo "Rolling forward to end of backup ..."
-su - db2inst1 -c "db2 rollforward db BLUDB to end of backup and stop"
-echo "Rollforward completed."
-
-
-# Ensure the archive log directory exists after restore.
-su - db2inst1 -c "mkdir -p /mnt/backup/archivelog"
-
-# Activate the database and verify.
-su - db2inst1 -c "db2 activate db BLUDB"
-echo "BLUDB activated."
-su - db2inst1 -c "db2 connect to BLUDB && db2 'SELECT COUNT(*) FROM SYSCAT.TABLES' && db2 disconnect all"
-echo "=== Restore post-hook completed successfully ==="
-```
-
-### Step 5 Scale up the manage database 
-
-```bash 
-DB2U_NS=db2u
-for db2ucluster in $(kubectl get db2ucluster -o name -n $DB2U_NS)
-do 
-  MANAGE_NS=$(kubectl get $db2ucluster -n $DB2U_NS \
-    -o jsonpath='{.metadata.labels.manage-namespace}')
-  echo "Scaling up Maximo namespace: $MANAGE_NS"
-  kubectl scale deployment --all -n "$MANAGE_NS" --replicas=1  
-done
-```
 
 ---
 
@@ -369,6 +227,97 @@ the encryption keystore from the backup PVC to `KEYSTORE_LOCATION` before runnin
 so decryption is handled correctly without touching the SSL keystore.
 
 The procedure above guarantee that both same and cross cluster will work.
+
+--- 
+
+## Restore steps 
+
+### Step 1 : scale down manage and db2u 
+
+**Manual pre-restore steps (required until the fix ships):**
+
+Before triggering a Kasten restore, manually scale down all workloads that hold DB2 connections.
+Two namespaces must be quiesced:
+
+1. **`mas-<instance-id>-manage`** — Maximo application pods that connect to DB2 as SYSADM. Without
+   scaling these down, Maximo reconnects immediately after each `FORCE APPLICATION`, and
+   `db2 deactivate db BLUDB` in `restorePosthook` stalls indefinitely.
+2. **`db2u`** — operator components and ancillary services that may hold connections or attempt
+   to reconcile while Kasten replaces the PVCs, leaving the restored PVCs in an inconsistent state.
+
+```bash
+# Read the manage namespace from the Db2uCluster label (same source as the blueprint)
+DB2U_NS=db2u
+echo "Scaling down the manage namespaces"
+for db2ucluster in $(kubectl get db2ucluster -o name -n $DB2U_NS)
+do 
+  MANAGE_NS=$(kubectl get $db2ucluster -n $DB2U_NS \
+    -o jsonpath='{.metadata.labels.manage-namespace}')
+
+  echo "Scaling down Maximo namespace: $MANAGE_NS"
+  kubectl scale deployment --all -n "$MANAGE_NS" --replicas=0
+  echo "Waiting 300s for all pods in $MANAGE_NS to terminate."
+  sleep 5
+  kubectl delete pod --all -n "$MANAGE_NS"
+  kubectl wait pod --all -n "$MANAGE_NS" --for=delete --timeout=300s 2>/dev/null || true
+  echo "Pods in $MANAGE_NS terminated."
+done
+
+
+DB2U_NS=db2u
+echo "Scaling down DB2u namespace: $DB2U_NS"
+kubectl scale deployment --all -n "$DB2U_NS" --replicas=0 2>/dev/null || true
+kubectl scale statefulset --all -n "$DB2U_NS" --replicas=0 2>/dev/null || true
+for cronjob in $(kubectl get cronjob -o name -n "$DB2U_NS"); do kubectl patch $cronjob -n "$DB2U_NS" -p '{"spec":{"suspend":true}}'; done
+kubectl delete pod --all -n $DB2U_NS
+kubectl wait pod --all -n "$DB2U_NS" --for=delete --timeout=300s 2>/dev/null || true
+echo "DB2u pods terminated."
+```
+
+### Step 2 : Only restore the backup pvc 
+
+In the restorepoint unselect all (PVCs and resources) except the backup PVCs for the db2uclusters you want to restore.
+
+Wait for completion of the restoreaction only the backup PVCs that you selected are restored.
+
+### Step 3 : restart only the db2u namespace 
+
+```bash 
+DB2U_NS=db2u
+echo "Scaling up DB2u namespace: $DB2U_NS"
+kubectl scale deployment --all -n "$DB2U_NS" --replicas=1 2>/dev/null || true
+kubectl scale statefulset --all -n "$DB2U_NS" --replicas=1 2>/dev/null || true
+for cronjob in $(kubectl get cronjob -o name -n "$DB2U_NS"); do kubectl patch $cronjob -n "$DB2U_NS" -p '{"spec":{"suspend":false}}'; done
+echo "DB2u pods re-started."
+```
+
+Wait for all pods to be ready, it can take 5 to 10 minutes, the pod `c-mas-<instance-id>-<workspace-id>-manage-db2u-0` is the last being ready, 
+sometime it restarts.
+
+### Step 4 : Execute the restoration of the database 
+
+Connect to the first pod of the statefulset (eg: c-mas-instance1-workspace1-manage-db2u-0)
+
+```bash
+BACKUP_DIR=/mnt/backup/backup
+# following the IBM documentation https://www.ibm.com/docs/en/db2/11.5.x?topic=backup-using-restore-script#db2-restore-script_11-5-8__enc
+TIMESTAMP=$(su - db2inst1 -c "ls $BACKUP_DIR/BLUDB.*.001 | sort | tail -1 | xargs basename | cut -d. -f5")
+echo "Restoring BLUDB from backup timestamp: $TIMESTAMP ..."
+db_restore_extdb --bkp-dir ${BACKUP_DIR} --dbname BLUDB --bkp-timestamp $TIMESTAMP --replace --keystore-dir ${BACKUP_DIR}
+```
+
+### Step 5 Scale up the manage namespaces 
+
+```bash 
+DB2U_NS=db2u
+for db2ucluster in $(kubectl get db2ucluster -o name -n $DB2U_NS)
+do 
+  MANAGE_NS=$(kubectl get $db2ucluster -n $DB2U_NS \
+    -o jsonpath='{.metadata.labels.manage-namespace}')
+  echo "Scaling up Maximo namespace: $MANAGE_NS"
+  kubectl scale deployment --all -n "$MANAGE_NS" --replicas=1  
+done
+```
 
 ---
 
