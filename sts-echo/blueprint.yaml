@@ -1,0 +1,39 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: sts-echo
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    phases:
+      - func: KubeTask
+        name: echoSTSDataAtBackupPrehook
+        args:
+          image: busybox
+          namespace: "{{ .Object.metadata.namespace }}"
+          command:
+            - sh
+            - -c
+            - |
+              echo backupPrehook running ...
+              {{- range $key, $value := .Object.metadata.labels }}
+              echo "Label: {{ $key }}={{ $value }}"
+              {{- end }}
+              echo backupPrehook completed.
+  
+  restorePosthook:
+    phases:
+      - func: KubeTask
+        name: echoSTSDataAtRestorePosthook
+        args:
+          image: busybox
+          namespace: "{{ .Object.metadata.namespace }}"
+          command:
+            - sh
+            - -c
+            - |
+              echo restorePosthook running ...
+              {{- range $key, $value := .Object.metadata.labels }}
+              echo "Label: {{ $key }}={{ $value }}"
+              {{- end }}
+              echo restorePosthook completed.
