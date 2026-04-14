@@ -33,11 +33,14 @@ su - db2inst1 -c "/opt/ibm/db2/V11.5.0.0/gskit/bin/gsk8capicmd_64 -cert -export 
   -target /mnt/backup/backup/BLUDB-source.raw -target_type pkcs12 -target_stashed"
 ```
  
-# With kasten export from the source and restore the backup pvc in the destination cluster 
+# On the destination cluster 
 
-Scaled down db2u, restore only the backup pvc then scale up.
- 
-Now import the key in the key store of the destination 
+Scaled down manage.
+Scale down db2u.
+
+Export the backup pvc With kasten from the source and restore only it in the destination leave the others pvc untouched. Do not restore any other resources.
+
+Scale up db2u and connect to the sts pod and import the key in the key store of the destination :
 ```
 su - db2inst1 -c "opt/ibm/db2/V11.5.0.0/gskit/bin/gsk8capicmd_64 \
    -cert -import -db /mnt/backup/backup/BLUDB-source.raw \
