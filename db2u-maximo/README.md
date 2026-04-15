@@ -56,7 +56,7 @@ it in the destination instance.
 * `backupPrehook` copie the label and encryption master key alongside the backup image *before* 
   Kasten takes the snapshot. The backup PVC therefore always holds a matched pair (image + key).
 * `restorePosthook` is for the moment manual and described in this document, it must be executed
-  after the backup PVC is restored and db2u restored.
+  after the backup PVC is restored and db2u restarted.
 
 **SSL keystore (not backed up):** The DB2 SSL keystore (`bludb_ssl.kdb`) is stored on the meta PVC
 and is intentionally *not* copied to the backup PVC because for cross-instance restore we need the 
