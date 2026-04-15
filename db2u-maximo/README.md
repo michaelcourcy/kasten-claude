@@ -48,8 +48,8 @@ resource in the DB2u operator ownership chain: `Db2uCluster → Formation → St
 
 DB2 encrypts the database at rest and the backup image using a PKCS12 keystore stored at
 `KEYSTORE_LOCATION` (typically `/mnt/blumeta0/db2/keystore/keystore.p12`). The backup image
-cannot be restored without the matching keystore — `db2 restore` will fail with a decryption error
-if the keystore has changed since the backup was taken.
+cannot be restored without the label/encryption in the keystore, it's why we copy it to reinstall 
+it in the destination instance.
 
 **What the blueprint does:**
 
