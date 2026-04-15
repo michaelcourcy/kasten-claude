@@ -49,6 +49,7 @@ actions:
         - |
           set -e
           BACKUP_DIR=/mnt/backup/backup
+          su - db2inst1 -c "mkdir -p $BACKUP_DIR"
 
           echo "=== DB2u Maximo backup pre-hook ==="
           echo "Namespace : {{ .Object.metadata.namespace }}"
@@ -69,19 +70,21 @@ actions:
           BACKUP_FILE=$(su - db2inst1 -c "ls $BACKUP_DIR/BLUDB.*.001 | tail -1")
           echo "Backup image: $BACKUP_FILE"
 
-          # Copy the encryption keystore alongside the backup image.
-          # The KEYSTORE_LOCATION keystore (PKCS12) holds the master encryption key
-          # used to encrypt both the database at rest and the backup image itself.
-          # Storing keystore.p12 + keystore.sth next to the backup image on the same
-          # Kasten-snapshotted PVC guarantees the key and its matching backup are
-          # always restored together.
-          echo "Copying encryption keystore ..."
-          su - db2inst1 -c "
-            cp /mnt/blumeta0/db2/keystore/keystore.p12 $BACKUP_DIR/keystore.p12
-            cp /mnt/blumeta0/db2/keystore/keystore.sth $BACKUP_DIR/keystore.sth
-            chmod 600 $BACKUP_DIR/keystore.p12 $BACKUP_DIR/keystore.sth
-          "
-          echo "Encryption keystore copied."
+          # When restoring on another instance we'll need the keystore to decrypt the backup, so copy it to the backup location
+          # The keystore contains the master key which is required to decrypt the backup image.  
+          # The .sth file contains the stash password for the keystore, which is needed if the keystore 
+          # is exported in stashed mode (recommended for security, see README.md "One-time prerequisite — enabling archive logging").
+          echo "Copy BLUDB database encryption master key with its label "
+          LABEL=$(su - db2inst1 -c "/mnt/blumeta0/home/db2inst1/sqllib/adm/db2pd -db BLUDB -encrypt" \
+          | grep "Master Key Label:" \
+          | head -1 \
+          | awk '{print $NF}')
+          echo "Master key label/encryption $LABEL will be copied to $BACKUP_DIR/BLUDB-source.raw"
+          su - db2inst1 -c "/opt/ibm/db2/V11.5.0.0/gskit/bin/gsk8capicmd_64 -cert -export \
+            -db /mnt/blumeta0/db2/keystore/keystore.p12 \
+            -stashed \
+            -label $LABEL \
+            -target $BACKUP_DIR/BLUDB-source.raw -target_type pkcs12 -target_stashed"
 
           # Flush OS page cache so the block-level CSI snapshot captures the
           # fully-written backup image and keystore before Kasten triggers it.
@@ -109,9 +112,9 @@ actions:
           if [ -z "$BACKUP_FILE" ]; then
             echo "ERROR: No backup image found in $BACKUP_DIR"; exit 1
           fi
-          if [ ! -f "$BACKUP_DIR/keystore.p12" ]; then
-            echo "ERROR: Encryption keystore not found at $BACKUP_DIR/keystore.p12"; exit 1
+          if [ ! -f "$BACKUP_DIR/BLUDB-source.raw" ]; then
+            echo "ERROR: Encryption keystore not found at $BACKUP_DIR/BLUDB-source.raw"; exit 1
           fi
           echo "Backup image : $BACKUP_FILE ($(du -sh "$BACKUP_FILE" | cut -f1))"
-          echo "Keystore     : $BACKUP_DIR/keystore.p12 (present)"
+          echo "Keystore     : $BACKUP_DIR/BLUDB-source.raw (present)"
           echo "=== Backup post-hook completed ==="
