@@ -33,14 +33,13 @@ Those storage class can change depending of your installation.
 
 The blueprint uses [**Pattern 3A — database snapshot on a permanent backup PVC**](https://github.com/michaelcourcy/kasten-claude/blob/main/kasten-kanister.md#3-database-snapshot-on-a-permanent-pvc-sub-case-a--pvc-mounted-by-workload). The `backupPrehook`
 runs `db2 backup db BLUDB online … include logs` inside the DB2u engine pod, writing the backup
-image to the backup PVC at `/mnt/backup/backup/`. Kasten then snapshots all PVCs (including the
-backup PVC). 
+image to the backup PVC at `/mnt/backup/backup/`. The Blueprint copy also the master label/encryption key of the database.
+ Kasten then snapshots all PVCs (including the backup PVC). 
 
 The blueprint does not implement the restore phase, the restore is described later on [the restore steps section](#restore-steps).
 
 **Blueprint binding approach:** The blueprint is bound to the `Db2uCluster` CR (the top-level
-resource in the DB2u operator ownership chain: `Db2uCluster → Formation → StatefulSet`). The
-recommended approach is to annotate the `Db2uCluster` CR directly. A `BlueprintBinding` targeting
+resource in the DB2u operator ownership chain: `Db2uCluster → Formation → StatefulSet`). A `BlueprintBinding` targeting
 `db2uclusters` is also provided as a fleet automation mechanism.
 
 ---
