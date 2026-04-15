@@ -40,7 +40,7 @@ The blueprint does not implement the restore phase, the restore is described lat
 
 **Blueprint binding approach:** The blueprint is bound to the `Db2uCluster` CR (the top-level
 resource in the DB2u operator ownership chain: `Db2uCluster → Formation → StatefulSet`). A `BlueprintBinding` targeting
-`db2uclusters` is also provided as a fleet automation mechanism.
+`db2uclusters` is provided as a fleet automation mechanism, most of the installations run several instances on the same cluster.
 
 ---
 
