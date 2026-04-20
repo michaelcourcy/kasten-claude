@@ -47,3 +47,6 @@ but I don't know exactly what it is and how we should include this artifact in t
 You don't have to restore db2u in another maximo instance, but you must bring extra instruction on how it should be restored on another instance to ensure that 
 the client application that connect to this instance won't have to renew their truststore.
 
+# CNPG 
+
+Create a blueprint to backup a CNPG instance 

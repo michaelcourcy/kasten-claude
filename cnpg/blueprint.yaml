@@ -1,0 +1,120 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: cnpg-blueprint
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    phases:
+      - func: KubeTask
+        name: pauseWalReplay
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NAMESPACE="{{ .Object.metadata.namespace }}"
+              CLUSTER="{{ .Object.metadata.name }}"
+
+              REPLICA=$(kubectl get pods -n "$NAMESPACE" \
+                -l "cnpg.io/cluster=${CLUSTER},cnpg.io/instanceRole=replica" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+              if [ -z "$REPLICA" ]; then
+                echo "No replica found — single-instance cluster, skipping WAL pause"
+                exit 0
+              fi
+
+              echo "Pausing WAL replay on replica $REPLICA"
+              kubectl exec -n "$NAMESPACE" "$REPLICA" -- \
+                psql -U postgres -c "SELECT pg_wal_replay_pause();"
+
+              PAUSED=$(kubectl exec -n "$NAMESPACE" "$REPLICA" -- \
+                psql -U postgres -At -c "SELECT pg_is_wal_replay_paused();")
+              echo "WAL replay paused: $PAUSED"
+
+  backupPosthook:
+    phases:
+      - func: KubeTask
+        name: resumeWalReplay
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NAMESPACE="{{ .Object.metadata.namespace }}"
+              CLUSTER="{{ .Object.metadata.name }}"
+
+              REPLICA=$(kubectl get pods -n "$NAMESPACE" \
+                -l "cnpg.io/cluster=${CLUSTER},cnpg.io/instanceRole=replica" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+              if [ -z "$REPLICA" ]; then
+                echo "No replica found — nothing to resume"
+                exit 0
+              fi
+
+              echo "Resuming WAL replay on replica $REPLICA"
+              kubectl exec -n "$NAMESPACE" "$REPLICA" -- \
+                psql -U postgres -c "SELECT pg_wal_replay_resume();"
+
+              PAUSED=$(kubectl exec -n "$NAMESPACE" "$REPLICA" -- \
+                psql -U postgres -At -c "SELECT pg_is_wal_replay_paused();")
+              echo "WAL replay paused after resume: $PAUSED"
+
+  restorePrehook:
+    # NOTE: not yet triggered by Kasten <= 8.5.x — see README for manual steps
+    phases:
+      - func: KubeTask
+        name: stopCluster
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NAMESPACE="{{ .Object.metadata.namespace }}"
+              CLUSTER="{{ .Object.metadata.name }}"
+
+              echo "Deleting CNPG Cluster CR — operator will stop all pods and remove PVCs"
+              kubectl delete cluster.postgresql.cnpg.io "$CLUSTER" \
+                -n "$NAMESPACE" --ignore-not-found
+
+              echo "Waiting for all CNPG pods to terminate"
+              kubectl wait pods -n "$NAMESPACE" \
+                -l "cnpg.io/cluster=$CLUSTER" \
+                --for=delete --timeout=5m || true
+              echo "All CNPG pods terminated"
+
+  restorePosthook:
+    phases:
+      - func: WaitV2
+        name: waitForClusterReady
+        args:
+          timeout: 600s
+          conditions:
+            anyOf:
+              - condition: '{{ range .status.conditions }}{{ if and (eq .type "Ready") (eq .status "True") }}true{{ end }}{{ end }}'
+                objectReference:
+                  apiVersion: v1
+                  group: postgresql.cnpg.io
+                  name: "{{ .Object.metadata.name }}"
+                  namespace: "{{ .Object.metadata.namespace }}"
+                  resource: clusters

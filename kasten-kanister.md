@@ -59,7 +59,7 @@ A blueprint attached to a high-level custom resource (e.g., an EDB `Cluster`) wi
 > with no prehook is only valid when the PVC already holds valid, up-to-date backup data that
 > does not need to be refreshed before snapshotting.
 
-### Permanent PVC discovery — two sub-cases
+### Permanent PVC discovery — three sub-cases
 
 A permanent PVC is always pre-existing when Kasten runs its discovery pass. However, a
 BlueprintBinding targets a **workload resource**, not a PVC directly. How Kasten links the PVC
@@ -91,31 +91,16 @@ Deployment does not need to do anything at runtime — it simply keeps the PVC m
 can discover it and so that `KubeExec` has a stable target. Use a lightweight long-running command
 such as `sleep infinity` if the image does not have a natural entrypoint.
 
-**Multi-keeper namespaces — naming convention and env-var pattern**
+**Sub-case C — Local MinIO keeper (S3-protocol data movers)**
 
-When a namespace contains more than one workload (e.g. two independent Couchbase clusters),
-deploy one keeper per workload. To keep a single blueprint reusable across all of them, follow
-these conventions:
+For workloads with a native S3-compatible backup mechanism (e.g. pgBackRest, wal-g, Cassandra
+Medusa), a MinIO Deployment in the application namespace acts as the local S3 endpoint, backed by
+a permanent PVC. Kasten discovers the PVC through the MinIO Deployment's ownership chain. The
+blueprint is bound to the MinIO Deployment, not to the main workload CR.
 
-- **Naming**: name each keeper Deployment and its backup PVC after the workload it serves,
-  suffixed with `-keeper`. For example, the keeper for `cb-example` is named `cb-example-keeper`
-  and its PVC is also `cb-example-keeper`. This makes the relationship immediately visible.
-- **Generic component label**: add a stable component label (e.g. `couchbase-keeper: "true"`)
-  to every keeper Deployment. The BlueprintBinding targets this label — not the specific
-  deployment name — so one binding covers all keepers in the fleet.
-- **Env vars instead of `objects:`**: set `USERNAME`, `PASSWORD`, and `CLUSTER` directly in the
-  keeper Deployment's `env:` block (using `secretKeyRef` for credentials). Because `KubeExec`
-  runs inside the keeper pod, these variables are already present in the shell environment when
-  the backup script executes. The blueprint phases need no `objects:` block — no ConfigMap or
-  Secret is fetched at runtime — making the blueprint fully generic and free of workload-specific
-  object references.
-- **Cluster name derivation in KubeTask phases**: when a `KubeTask` phase (which runs in a
-  separate pod outside the keeper) needs the workload name, derive it from the keeper Deployment
-  name by stripping the `-keeper` suffix:
-  ```bash
-  KEEPER_NAME="{{ .Deployment.Name }}"
-  CLUSTER_NAME="${KEEPER_NAME%-keeper}"   # e.g. cb-example-keeper → cb-example
-  ```
+See [Pattern 4C](#4c-database-backup-via-a-local-minio-keeper-s3-protocol-data-movers) in the
+Blueprint patterns section for the full description, deployment YAML, BlueprintBinding, and phase
+skeleton.
 
 ### Reserved action names — Backup
 
@@ -497,8 +482,294 @@ the PVC will be included in the restore point.
 - **Pro**: No change to the main workload configuration. PVC is always discovered because the keeper keeps it mounted. `KubeExec` avoids temporary pod lifecycle management. BlueprintBinding attaches to the keeper Deployment.
 - **Cons**: Requires deploying an extra Deployment alongside the workload. The keeper image must include the backup tool (e.g. `couchbase/server:<version>` for `cbbackupmgr`).
 - **BlueprintBinding**: Yes — attach to the keeper Deployment using a generic component label (e.g. `couchbase-keeper: "true"`) so one binding covers multiple keepers in the same namespace.
-- **Env vars**: Set `USERNAME`, `PASSWORD`, and `CLUSTER` as env vars on the keeper Deployment (using `secretKeyRef` for credentials). `KubeExec` phases inherit these from the pod environment — no `objects:` block needed in the blueprint. Follow the naming convention `<workload>-keeper` for both the Deployment and its PVC; `KubeTask` phases can recover the workload name by stripping the `-keeper` suffix from `{{ .Deployment.Name }}`.
+- **Env vars**: Set `USERNAME`, `PASSWORD`, and `CLUSTER` as env vars on the keeper Deployment (using `secretKeyRef` for credentials). `KubeExec` phases inherit these from the pod environment — no `objects:` block needed in the blueprint.
 - **Filter PVC**: Yes — you can take only the permanent PVC used for the backup.
+
+**Multi-keeper namespaces — naming convention and env-var pattern**
+
+When a namespace contains more than one workload (e.g. two independent Couchbase clusters),
+deploy one keeper per workload. To keep a single blueprint reusable across all of them, follow
+these conventions:
+
+- **Naming**: name each keeper Deployment and its backup PVC after the workload it serves,
+  suffixed with `-keeper`. For example, the keeper for `cb-example` is named `cb-example-keeper`
+  and its PVC is also `cb-example-keeper`. This makes the relationship immediately visible.
+- **Generic component label**: add a stable component label (e.g. `couchbase-keeper: "true"`)
+  to every keeper Deployment. The BlueprintBinding targets this label — not the specific
+  deployment name — so one binding covers all keepers in the fleet.
+- **Env vars instead of `objects:`**: set `USERNAME`, `PASSWORD`, and `CLUSTER` directly in the
+  keeper Deployment's `env:` block (using `secretKeyRef` for credentials). Because `KubeExec`
+  runs inside the keeper pod, these variables are already present in the shell environment when
+  the backup script executes. The blueprint phases need no `objects:` block — no ConfigMap or
+  Secret is fetched at runtime — making the blueprint fully generic and free of workload-specific
+  object references.
+- **Cluster name derivation in KubeTask phases**: when a `KubeTask` phase (which runs in a
+  separate pod outside the keeper) needs the workload name, derive it from the keeper Deployment
+  name by stripping the `-keeper` suffix:
+  ```bash
+  KEEPER_NAME="{{ .Deployment.Name }}"
+  CLUSTER_NAME="${KEEPER_NAME%-keeper}"   # e.g. cb-example-keeper → cb-example
+  ```
+
+### 4C. Database backup via a local MinIO keeper (S3-protocol data movers)
+
+- **Principle**: The workload has a native S3-compatible backup/restore mechanism. A MinIO
+  Deployment is deployed in the **application namespace** as the local S3 endpoint, backed by a
+  permanent PVC. Kasten discovers the PVC through the MinIO Deployment's ownership chain. The
+  `backupPrehook` triggers the workload's native backup to point at the local MinIO service
+  (`http://<minio-svc>:9000`). After Kasten snapshots the MinIO PVC, `restorePosthook` triggers
+  the workload to restore from it.
+- **Example**: no example yet
+- **Pro**: No custom dump image needed — MinIO is the off-the-shelf keeper image. The workload's
+  existing S3-protocol backup mechanism is reused as-is. BlueprintBinding works because MinIO's
+  PVC is permanent. Incremental if the workload's S3 tool supports it (e.g. wal-g, pgBackRest
+  with block-level incremental).
+- **Cons**: Requires deploying MinIO alongside the workload. If the backup tool is not already
+  available inside the workload pod, a sidecar or a separate pod (with narrow RBAC) is needed to
+  invoke it.
+- **BlueprintBinding**: Yes — target the MinIO Deployment via the generic label
+  `minio-s3-keeper: "true"`.
+- **Workload identity**: carry it in labels on the MinIO Deployment (`kasten.io/workload-name`,
+  `kasten.io/workload-kind`) rather than deriving it from the Deployment name. Read them in
+  blueprint phases via `{{ index .Object.metadata.labels "kasten.io/workload-name" }}`.
+- **Backup trigger strategy** — apply in order, stop at the first feasible option:
+  1. StatefulSet → `KubeExec` with deterministic pod name `<name>-0`, no discovery.
+  2. REST API / backup CR → `KubeTask` (app namespace) or `KubeOps`, no pod name needed.
+  3. Annotation-based trigger → `KubeOps` to annotate the workload.
+  4. Pod discovery → grant `default` SA in app namespace a namespace-scoped `Role` to `get`/`list` pods;
+     run `KubeTask` in the **app namespace** (uses narrow SA, not the broad Kasten SA in `kasten-io`).
+- **Filter PVC**: Yes — include only the MinIO PVC, not the workload's own data PVCs.
+
+#### MinIO keeper deployment manifest
+
+Replace `<app-namespace>`, `<workload>`, and `<storage-class>` with your values. Note that the
+`emptyDir` from development examples must be replaced with a PVC for production use.
+
+```yaml
+# Credentials Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: <workload>-minio-creds
+  namespace: <app-namespace>
+type: Opaque
+stringData:
+  accessKey: minio
+  secretKey: minio123        # use a strong secret in production
+---
+# Backup storage PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: <workload>-minio
+  namespace: <app-namespace>
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: <storage-class>   # must support CSI snapshots
+  resources:
+    requests:
+      storage: 20Gi
+---
+# MinIO keeper Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: <workload>-minio
+  namespace: <app-namespace>
+  labels:
+    app: <workload>-minio
+    minio-s3-keeper: "true"             # targeted by BlueprintBinding
+    kasten.io/workload-name: <workload> # read by the blueprint
+    kasten.io/workload-kind: StatefulSet  # or Deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: <workload>-minio
+  template:
+    metadata:
+      labels:
+        app: <workload>-minio
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: <workload>-minio
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: <workload>-minio-creds
+                  key: accessKey
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: <workload>-minio-creds
+                  key: secretKey
+          args: ["server", "/data", "--console-address", ":9090"]
+          ports:
+            - containerPort: 9000
+              name: s3
+            - containerPort: 9090
+              name: console
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          volumeMounts:
+            - mountPath: /data
+              name: data
+---
+# ClusterIP Service — S3 endpoint reachable within the namespace
+apiVersion: v1
+kind: Service
+metadata:
+  name: <workload>-minio
+  namespace: <app-namespace>
+spec:
+  selector:
+    app: <workload>-minio
+  ports:
+    - port: 9000
+      name: s3
+    - port: 9090
+      name: console
+  type: ClusterIP
+```
+
+#### BlueprintBinding
+
+```yaml
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: minio-s3-keeper-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: <blueprint-name>
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: minio-s3-keeper
+          operator: In
+          values: ["true"]
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist
+```
+
+#### Blueprint phase skeleton
+
+The S3 endpoint for in-namespace access is `http://<workload>-minio:9000`. From a KubeTask
+running in `kasten-io` or another namespace, use the full cluster DNS:
+`http://<workload>-minio.<app-namespace>.svc.cluster.local:9000`.
+
+```yaml
+actions:
+  backupPrehook:
+    phases:
+      # Option 1 — StatefulSet: pod name is deterministic, no discovery needed
+      - func: KubeExec
+        name: triggerBackup
+        objects:
+          minioCreds:
+            kind: Secret
+            name: '{{ index .Object.metadata.labels "kasten.io/workload-name" }}-minio-creds'
+            namespace: '{{ .Object.metadata.namespace }}'
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'
+          pod: '{{ index .Object.metadata.labels "kasten.io/workload-name" }}-0'
+          container: <workload-container>
+          command:
+            - bash
+            - -c
+            - |
+              MINIO_SVC="{{ index .Object.metadata.labels "kasten.io/workload-name" }}-minio"
+              ENDPOINT="http://${MINIO_SVC}:9000"
+              ACCESS_KEY='{{ index .Phases.triggerBackup.Secrets.minioCreds.Data "accessKey" | toString }}'
+              SECRET_KEY='{{ index .Phases.triggerBackup.Secrets.minioCreds.Data "secretKey" | toString }}'
+              # run the workload-specific S3 backup command, e.g.:
+              # wal-g backup-push --s3-endpoint "${ENDPOINT}" ...
+              # pgbackrest --stanza=main --repo1-s3-endpoint "${ENDPOINT}" backup
+
+      # Option 4 — pod discovery with narrow RBAC (last resort)
+      # Requires Role + RoleBinding for default SA — see sub-case C in the discovery section above.
+      - func: KubeTask
+        name: triggerBackupByDiscovery
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'   # app namespace → uses default SA
+          image: <image-with-kubectl-and-backup-tool>
+          command:
+            - bash
+            - -c
+            - |
+              APP_NS="{{ .Object.metadata.namespace }}"
+              WORKLOAD="{{ index .Object.metadata.labels "kasten.io/workload-name" }}"
+              MINIO_SVC="${WORKLOAD}-minio"
+              ENDPOINT="http://${MINIO_SVC}:9000"
+              ACCESS_KEY=$(kubectl get secret "${WORKLOAD}-minio-creds" -n "${APP_NS}" \
+                           -o jsonpath='{.data.accessKey}' | base64 -d)
+              SECRET_KEY=$(kubectl get secret "${WORKLOAD}-minio-creds" -n "${APP_NS}" \
+                           -o jsonpath='{.data.secretKey}' | base64 -d)
+              POD=$(kubectl get pod -n "${APP_NS}" -l "app=${WORKLOAD}" \
+                    --field-selector=status.phase=Running \
+                    -o jsonpath='{.items[0].metadata.name}')
+              kubectl exec -n "${APP_NS}" "${POD}" -- \
+                <workload-specific-backup-command> \
+                  --s3-endpoint "${ENDPOINT}" \
+                  --access-key "${ACCESS_KEY}" \
+                  --secret-key "${SECRET_KEY}"
+
+  restorePosthook:
+    phases:
+      # After Kasten restores the MinIO PVC, trigger the workload to reload from it
+      - func: KubeExec
+        name: triggerRestore
+        objects:
+          minioCreds:
+            kind: Secret
+            name: '{{ index .Object.metadata.labels "kasten.io/workload-name" }}-minio-creds'
+            namespace: '{{ .Object.metadata.namespace }}'
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'
+          pod: '{{ index .Object.metadata.labels "kasten.io/workload-name" }}-0'
+          container: <workload-container>
+          command:
+            - bash
+            - -c
+            - |
+              MINIO_SVC="{{ index .Object.metadata.labels "kasten.io/workload-name" }}-minio"
+              ENDPOINT="http://${MINIO_SVC}:9000"
+              ACCESS_KEY='{{ index .Phases.triggerRestore.Secrets.minioCreds.Data "accessKey" | toString }}'
+              SECRET_KEY='{{ index .Phases.triggerRestore.Secrets.minioCreds.Data "secretKey" | toString }}'
+              # run the workload-specific S3 restore command
+```
 
 ### 5. Create logical dump or database snapshot on PVC already used by the database
 

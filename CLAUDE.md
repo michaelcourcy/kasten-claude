@@ -71,7 +71,19 @@ When **Kasten is not the data mover**, two additional patterns apply. These are 
 9. **Trigger a dump of a managed database** — for cloud-managed databases (RDS, Firestore, MongoDB Atlas, etc.); the cloud provider owns immutability.
 10. **Use vendor operator data mover** — when the operator has a built-in backup API (CNPG, K8ssandra Medusa, Crunchy Postgres, etc.); the operator owns immutability.
 
-The choice must balance implementation complexity (backup **and** restore), and whether incrementality is critical (patterns 1–4 with append-only snapshots are incremental; plain dump patterns are not). **Document the chosen pattern and its rationale in a `README.md` before writing any code. This must be reviewed before development begins.**
+The choice must balance implementation complexity (backup **and** restore), and whether incrementality is critical (patterns 1–4 with append-only snapshots are incremental; plain dump patterns are not).
+
+> ⛔ **MANDATORY STOP — do not proceed to Step 2 until the user has explicitly approved the pattern.**
+>
+> When you reach this point you MUST:
+> 1. State the pattern you have chosen and explain why it is the best fit for this workload.
+> 2. List any patterns you considered and ruled out, with one-line reasons.
+> 3. Ask the user explicitly: *"Do you agree with this pattern choice? Should I proceed to Step 2?"*
+> 4. **Wait for the user's reply.** Do not write any README, deploy any workload, or write any code
+>    until the user confirms. If the user asks for changes, revise the analysis and repeat from point 1.
+>
+> Writing the README is part of Step 2, not Step 1. The only output of Step 1 is the user's
+> confirmed approval of the pattern.
 
 ### Step 2 — Deploy the workload and create test data
 
