@@ -8,7 +8,7 @@ Backup and restore for [CloudNativePG](https://cloudnative-pg.io/) PostgreSQL cl
 | Component | Version |
 |---|---|
 | Kubernetes | `1.32` (EKS) |
-| Kasten | `8.5.2` |
+| Kasten | `8.5.4` |
 | CNPG Helm chart | `cloudnative-pg 0.28.0` |
 | CNPG operator | `1.29.0` |
 | PostgreSQL | `18.3` |
@@ -175,9 +175,61 @@ kubectl exec -n cnpg-test pg-cluster-1 -- \
       ('David Johnson',  'Sales',       68000),
       ('Eve Williams',   'Engineering', 102000);
   "
+
+kubectl exec -n cnpg-test pg-cluster-1 -- \
+  psql -U postgres -d kasten_test -c "SELECT * FROM employees ORDER BY id;"
 ```
 
+Run the policy and corrupt some data :
+
+```bash 
+
+kubectl exec -n cnpg-test pg-cluster-1 -- \
+  psql -U postgres -d kasten_test -c "DELETE FROM employees WHERE department = 'Engineering';"
+
+kubectl exec -n cnpg-test pg-cluster-1 -- \
+  psql -U postgres -d kasten_test -c "SELECT * FROM employees ORDER BY id;"
+
+```
+
+then create a restore action from the last restore point 
+
+```bash
+# delete the cnpg cluster 
+kubectl delete clusters.postgresql.cnpg.io pg-cluster -n cnpg-test
+
+RESTORE_POINT=$(kubectl get restorepoint -n cnpg-test \
+  -o jsonpath='{.items[-1].metadata.name}')
+
+POLICY=$(kubectl get restorepoint -n cnpg-test "$RESTORE_POINT" \
+  -o jsonpath='{.metadata.labels.k10\.kasten\.io/policyName}')
+
+PROFILE=$(kubectl get policy "$POLICY" -n kasten-io \
+  -o jsonpath='{.spec.actions[?(@.action=="backup")].backupParameters.profile.name}')
+
+kubectl create -f - <<EOF
+apiVersion: actions.kio.kasten.io/v1alpha1
+kind: RestoreAction
+metadata:
+  generateName: restore-
+  namespace: cnpg-test
+spec:
+  subject:
+    apiVersion: apps.kio.kasten.io/v1alpha1
+    kind: RestorePoint
+    name: ${RESTORE_POINT}
+    namespace: cnpg-test
+  targetNamespace: cnpg-test
+  profile:
+    name: ${PROFILE}
+    namespace: kasten-io
+EOF
+```
+
+
+
 ## Validate data after restore
+
 
 ```bash
 # The primary pod name changes after restore (CNPG promotes the replica)
