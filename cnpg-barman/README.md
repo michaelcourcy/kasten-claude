@@ -225,7 +225,10 @@ kubectl wait pods -n cnpg-barman -l cnpg.io/cluster=pg-cluster --for=delete --ti
 
 ### Step 3 — Trigger Kasten restore
 
-Derive the restore point, policy, and location profile automatically, then trigger the restore:
+Derive the restore point, policy, and location profile automatically, then trigger the restore. Two `excludeResources` entries are applied so that no manual cleanup is needed afterward:
+
+- **Label filter** `cnpg.io/cluster: pg-cluster` — skips CNPG-managed services and endpoints (CNPG refuses to own objects it did not create; they will be recreated by the operator).
+- **Type + name filter** `postgresql.cnpg.io/clusters: pg-cluster` — skips the original Cluster CR (it will be replaced by `pg-cluster-restored` in the next step).
 
 ```bash
 RESTORE_POINT=$(kubectl get restorepoint -n cnpg-barman \
@@ -253,29 +256,25 @@ spec:
   profile:
     name: ${PROFILE}
     namespace: kasten-io
+  filters:
+    excludeResources:
+      - matchLabels:
+          cnpg.io/cluster: pg-cluster
+      - type:
+          operator: In
+          values:
+            - group: postgresql.cnpg.io
+              resource: clusters
+        names:
+          - pg-cluster
 EOF
 ```
 
-Wait for the RestoreAction to complete (100%). Kasten restores the MinIO PVC and all other resources (Deployments, Services, Secrets, etc.) from the restore point.
+Wait for the RestoreAction to complete (100%). Kasten restores the MinIO PVC, Deployment, Secrets, ConfigMaps, and other resources — but not the CNPG-managed services or the original Cluster CR.
 
-### Step 4 — Clean up stale CNPG services
+### Step 4 — Create a CNPG recovery cluster
 
-Kasten restores the CNPG Services from the restore point. CNPG refuses to own services it did not create. Delete them so CNPG can recreate them on startup:
-
-```bash
-kubectl delete service -n cnpg-barman -l cnpg.io/cluster=pg-cluster
-```
-
-Also delete the CNPG Cluster CR if Kasten restored it (it will be replaced with the recovery cluster manifest):
-
-```bash
-kubectl delete cluster.postgresql.cnpg.io pg-cluster -n cnpg-barman 2>/dev/null || true
-kubectl wait pods -n cnpg-barman -l cnpg.io/cluster=pg-cluster --for=delete --timeout=3m 2>/dev/null || true
-```
-
-### Step 5 — Create a CNPG recovery cluster
-
-Create a new Cluster CR that bootstraps from the barman archive in MinIO. The `externalClusters[].name` **must exactly match the original cluster name** (`pg-cluster`) because CNPG uses it as the barman server path in S3 (`s3://cnpg-backup/pg-cluster/`).
+Create a new Cluster CR named `pg-cluster-restored` that bootstraps from the barman archive in MinIO. The `externalClusters[].name` **must exactly match the original cluster name** (`pg-cluster`) because CNPG uses it as the barman server path in S3 (`s3://cnpg-backup/pg-cluster/`).
 
 The `backup.barmanObjectStore.destinationPath` must point to a **different bucket** (`cnpg-backup-recovered`) — CNPG refuses to start if the write destination already contains an archive.
 
@@ -284,7 +283,7 @@ kubectl apply -f - <<EOF
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
-  name: pg-cluster
+  name: pg-cluster-restored
   namespace: cnpg-barman
   labels:
     cnpg-backup-pattern: barman-minio
@@ -331,14 +330,14 @@ spec:
 EOF
 ```
 
-### Step 6 — Wait and verify
+### Step 5 — Wait and verify
 
 ```bash
-kubectl wait cluster.postgresql.cnpg.io pg-cluster -n cnpg-barman \
+kubectl wait cluster.postgresql.cnpg.io pg-cluster-restored -n cnpg-barman \
   --for=condition=Ready --timeout=10m
 
 PRIMARY=$(kubectl get pods -n cnpg-barman \
-  -l "cnpg.io/cluster=pg-cluster,cnpg.io/instanceRole=primary" \
+  -l "cnpg.io/cluster=pg-cluster-restored,cnpg.io/instanceRole=primary" \
   -o jsonpath='{.items[0].metadata.name}')
 
 kubectl exec -n cnpg-barman "$PRIMARY" -- \
