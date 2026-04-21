@@ -26,7 +26,15 @@ A dedicated MinIO `Deployment` (the *keeper*) with a permanent PVC stores the CN
 Kasten then snapshots the MinIO PVC (and only that PVC — CNPG data PVCs are excluded via policy filter). The MinIO snapshot contains a self-consistent barman archive: a base backup plus all WALs up to the switch.
 
 **Why this pattern:**  
-Barman owns data movement and immutability. Kasten's role is solely to snapshot the MinIO PVC at a moment when the archive is consistent. This avoids duplicating CNPG's existing WAL archiving infrastructure.
+The goal is to give Kasten full ownership of data protection while keeping barman's scope strictly local to the namespace. Barman writes to a MinIO instance that lives in the same namespace — it never leaves it. Kasten then takes over everything beyond that boundary:
+
+- **Encryption at rest** — Kasten encrypts snapshot data at the storage layer; barman has no equivalent.
+- **Secure, authenticated data movement** — Kasten handles egress to the backup target; the application team never needs credentials for the external location profile.
+- **Immutability** — Kasten enforces immutability at the backup target; barman retention policies alone cannot guarantee this.
+- **Broad backup target support** — Kasten can protect to NFS, Veeam Vault, VBR, and other targets that barman-cloud does not support.
+- **Incrementality** — Kasten's PVC snapshot mechanism is incremental; a plain barman export to an external store is a full transfer each time.
+- **Local restore cache** — because MinIO is in the same namespace, a restore from the most recent restore point does not require fetching data from the external backup location — it reads directly from the local PVC snapshot, which is fast.
+- **Credential isolation** — the application team only needs to create MinIO credentials inside their namespace. They never need to know or share the Kasten location profile credentials, which simplifies both security and configuration significantly.
 
 ## Architecture
 
