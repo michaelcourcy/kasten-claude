@@ -225,12 +225,19 @@ kubectl wait pods -n cnpg-barman -l cnpg.io/cluster=pg-cluster --for=delete --ti
 
 ### Step 3 — Trigger Kasten restore
 
-List available restore points and trigger a restore:
+Derive the restore point, policy, and location profile automatically, then trigger the restore:
 
 ```bash
-kubectl get restorepoint -n cnpg-barman
+RESTORE_POINT=$(kubectl get restorepoint -n cnpg-barman \
+  -o jsonpath='{.items[-1].metadata.name}')
 
-kubectl create -f - --validate=false <<EOF
+POLICY=$(kubectl get restorepoint -n cnpg-barman "$RESTORE_POINT" \
+  -o jsonpath='{.metadata.labels.k10\.kasten\.io/policyName}')
+
+PROFILE=$(kubectl get policy "$POLICY" -n kasten-io \
+  -o jsonpath='{.spec.actions[?(@.action=="backup")].backupParameters.profile.name}')
+
+kubectl create -f - <<EOF
 apiVersion: actions.kio.kasten.io/v1alpha1
 kind: RestoreAction
 metadata:
@@ -240,11 +247,11 @@ spec:
   subject:
     apiVersion: apps.kio.kasten.io/v1alpha1
     kind: RestorePoint
-    name: <RESTORE_POINT_NAME>
+    name: ${RESTORE_POINT}
     namespace: cnpg-barman
   targetNamespace: cnpg-barman
   profile:
-    name: <LOCATION_PROFILE_NAME>   # type=Location, e.g. "us-east-1"
+    name: ${PROFILE}
     namespace: kasten-io
 EOF
 ```
