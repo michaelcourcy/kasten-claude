@@ -5,6 +5,11 @@ metadata:
   namespace: kasten-io
 actions:
   backupPrehook:
+    outputArtifacts:
+      barmanBackup:
+        keyValue:
+          backupName: "{{ .Phases.triggerBarmanBackup.Output.backupName }}"
+          namespace: "{{ .Phases.triggerBarmanBackup.Output.namespace }}"
     phases:
       - func: KubeTask
         name: triggerBarmanBackup
@@ -81,3 +86,43 @@ actions:
               else
                 echo "WARNING: no primary pod found, skipping WAL switch"
               fi
+
+              kando output backupName "${BACKUP_NAME}"
+              kando output namespace "${NS}"
+
+  delete:
+    inputArtifactNames:
+      - barmanBackup
+    phases:
+      - func: KubeTask
+        name: deleteBarmanBackup
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              BACKUP_NAME="{{ .ArtifactsIn.barmanBackup.KeyValue.backupName }}"
+              NS="{{ .ArtifactsIn.barmanBackup.KeyValue.namespace }}"
+              echo "Deleting the backup CR ${BACKUP_NAME} from namespace ${NS}..."
+
+              echo "Checking namespace ${NS}..."
+              if ! kubectl get namespace "${NS}" > /dev/null 2>&1; then
+                echo "Namespace ${NS} no longer exists — nothing to delete."
+                exit 0
+              fi
+
+              echo "Checking Backup CR ${BACKUP_NAME} in namespace ${NS}..."
+              if ! kubectl get backups.postgresql.cnpg.io "${BACKUP_NAME}" -n "${NS}" > /dev/null 2>&1; then
+                echo "Backup CR ${BACKUP_NAME} does not exist — nothing to delete."
+                exit 0
+              fi
+
+              echo "Deleting Backup CR ${BACKUP_NAME} from namespace ${NS}..."
+              kubectl delete backups.postgresql.cnpg.io "${BACKUP_NAME}" -n "${NS}"
+              echo "Backup CR deleted. CNPG will reconcile and remove the barman data from MinIO."

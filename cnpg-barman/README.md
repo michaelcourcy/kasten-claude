@@ -56,9 +56,12 @@ The CNPG Cluster must carry the label `cnpg-backup-pattern: barman-minio`, which
 
 | Action | Hook | What it does |
 |---|---|---|
-| `backupPrehook` | Before PVC snapshot | Creates CNPG `Backup` CR, waits for completion, forces WAL switch |
+| `backupPrehook` | Before PVC snapshot | Creates CNPG `Backup` CR, waits for completion, forces WAL switch; outputs `backupName` and `namespace` as restore-point artifacts |
+| `delete` | On restore-point deletion | Deletes the CNPG `Backup` CR from the application namespace so the CNPG operator removes the corresponding barman data from MinIO; silently no-ops if the namespace or Backup CR no longer exists |
 
 No restore hooks are implemented — PITR recovery is a **manual procedure** using a CNPG recovery cluster manifest (see [PITR Recovery Procedure](#pitr-recovery-procedure) below).
+
+> **Why a `delete` action is necessary**: deleting a Kasten restore point only removes the MinIO PVC snapshot. The CNPG `Backup` CR and the barman base-backup data it references inside MinIO are not cleaned up automatically. Without the `delete` action, the MinIO bucket grows unboundedly. The `delete` action triggers the CNPG operator's normal garbage-collection path by deleting the `Backup` CR.
 
 ## Prerequisites
 
