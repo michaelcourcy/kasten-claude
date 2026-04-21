@@ -35,6 +35,7 @@ The goal is to give Kasten full ownership of data protection while keeping barma
 - **Incrementality** — Kasten's PVC snapshot mechanism is incremental; a plain barman export to an external store is a full transfer each time.
 - **Local restore cache** — because MinIO is in the same namespace, a restore from the most recent restore point does not require fetching data from the external backup location — it reads directly from the local PVC snapshot, which is fast.
 - **Credential isolation** — the application team only needs to create MinIO credentials inside their namespace. They never need to know or share the Kasten location profile credentials, which simplifies both security and configuration significantly.
+- **Repeatable, self-contained configuration** — every component (MinIO Deployment, PVC, CNPG Cluster, Secrets, blueprint) lives entirely within the application namespace. The same manifests can be deployed verbatim in a new namespace just by changing the namespace name — nothing else needs to be adapted. This makes the pattern an ideal candidate for productisation with Helm: a single chart parameterised only on the namespace (and optionally the storage class) can provision a fully protected CNPG cluster in any environment.
 
 ## Architecture
 
