@@ -105,7 +105,7 @@ kubectl wait deployment pg-cluster-minio -n cnpg-barman --for=condition=Availabl
 ### 3. Create the MinIO bucket
 
 ```bash
-kubectl run mc-init -n cnpg-barman --image=minio/mc:latest --restart=Never --rm -it -- \
+kubectl run mc-init -n cnpg-barman --image=minio/mc:latest --restart=Never --rm -it --command -- \
   /bin/sh -c "
     mc alias set local http://pg-cluster-minio:9000 minioadmin minioadmin123
     mc mb local/cnpg-backup
