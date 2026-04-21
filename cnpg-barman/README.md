@@ -9,7 +9,7 @@ Kasten blueprint for CloudNativePG clusters that use **barman-cloud WAL archivin
 | Component | Version |
 |---|---|
 | Kubernetes | `1.32` (EKS) |
-| Kasten | `8.5.2` |
+| Kasten | `8.5.4` |
 | CNPG operator / Helm chart | `1.29.0` / `cloudnative-pg 0.28.0` |
 | PostgreSQL | `18.3` |
 | MinIO | `RELEASE.2025-04-22T22-12-26Z` |
