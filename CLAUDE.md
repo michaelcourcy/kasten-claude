@@ -129,9 +129,19 @@ Write the Blueprint (and BlueprintBinding if needed). Document all deployment pr
 | Component | Version |
 |---|---|
 | Kubernetes | e.g. `1.32` (EKS) |
-| Kasten | e.g. `8.5.2` |
+| Kasten | e.g. `8.5.4` |
 | Operator / Helm chart | e.g. `mariadb-operator 25.10.4` |
 | Database / Application | e.g. `MariaDB 11.8.5` |
+
+**Always detect the Kasten version from the cluster** rather than hardcoding it. Use the appropriate command for the deployment method:
+
+```bash
+# Helm (most common)
+helm ls -n kasten-io
+
+# OpenShift OLM (CSV)
+kubectl get csv -n kasten-io -o jsonpath='{.items[?(@.spec.displayName=="Kasten K10")].spec.version}'
+```
 
 Omit the operator row for workloads deployed without an operator (plain Helm chart only).
 
