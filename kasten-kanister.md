@@ -451,7 +451,7 @@ the PVC will be included in the restore point.
 ### 1. Fence and quiesce a replica
 
 - **Principle**: Fence (halt) replication synchronization and quiesce a replica to take a backup of the application volumes.
-- **Example**: [EDB](https://github.com/kastendevhub/enterprise-blueprint/tree/main/edb) or [Kafka with Mirror Maker](https://github.com/michaelcourcy/kafka-kasten)
+- **Example**: [cnpg](./cnpg/)
 - **Pro**: No impact on the primary, because only a replica is quiesced.
 - **Cons**: At restore time, the operator must be able to promote the replica to primary, or you have to manually reconfigure your workload.
 - **BlueprintBinding**: Yes — attach to the workload CR.
@@ -519,7 +519,7 @@ these conventions:
   `backupPrehook` triggers the workload's native backup to point at the local MinIO service
   (`http://<minio-svc>:9000`). After Kasten snapshots the MinIO PVC, `restorePosthook` triggers
   the workload to restore from it.
-- **Example**: no example yet
+- **Example**: [cnpg-barman](./cnpg-barman/)
 - **Pro**: No custom dump image needed — MinIO is the off-the-shelf keeper image. The workload's
   existing S3-protocol backup mechanism is reused as-is. BlueprintBinding works because MinIO's
   PVC is permanent. Incremental if the workload's S3 tool supports it (e.g. wal-g, pgBackRest

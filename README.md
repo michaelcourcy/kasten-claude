@@ -50,3 +50,10 @@ the client application that connect to this instance won't have to renew their t
 # CNPG 
 
 Create a blueprint to backup a CNPG instance 
+
+# CNPG Point in time restore
+
+I want a blueprint to backup a CNPG instance using barman in order to leverage PIT (Point In Time) restore. I don't want you to implement the restore pre and post hook 
+because this is not adapted in the Kasten context. Instead I want you to document the steps by giving an example to restore at a precise PIT. 
+The barman configuration will work with a local minio cluster, one minio cluster per cnpg instance. 
+We are definitely in the pattern 4C. "Database backup via a local MinIO keeper (S3-protocol data movers)" so you don't need to ask for the validation of the pattern.

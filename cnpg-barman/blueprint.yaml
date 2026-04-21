@@ -1,0 +1,83 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: cnpg-barman-blueprint
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    phases:
+      - func: KubeTask
+        name: triggerBarmanBackup
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              KEEPER="{{ .Object.metadata.name }}"
+              NS="{{ .Object.metadata.namespace }}"
+              CLUSTER="${KEEPER%-minio}"
+              BACKUP_NAME="${CLUSTER}-kasten-$(date +%Y%m%d%H%M%S)"
+
+              echo "Triggering barman base backup: ${BACKUP_NAME} (cluster=${CLUSTER}, ns=${NS})"
+
+              kubectl create -n "${NS}" -f - <<EOF
+              apiVersion: postgresql.cnpg.io/v1
+              kind: Backup
+              metadata:
+                name: ${BACKUP_NAME}
+                namespace: ${NS}
+              spec:
+                method: barmanObjectStore
+                cluster:
+                  name: ${CLUSTER}
+              EOF
+
+              echo "Waiting for backup to complete (timeout 15m)..."
+              ELAPSED=0
+              while [ $ELAPSED -lt 900 ]; do
+                PHASE=$(kubectl get backups.postgresql.cnpg.io "${BACKUP_NAME}" -n "${NS}" \
+                  -o jsonpath='{.status.phase}' 2>/dev/null || echo "pending")
+                echo "  [${ELAPSED}s] phase: ${PHASE}"
+                case "${PHASE}" in
+                  completed)
+                    echo "Backup completed. MinIO PVC is consistent for Kasten snapshot."
+                    break
+                    ;;
+                  failed)
+                    echo "ERROR: backup failed"
+                    kubectl get backups.postgresql.cnpg.io "${BACKUP_NAME}" -n "${NS}" -o yaml | tail -40
+                    exit 1
+                    ;;
+                esac
+                sleep 10
+                ELAPSED=$((ELAPSED + 10))
+              done
+
+              if [ $ELAPSED -ge 900 ]; then
+                echo "ERROR: timed out waiting for barman backup"
+                kubectl get backups.postgresql.cnpg.io "${BACKUP_NAME}" -n "${NS}" -o yaml | tail -20
+                exit 1
+              fi
+
+              # Force a WAL segment switch so the post-backup checkpoint WAL is
+              # archived to MinIO before Kasten takes the PVC snapshot. Without this,
+              # the WAL needed for a consistent recovery point may not be flushed yet.
+              PRIMARY=$(kubectl get pods -n "${NS}" \
+                -l "cnpg.io/cluster=${CLUSTER},cnpg.io/instanceRole=primary" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+              if [ -n "${PRIMARY}" ]; then
+                echo "Forcing WAL switch on ${PRIMARY} to flush post-backup WALs..."
+                kubectl exec -n "${NS}" "${PRIMARY}" -- \
+                  psql -U postgres -At -c "SELECT pg_switch_wal();"
+                echo "Waiting 15s for WAL archival to complete..."
+                sleep 15
+                echo "WAL archival done. MinIO PVC is ready for Kasten snapshot."
+              else
+                echo "WARNING: no primary pod found, skipping WAL switch"
+              fi

@@ -1,0 +1,27 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-cluster
+  namespace: cnpg-barman
+  labels:
+    cnpg-backup-pattern: barman-minio
+spec:
+  instances: 2
+  storage:
+    size: 1Gi
+    storageClass: ebs-sc
+  backup:
+    barmanObjectStore:
+      endpointURL: http://pg-cluster-minio.cnpg-barman.svc:9000
+      destinationPath: s3://cnpg-backup/
+      s3Credentials:
+        accessKeyId:
+          name: pg-cluster-minio-creds
+          key: rootUser
+        secretAccessKey:
+          name: pg-cluster-minio-creds
+          key: rootPassword
+      wal:
+        compression: gzip
+        maxParallel: 2
+    retentionPolicy: "7d"
