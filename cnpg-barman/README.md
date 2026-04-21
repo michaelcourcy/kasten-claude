@@ -175,7 +175,10 @@ backupParameters:
           cnpg.io/pvcRole: PG_DATA
 ```
 
-Without this filter, Kasten snapshots both the CNPG data PVCs and the MinIO PVC. The restore would then overwrite the CNPG data PVCs with stale content before PITR has a chance to run — producing incorrect results.
+This filter serves two purposes:
+
+- **Correctness at restore time** — if the CNPG data PVCs are restored alongside the MinIO PVC, the operator would find PVCs with stale PostgreSQL data that predate the WAL archive. Any attempt to use the barman archive for recovery would fail or produce inconsistent results.
+- **Avoiding redundant storage** — the CNPG data PVCs (primary and replica) are already fully represented in the MinIO barman archive. Snapshotting them adds cost and snapshot quota consumption with no recovery benefit: the MinIO PVC alone is sufficient for a complete restore.
 
 ## Understanding PITR range and WAL retention
 
