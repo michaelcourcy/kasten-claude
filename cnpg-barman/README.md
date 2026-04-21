@@ -315,13 +315,9 @@ spec:
     excludeResources:
       - matchLabels:
           cnpg.io/cluster: pg-cluster
-      - type:
-          operator: In
-          values:
-            - group: postgresql.cnpg.io
-              resource: clusters
-        names:
-          - pg-cluster
+      - group: postgresql.cnpg.io
+        resource: clusters
+        name: pg-cluster
 EOF
 ```
 
