@@ -182,7 +182,7 @@ After a RunAction completes, check:
 
 ```bash
 # Confirm the Backup CR was created and completed
-kubectl get backups.postgresql.cnpg.io -n cnpg-barman -l cnpg.io/cluster=pg-cluster
+kubectl get backups.postgresql.cnpg.io -n cnpg-barman
 
 # Verify base backup and WALs are in MinIO
 MINIO_POD=$(kubectl get pods -n cnpg-barman -l app=pg-cluster-minio -o jsonpath='{.items[0].metadata.name}')
