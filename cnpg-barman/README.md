@@ -177,6 +177,57 @@ backupParameters:
 
 Without this filter, Kasten snapshots both the CNPG data PVCs and the MinIO PVC. The restore would then overwrite the CNPG data PVCs with stale content before PITR has a chance to run — producing incorrect results.
 
+## Understanding PITR range and WAL retention
+
+This section explains how far back you can recover and to what precision, so you can size the barman `retentionPolicy` correctly relative to your Kasten backup schedule.
+
+### What a Kasten restore point contains
+
+A Kasten restore point is a self-contained, immutable snapshot of the MinIO PVC taken at backup time. It is important to understand that this PVC does not only contain the base backup just created by `backupPrehook` — it contains the **entire barman archive** that existed on MinIO at that moment:
+
+- **All base backups** not yet pruned by the barman `retentionPolicy`.
+- **All WAL files** archived since the oldest retained base backup.
+
+WAL archiving is continuous: barman-cloud uploads a WAL segment to MinIO every time PostgreSQL seals one, 24 hours a day, independently of whether a base backup is running. By the time Kasten takes its snapshot, the MinIO PVC already holds a dense, uninterrupted WAL stream going back to the oldest retained base backup.
+
+### Concrete example
+
+Suppose Kasten runs daily backups and `retentionPolicy: "7d"`. On **January 3rd at 10:00** the `backupPrehook` creates a base backup and Kasten snapshots MinIO. That snapshot contains:
+
+- The **January 2nd 10:00 base backup** (and earlier ones, within the 7-day window)
+- Every WAL file produced between **January 2nd 10:00 and January 3rd 10:00** — including all transactions from January 3rd at 05:00
+
+To recover to **January 3rd at 05:00** from that restore point, CNPG uses the **January 2nd base backup** as the starting point and replays WALs forward up to 05:00. The January 3rd base backup cannot be used as the start because it is dated *after* the target time — WAL replay only moves forward.
+
+The restore point from January 3rd at 10:00 is therefore sufficient to recover to any moment between **January 2nd 10:00** and **January 3rd 10:00**.
+
+### How far back can you go?
+
+The oldest recoverable moment from a given restore point is the start time of the oldest base backup included in that MinIO snapshot. With daily Kasten backups and `retentionPolicy: "7d"`, the January 3rd restore point covers the last 7 days. The oldest Kasten restore point you still hold extends that window further back — each restore point carries its own independent WAL archive frozen at snapshot time.
+
+### Sizing `retentionPolicy` relative to the Kasten backup interval
+
+The barman `retentionPolicy` controls which base backups (and their associated WALs) are kept on the **live MinIO PVC**. Once a base backup falls outside the retention window, barman prunes it and the WALs that predate it from the live PVC.
+
+The risk is this: if `retentionPolicy` is shorter than the Kasten backup interval, the previous base backup may be pruned from the live MinIO *before* the next Kasten snapshot captures it. The resulting snapshot would contain only the freshly-created base backup and no prior history — drastically reducing the PITR window available from that restore point.
+
+**Rule of thumb: set `retentionPolicy` to at least 2× the Kasten backup interval.**
+
+| Kasten backup frequency | Minimum recommended `retentionPolicy` |
+|---|---|
+| Daily | `3d` (default `7d` in this blueprint gives comfortable headroom) |
+| Every 12 hours | `2d` |
+| Weekly | `14d` |
+
+### Summary table
+
+| Question | Answer |
+|---|---|
+| How far back can I recover? | To the start of the oldest base backup in the restored MinIO snapshot, governed by `retentionPolicy` and the Kasten restore point age |
+| How precisely can I target a recovery time? | Any transaction timestamp after the oldest base backup in the snapshot and before the last WAL in the snapshot |
+| What governs how many restore points I can choose from? | Kasten policy retention (number or age of restore points kept by Kasten) |
+| What happens if `retentionPolicy` < Kasten backup interval? | The previous base backup may be absent from the next snapshot, reducing PITR range to the interval since the last base backup only |
+
 ## Verifying a backup
 
 After a RunAction completes, check:
