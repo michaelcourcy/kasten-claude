@@ -1,0 +1,265 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: psmdb-blueprint
+  namespace: kasten-io
+actions:
+
+  backupPrehook:
+    outputArtifacts:
+      psmdbMeta:
+        keyValue:
+          # Stored in the restore point so restorePosthook knows which PVC holds the clean data.
+          quiescedPVC: "{{ .Phases.quiesceSecondary.Output.quiescedPVC }}"
+    phases:
+    - func: KubeTask
+      name: quiesceSecondary
+      args:
+        namespace: kasten-io
+        image: michaelcourcy/kasten-tools:8.5.2
+        command:
+        - bash
+        - -o
+        - errexit
+        - -o
+        - pipefail
+        - -c
+        - |
+          APP_NS="{{ .Object.metadata.namespace }}"
+          CR_NAME="{{ .Object.metadata.name }}"
+          CRED_SECRET="${CR_NAME}-secrets"
+
+          CLUSTER_ADMIN_USER=$(kubectl get secret "${CRED_SECRET}" -n "${APP_NS}" \
+            -o jsonpath='{.data.MONGODB_CLUSTER_ADMIN_USER}' | base64 -d)
+          CLUSTER_ADMIN_PASS=$(kubectl get secret "${CRED_SECRET}" -n "${APP_NS}" \
+            -o jsonpath='{.data.MONGODB_CLUSTER_ADMIN_PASSWORD}' | base64 -d)
+
+          REPLSET=$(kubectl get psmdb "${CR_NAME}" -n "${APP_NS}" \
+            -o jsonpath='{.spec.replsets[0].name}')
+          REPLICAS=$(kubectl get psmdb "${CR_NAME}" -n "${APP_NS}" \
+            -o jsonpath='{.spec.replsets[0].size}')
+
+          # Remove any stale kasten.io/psmdb-quiesced label from a previous backup.
+          # Required: a failover between backups would leave the label on the old secondary.
+          for PVC in $(kubectl get pvc -n "${APP_NS}" \
+            -l "app.kubernetes.io/instance=${CR_NAME},kasten.io/psmdb-quiesced=true" \
+            -o jsonpath='{.items[*].metadata.name}'); do
+            kubectl label pvc "${PVC}" -n "${APP_NS}" kasten.io/psmdb-quiesced-
+            echo "Removed stale quiesced label from: ${PVC}"
+          done
+
+          # Iterate from the highest ordinal down — pick the first secondary found.
+          TARGET_POD=""
+          for (( i=REPLICAS-1; i>=0; i-- )); do
+            POD="${CR_NAME}-${REPLSET}-${i}"
+            ROLE=$(kubectl exec -n "${APP_NS}" "${POD}" -c mongod -- \
+              mongosh "mongodb://localhost:27017/admin" \
+              -u "${CLUSTER_ADMIN_USER}" -p "${CLUSTER_ADMIN_PASS}" \
+              --quiet --eval 'print(rs.isMaster().ismaster ? "primary" : "secondary")' \
+              2>/dev/null || echo "unknown")
+            echo "Pod ${POD}: ${ROLE}"
+            if [ "${ROLE}" = "secondary" ]; then
+              TARGET_POD="${POD}"
+              break
+            fi
+          done
+
+          if [ -z "${TARGET_POD}" ]; then
+            echo "ERROR: No secondary found in replica set ${REPLSET}"
+            exit 1
+          fi
+
+          QUIESCED_PVC="mongod-data-${TARGET_POD}"
+          echo "Quiescing secondary: ${TARGET_POD} (PVC: ${QUIESCED_PVC})"
+
+          # fsyncLock: flushes all pending writes to disk and halts new I/O.
+          # This guarantees a crash-free snapshot regardless of storage-level crash consistency.
+          kubectl exec -n "${APP_NS}" "${TARGET_POD}" -c mongod -- \
+            mongosh "mongodb://localhost:27017/admin" \
+            -u "${CLUSTER_ADMIN_USER}" -p "${CLUSTER_ADMIN_PASS}" \
+            --quiet \
+            --eval 'print("fsyncLock lockCount:", db.fsyncLock().lockCount.toString())'
+
+          # Label the pod so backupPosthook can find it without re-querying MongoDB.
+          kubectl label pod "${TARGET_POD}" -n "${APP_NS}" \
+            kasten.io/psmdb-fsync-locked=true --overwrite
+
+          # Label the PVC so restorePosthook can identify the authoritative restore source.
+          # Kasten preserves PVC labels when it restores a PVC from a snapshot.
+          kubectl label pvc "${QUIESCED_PVC}" -n "${APP_NS}" \
+            kasten.io/psmdb-quiesced=true --overwrite
+
+          # Emit PVC name into the restore-point artifact as belt-and-suspenders fallback.
+          kando output quiescedPVC "${QUIESCED_PVC}"
+
+  backupPosthook:
+    phases:
+    - func: KubeTask
+      name: unquiesceSecondary
+      args:
+        namespace: kasten-io
+        image: michaelcourcy/kasten-tools:8.5.2
+        command:
+        - bash
+        - -o
+        - errexit
+        - -o
+        - pipefail
+        - -c
+        - |
+          APP_NS="{{ .Object.metadata.namespace }}"
+          CR_NAME="{{ .Object.metadata.name }}"
+          CRED_SECRET="${CR_NAME}-secrets"
+
+          CLUSTER_ADMIN_USER=$(kubectl get secret "${CRED_SECRET}" -n "${APP_NS}" \
+            -o jsonpath='{.data.MONGODB_CLUSTER_ADMIN_USER}' | base64 -d)
+          CLUSTER_ADMIN_PASS=$(kubectl get secret "${CRED_SECRET}" -n "${APP_NS}" \
+            -o jsonpath='{.data.MONGODB_CLUSTER_ADMIN_PASSWORD}' | base64 -d)
+
+          # Find the locked pod by the label set in backupPrehook.
+          LOCKED_POD=$(kubectl get pod -n "${APP_NS}" \
+            -l kasten.io/psmdb-fsync-locked=true \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+          if [ -z "${LOCKED_POD}" ]; then
+            echo "WARNING: No pod with label kasten.io/psmdb-fsync-locked=true — nothing to unlock"
+            exit 0
+          fi
+
+          echo "Unlocking pod: ${LOCKED_POD}"
+          kubectl exec -n "${APP_NS}" "${LOCKED_POD}" -c mongod -- \
+            mongosh "mongodb://localhost:27017/admin" \
+            -u "${CLUSTER_ADMIN_USER}" -p "${CLUSTER_ADMIN_PASS}" \
+            --quiet \
+            --eval 'print("fsyncUnlock lockCount:", db.fsyncUnlock().lockCount.toString())'
+
+          kubectl label pod "${LOCKED_POD}" -n "${APP_NS}" kasten.io/psmdb-fsync-locked-
+          echo "Pod ${LOCKED_POD} unlocked"
+
+  # Pauses the cluster so Kasten can safely replace PVCs during restore.
+  # NOTE: restorePrehook is NOT triggered in Kasten ≤ 8.5.x.
+  # restorePosthook handles the full cleanup automatically (no manual pre-restore steps needed).
+  restorePrehook:
+    inputArtifactNames:
+    - psmdbMeta
+    phases:
+    - func: KubeTask
+      name: pauseCluster
+      args:
+        namespace: kasten-io
+        image: michaelcourcy/kasten-tools:8.5.2
+        command:
+        - bash
+        - -o
+        - errexit
+        - -o
+        - pipefail
+        - -c
+        - |
+          APP_NS="{{ .Object.metadata.namespace }}"
+          CR_NAME="{{ .Object.metadata.name }}"
+
+          echo "Pausing PSMDB cluster ${CR_NAME} before PVC restore..."
+          kubectl patch psmdb "${CR_NAME}" -n "${APP_NS}" \
+            --type=merge -p '{"spec":{"pause":true}}'
+
+          for i in $(seq 1 30); do
+            PODS=$(kubectl get pods -n "${APP_NS}" \
+              -l "app.kubernetes.io/instance=${CR_NAME}" \
+              --no-headers 2>/dev/null | wc -l)
+            echo "Attempt ${i}: pods=${PODS}"
+            if [ "${PODS}" -eq 0 ]; then echo "All pods stopped"; exit 0; fi
+            sleep 10
+          done
+          echo "ERROR: Pods did not stop within 300 seconds"
+          exit 1
+
+  # Ensures only the quiesced PVC's data drives recovery:
+  #   1. Immediately pauses the cluster — prevents WiredTiger from activating on
+  #      non-quiesced PVCs (which may hold fuzzy snapshots on non-crash-consistent storage).
+  #   2. Deletes all PVCs except the quiesced one. The operator then creates fresh
+  #      empty PVCs for the other members, which sync from the quiesced node via
+  #      MongoDB initial sync.
+  # Because restorePosthook runs before WiredTiger completes startup (~30-120s per pod),
+  # this sequence is safe without restorePrehook (Kasten ≤ 8.5.x).
+  restorePosthook:
+    inputArtifactNames:
+    - psmdbMeta
+    phases:
+    - func: KubeTask
+      name: cleanupAndRestart
+      args:
+        namespace: kasten-io
+        image: michaelcourcy/kasten-tools:8.5.2
+        command:
+        - bash
+        - -o
+        - errexit
+        - -o
+        - pipefail
+        - -c
+        - |
+          APP_NS="{{ .Object.metadata.namespace }}"
+          CR_NAME="{{ .Object.metadata.name }}"
+
+          # Prefer the PVC label (survives restore with the PVC) over the artifact.
+          QUIESCED_PVC=$(kubectl get pvc -n "${APP_NS}" \
+            -l "app.kubernetes.io/instance=${CR_NAME},kasten.io/psmdb-quiesced=true" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+          # Fall back to the artifact if the label was not preserved.
+          if [ -z "${QUIESCED_PVC}" ]; then
+            QUIESCED_PVC="{{ .ArtifactsIn.psmdbMeta.KeyValue.quiescedPVC }}"
+          fi
+
+          if [ -z "${QUIESCED_PVC}" ]; then
+            echo "ERROR: Cannot determine quiesced PVC from label or artifact"
+            exit 1
+          fi
+
+          echo "Authoritative restore PVC: ${QUIESCED_PVC}"
+
+          # Immediately pause to prevent WiredTiger activating on fuzzy PVCs.
+          kubectl patch psmdb "${CR_NAME}" -n "${APP_NS}" \
+            --type=merge -p '{"spec":{"pause":true}}'
+
+          for i in $(seq 1 18); do
+            PODS=$(kubectl get pods -n "${APP_NS}" \
+              -l "app.kubernetes.io/instance=${CR_NAME}" \
+              --no-headers 2>/dev/null | wc -l)
+            echo "Waiting for pods to stop — attempt ${i}: pods=${PODS}"
+            if [ "${PODS}" -eq 0 ]; then break; fi
+            sleep 5
+          done
+
+          # Delete every PVC for this cluster except the quiesced one.
+          for PVC in $(kubectl get pvc -n "${APP_NS}" \
+            -l "app.kubernetes.io/instance=${CR_NAME}" \
+            -o jsonpath='{.items[*].metadata.name}'); do
+            if [ "${PVC}" = "${QUIESCED_PVC}" ]; then
+              echo "Preserving quiesced PVC: ${PVC}"
+            else
+              echo "Deleting non-quiesced PVC: ${PVC}"
+              kubectl delete pvc "${PVC}" -n "${APP_NS}"
+            fi
+          done
+
+          # Resume: the operator creates fresh empty PVCs for the deleted members,
+          # which then perform MongoDB initial sync from the quiesced node (now primary).
+          echo "Resuming cluster — quiesced node will become primary, others will initial-sync"
+          kubectl patch psmdb "${CR_NAME}" -n "${APP_NS}" \
+            --type=merge -p '{"spec":{"pause":false}}'
+
+    - func: WaitV2
+      name: waitForClusterReady
+      args:
+        timeout: 600s
+        conditions:
+        - anyOf:
+          - condition: '{{ if eq .status.state "ready" }}true{{ end }}'
+            objectReference:
+              apiVersion: v1
+              group: psmdb.percona.com
+              name: "{{ .Object.metadata.name }}"
+              namespace: "{{ .Object.metadata.namespace }}"
+              resource: perconaservermongodbs

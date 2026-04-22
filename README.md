@@ -1,6 +1,6 @@
 # Goal 
 
-Generate blueprint with Claude Code 
+Generate Kasten blueprint with Claude Code 
 
 # Prompting 
 
@@ -57,3 +57,7 @@ I want a blueprint to backup a CNPG instance using barman in order to leverage P
 because this is not adapted in the Kasten context. Instead I want you to document the steps by giving an example to restore at a precise PIT. 
 The barman configuration will work with a local minio cluster, one minio cluster per cnpg instance. 
 We are definitely in the pattern 4C. "Database backup via a local MinIO keeper (S3-protocol data movers)" so you don't need to ask for the validation of the pattern.
+
+# Mongodb percona 
+
+Create a blueprint for mongodb deployed with the Percona operator

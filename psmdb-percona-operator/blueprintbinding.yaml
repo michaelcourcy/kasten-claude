@@ -1,0 +1,19 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: psmdb-blueprint-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: psmdb-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: psmdb.percona.com
+              resource: perconaservermongodbs
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist
