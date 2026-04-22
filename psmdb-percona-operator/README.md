@@ -19,6 +19,19 @@ https://www.mongodb.com/docs/manual/tutorial/backup-with-filesystem-snapshots/
 Do not deploy the blueprint or the BlueprintBinding. Let Kasten snapshot the three PVCs
 directly — WiredTiger handles recovery automatically.
 
+Two prerequisites make this safe for the PSMDB operator:
+
+1. **Journaling is always enabled.** WiredTiger journaling is on by default in MongoDB 4.0+ and
+   cannot be disabled on replica-set members (`--nojournal` is rejected at startup). Verified:
+   `getCmdLineOpts` shows no `--nojournal` flag; `journal/WiredTigerLog.*` exists on every node.
+
+2. **Journal and data files are on the same volume.** The PSMDB operator configures a single PVC
+   mounted at `dbPath: /data/db`. The `journal/` subdirectory lives inside that same mount point
+   (`/dev/nvme4n1 → /data/db`). There is no `--journalPath` override that would split them.
+   Verified by inspecting the running pod: `df -h /data/db/journal` reports the same device as
+   `/data/db`. Both conditions satisfy the MongoDB snapshot requirement documented at
+   https://www.mongodb.com/docs/manual/core/backups/#back-up-with-filesystem-snapshots.
+
 **This blueprint is necessary when your storage backend does NOT guarantee crash-consistent
 snapshots.** Some older NFS-backed, CIFS, or certain SAN/NAS implementations capture blocks
 from different points in time within the same volume ("fuzzy" snapshot). WiredTiger cannot
@@ -36,24 +49,37 @@ any journal replay — safe on any storage backend.
 **Pattern 1 — Fence and quiesce a secondary replica.**
 
 `backupPrehook` dynamically identifies a secondary member each time, runs `db.fsyncLock()`
-on it, and labels both the pod and the PVC. Kasten snapshots **all three PVCs** (the quiesced
-secondary provides a guaranteed clean anchor; the other two are also captured but discarded on
-restore). `backupPosthook` unlocks the secondary.
+on it, and records its PVC name as a restore-point artifact. Kasten snapshots **all three
+PVCs** (the quiesced secondary provides a guaranteed clean anchor; the other two are also
+captured). `backupPosthook` unlocks the secondary.
 
-On restore, `restorePosthook` **immediately** pauses the cluster (before WiredTiger activates
-on the non-quiesced PVCs), deletes all PVCs except the quiesced one, and resumes. The PSMDB
-operator creates fresh empty PVCs for the deleted members; they perform MongoDB initial sync
-from the quiesced node, which becomes the new primary.
+On restore, the operator must **manually** prepare before triggering the RestoreAction:
 
-Zero primary impact: writes continue normally while the secondary is frozen.
+1. Delete the PSMDB cluster CR (stops all pods; the operator stops reconciling).
+2. Delete all PVCs for the cluster.
+3. Trigger a RestoreAction that **excludes the non-quiesced PVCs by name** — so only the
+   quiesced PVC is restored from its snapshot.
+4. The PSMDB operator (restored alongside the CR) creates fresh empty PVCs for the excluded
+   members; they perform MongoDB initial sync from the quiesced node, which becomes primary.
+
+Zero primary impact during backup: writes continue normally while the secondary is frozen.
 
 ### Why three PVCs are snapshotted but only one is used for restore
 
 The quiesced secondary's PVC is the sole authoritative restore source. The other two snapshots
 are taken alongside it because Kasten snapshots all PVCs it discovers at backup time — they
-are present in the restore point but discarded by `restorePosthook`. This is intentional:
-discarding non-quiesced PVCs avoids any risk of fuzzy-snapshot data contaminating the cluster
+are present in the restore point but excluded from the RestoreAction. This is intentional:
+excluding non-quiesced PVCs avoids any risk of fuzzy-snapshot data contaminating the cluster
 on non-crash-consistent storage.
+
+### Why the PVC label is not the tracking mechanism
+
+`backupPrehook` labels the quiesced PVC with `kasten.io/psmdb-quiesced=true` for visibility,
+but this label is set **after** Kasten's PVC discovery pass. Kasten captures PVC specs at
+discovery time (before `backupPrehook` runs), so the label is not recorded in the restore
+point and will not appear on the restored PVC. The **Kanister artifact**
+`psmdbMeta.quiescedPVC` is the authoritative identifier — it is stored in the restore point
+and is used to determine which PVCs to exclude from the RestoreAction.
 
 ---
 
@@ -61,10 +87,8 @@ on non-crash-consistent storage.
 
 | Action | Function | What it does |
 |---|---|---|
-| `backupPrehook` | KubeTask | Removes any stale `kasten.io/psmdb-quiesced` label, picks a secondary (highest ordinal first), calls `db.fsyncLock()`, labels the pod (`kasten.io/psmdb-fsync-locked`) and the PVC (`kasten.io/psmdb-quiesced`), emits quiesced PVC name as a restore-point artifact |
+| `backupPrehook` | KubeTask | Removes stale `kasten.io/psmdb-quiesced` labels, picks a secondary (highest ordinal first), calls `db.fsyncLock()`, labels the pod (`kasten.io/psmdb-fsync-locked`) and the PVC (`kasten.io/psmdb-quiesced`), emits quiesced PVC name as restore-point artifact |
 | `backupPosthook` | KubeTask | Finds the labeled pod, calls `db.fsyncUnlock()`, removes the pod label |
-| `restorePrehook` | KubeTask | Pauses the cluster before PVC restore (**not yet triggered in Kasten ≤ 8.5.x** — `restorePosthook` handles this automatically) |
-| `restorePosthook` | KubeTask + WaitV2 | Immediately pauses cluster, deletes non-quiesced PVCs, resumes, waits for `.status.state == "ready"` |
 
 ---
 
@@ -191,54 +215,22 @@ kubectl apply -f blueprintbinding.yaml
 
 ---
 
-## ⚠️ restorePrehook not yet triggered in Kasten ≤ 8.5.x
-
-The `restorePrehook` blueprint action is **never called** in Kasten ≤ 8.5.x
-(confirmed by Kasten engineering — fix is in progress).
-
-`restorePrehook` is designed to pause the cluster before Kasten replaces PVCs, so that
-running MongoDB pods do not hold the volumes open during `restoreVolumes`.
-
-**No manual pre-restore steps are required.** `restorePosthook` handles the full cleanup
-sequence automatically:
-
-1. Immediately pauses the cluster on entry (before WiredTiger finishes starting).
-2. Identifies the quiesced PVC via the `kasten.io/psmdb-quiesced=true` label (or artifact fallback).
-3. Deletes all other PVCs.
-4. Resumes the cluster.
-5. Waits for readiness.
-
-Because MongoDB pods take 30–120 seconds to initialize, `restorePosthook` executes
-well within that window. The risk of WiredTiger activating on a fuzzy PVC before
-`restorePosthook` runs is negligible in practice.
-
-Once `restorePrehook` is fixed in a future Kasten release, it will provide a cleaner
-separation: the pause happens before `restoreVolumes`, and `restorePosthook` only
-needs to delete non-quiesced PVCs and wait for readiness.
-
----
-
 ## Backup policy
 
 Create a backup policy targeting the `psmdb-test` namespace with a **Location** profile
-(required for Kanister phases). No PVC filtering configuration is needed.
+(required for Kanister phases). No PVC filtering configuration is needed — all three PVCs
+are snapshotted, and the restore procedure excludes the non-quiesced ones by name.
 
-### How the quiesced PVC is tracked across backup and restore
+### Finding the quiesced PVC name
 
-`backupPrehook` uses two mechanisms in tandem:
+After a backup completes, find the quiesced PVC name from the executor logs:
 
-1. **PVC label** `kasten.io/psmdb-quiesced=true`: applied to the chosen PVC before Kasten
-   takes the snapshot. Kasten preserves PVC labels when restoring a PVC from a snapshot,
-   so this label survives into the restored PVC and is the primary identifier used by
-   `restorePosthook`.
+```bash
+kubectl logs -n kasten-io -l component=executor --tail=10000 | \
+  grep -o '"quiescedPVC":"[^"]*"'
+```
 
-2. **Kanister artifact** `psmdbMeta.quiescedPVC`: written via `kando output` and stored in
-   the Kasten restore point alongside the PVC snapshot. Used as a fallback if the PVC label
-   is ever absent.
-
-At the start of every `backupPrehook`, all existing `kasten.io/psmdb-quiesced` labels are
-removed before a new secondary is chosen. This prevents stale labels accumulating after a
-replica-set failover changes which member is the secondary.
+The artifact is also visible in the Kasten UI under the restore point's artifact details.
 
 ### Verify the backup hooks ran
 
@@ -251,7 +243,41 @@ kubectl logs -n kasten-io -l component=executor --tail=10000 | \
 
 ## Restore
 
-No manual preparation is required. Trigger the restore normally via the Kasten UI or:
+Restore requires manual preparation before triggering the RestoreAction. The goal is to
+ensure that only the quiesced PVC's data drives recovery.
+
+### Step 1 — Find the quiesced PVC name
+
+From the executor logs or the Kasten UI artifact, note the quiesced PVC name, e.g.:
+`mongod-data-my-psmdb-psmdb-db-rs0-2`
+
+The non-quiesced PVCs are all other members, e.g.:
+`mongod-data-my-psmdb-psmdb-db-rs0-0` and `mongod-data-my-psmdb-psmdb-db-rs0-1`
+
+### Step 2 — Delete the PSMDB CR and all PVCs
+
+Delete the PSMDB cluster CR **first** so the operator stops reconciling and cannot
+recreate PVCs while you delete them.
+
+```bash
+APP_NS=psmdb-test
+CR_NAME=my-psmdb-psmdb-db
+
+kubectl delete psmdb ${CR_NAME} -n ${APP_NS}
+
+# Wait for all pods to stop
+kubectl wait --for=delete pod -l app.kubernetes.io/instance=${CR_NAME} \
+  -n ${APP_NS} --timeout=120s
+
+# Delete all PVCs
+kubectl delete pvc -n ${APP_NS} -l app.kubernetes.io/instance=${CR_NAME}
+```
+
+### Step 3 — Trigger the RestoreAction
+
+Exclude the non-quiesced PVCs by name so only the quiesced PVC is restored from its
+snapshot. The PSMDB operator (restored with the CR) creates fresh empty PVCs for the
+excluded members; they sync from the quiesced node via MongoDB initial sync.
 
 ```bash
 # List available restore points
@@ -270,17 +296,19 @@ spec:
     name: <RESTORE_POINT_NAME>
     namespace: psmdb-test
   targetNamespace: psmdb-test
+  filters:
+    excludeResources:
+    - name: "mongod-data-my-psmdb-psmdb-db-rs0-0"   # adjust to non-quiesced PVC names
+    - name: "mongod-data-my-psmdb-psmdb-db-rs0-1"   # adjust to non-quiesced PVC names
   profile:
     name: <LOCATION_PROFILE_NAME>
     namespace: kasten-io
 EOF
 ```
 
-`restorePosthook` will automatically:
-1. Pause the cluster.
-2. Delete non-quiesced PVCs (identified by `kasten.io/psmdb-quiesced=true` label or artifact).
-3. Resume — the quiesced node becomes primary; others sync from it via initial sync.
-4. Wait until `.status.state == "ready"`.
+The RestoreAction will restore exactly 1 volume (the quiesced PVC). The PSMDB operator
+reconciles the restored CR, creates fresh empty PVCs for the two excluded members, and
+MongoDB initial sync populates them from the quiesced node (which becomes primary).
 
 ### Verify restore
 

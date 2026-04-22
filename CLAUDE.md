@@ -186,6 +186,12 @@ Iterate until success without coming back to step 1 unless you discover step 1 c
 ## Deployment rules
 
 - Always deploy blueprints in the **`kasten-io` namespace**.
+- **Separate operator namespace from workload namespace.** Deploy Kubernetes operators (PSMDB,
+  CNPG, Couchbase, etc.) in a dedicated namespace (e.g. `psmdb-operator`) and workload clusters
+  in separate namespaces (e.g. `psmdb-test`). Use `watchAllNamespaces=true` or equivalent so the
+  operator manages workloads across namespaces. This keeps operator lifecycle (GitOps / ArgoCD)
+  independent of application data managed by Kasten — Kasten should not be responsible for
+  restoring the operator itself.
 - Prefer **BlueprintBindings** over manual annotations for fleet automation when you can consistently identify that this type of resource will always be backed up the same way. Notice that often blueprintbinding use the `DoesNotExist`operator to not conflict with the `kanister.kasten.io/blueprint` annotation on the resource. See this example :
 ```
 apiVersion: config.kio.kasten.io/v1alpha1

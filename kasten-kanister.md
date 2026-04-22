@@ -52,6 +52,15 @@ A blueprint attached to a high-level custom resource (e.g., an EDB `Cluster`) wi
 >   [Invocation Mode 2 — Action Hooks](#invocation-mode-2--action-hooks) and the warning in the
 >   [temporary PVC patterns](#temporary-pvc-patterns--action-hook-required) section.
 >
+> **Labels and annotations added to PVCs during `backupPrehook` are not reflected in the restore
+> point.** Kasten captures the PVC spec at discovery time (before `backupPrehook` runs). When
+> restoring, Kasten recreates PVCs from those captured specs — so any label added to a PVC inside
+> `backupPrehook` will not appear on the restored PVC. The same applies to `restorePrehook`: any
+> label added there runs after the PVC restore specs are already fixed. If you need to track which
+> PVC was quiesced or modified during backup, use a **Kanister artifact** (`kando output` /
+> `outputArtifacts`) — artifacts are stored alongside the restore point and remain available to
+> `restorePosthook` via `inputArtifactNames`.
+>
 > Note: Kasten also snapshots **orphan PVCs** (PVCs not mounted by any running pod). However,
 > since there is no ownership chain to attach a blueprint to, no `backupPrehook` runs for orphan
 > PVCs through a BlueprintBinding. If backup data must be written to the PVC before the snapshot,
