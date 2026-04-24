@@ -80,6 +80,38 @@ actions:
               sleep 5
               echo "Restore preparation complete"
 
+  restorePosthook:
+    # Called by Kasten AFTER PVC restore and application manifests are back.
+    # Phase 1 (WaitV2): wait for the MariaDB operator to reconcile the CR to Ready.
+    # Phase 2 (KubeExec): verify the database accepts connections.
+    phases:
+      - func: WaitV2
+        name: waitForMariaDBReady
+        args:
+          timeout: 300s
+          conditions:
+            anyOf:
+              - condition: '{{ range .status.conditions }}{{ if and (eq .type "Ready") (eq .status "True") }}true{{ end }}{{ end }}'
+                objectReference:
+                  apiVersion: v1
+                  group: k8s.mariadb.com
+                  name: "{{ .Object.metadata.name }}"
+                  namespace: "{{ .Object.metadata.namespace }}"
+                  resource: mariadbs
+      - func: KubeExec
+        name: verifyMariaDB
+        args:
+          namespace: "{{ .Object.metadata.namespace }}"
+          pod: "{{ .Object.metadata.name }}-0"
+          container: mariadb
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" -e "SELECT 1;"
+              echo "MariaDB is healthy"
+
   backupPosthook:
     # Called by Kasten AFTER all PVC snapshots are ready.
     # Kills the background lock-holding process, which closes the mariadb session

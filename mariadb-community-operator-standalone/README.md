@@ -45,7 +45,8 @@ Advantages:
 - **Simple restore**: Kasten restores the PVC; MariaDB starts up cleanly from the snapshot.
   The `FLUSH TABLES WITH READ LOCK` lock is a session-level in-memory state — it does not
   persist on disk. InnoDB sees a clean checkpoint and starts normally without any unlock step.
-  No `restorePosthook` is needed.
+  A `restorePosthook` waits for the operator to reconcile the CR to `Ready` and then
+  verifies the database accepts connections.
 
 Limitation:
 - Granular restore (single table or database) is not possible — the whole PVC is restored.
@@ -70,6 +71,7 @@ The blueprint is bound to the **MariaDB custom resource** via a BlueprintBinding
 | `backupPrehook` | `FLUSH TABLES WITH READ LOCK; FLUSH LOGS;` — quiesces MariaDB |
 | `backupPosthook` | `UNLOCK TABLES;` — unquiesces after Kasten PVC snapshot is ready |
 | `restorePrehook` | Deletes the MariaDB CR so the operator stops reconciling, allowing Kasten to replace the PVC; waits for the StatefulSet to be garbage-collected before restore proceeds |
+| `restorePosthook` | WaitV2 until the MariaDB CR reaches `Ready=True`; then runs `SELECT 1` inside the pod to confirm the database accepts connections |
 
 ## Known limitation — `restorePrehook` not yet triggered (Kasten ≤ 8.5.x)
 
