@@ -138,15 +138,51 @@ skeleton.
 
 ## The backup and restore workflow managed by kasten 
 
-If the resource blueprint define `backup` and `restore` action then only the PVCs manifest 
-are captured but not the data on the PVC. `backup` and `restore` is used when the blueprint handle 
-the datamoving but : 
-- it has conscequence on security because you lose immutability 
-- you can not use the policy datamover, for instance if you use VBR as the target then the blueprint still use 
-kopia as the datamover.
-- you don't have incrementality 
+When a blueprint defines `backup` and `restore` actions, the blueprint itself becomes the data
+mover: it uses `kando location push` / `kando location pull` to transfer data directly to and
+from the location profile, bypassing Kasten's own pipeline. In that mode Kasten only captures
+the PVC *manifests* — not the data on the PVCs. This approach has six serious drawbacks that
+make it unsuitable for production blueprints:
 
-It's why we discourage the use of `backup` and `restore` action in the Kasten context. 
+1. **Custom image required.** `kando` is only distributed inside
+   `gcr.io/kasten-images/kanister-tools`. To use `kando location push` the blueprint must run
+   in a container that also has the database dump tools (`mongodump`, `pg_dump`, etc.). You
+   must build and maintain a combined image. `MultiContainerRun` moderates this by letting you
+   sidecar the dump tool next to `kanister-tools`, but that adds its own complexity (pod
+   lifecycle, shared volumes, inter-container coordination) compared to a simple `KubeExec`
+   into the existing workload container.
+
+2. **No immutability.** Kasten enforces immutability on the restore point objects it manages.
+   Data pushed via `kando location push` sits outside that tracking — it can be overwritten or
+   deleted without Kasten knowing, silently breaking a restore and voiding any compliance
+   guarantee.
+
+3. **No incrementality.** Kasten's PVC snapshot export is block-incremental: only changed
+   blocks are transferred on subsequent backups. `kando location push` always pushes a full
+   stream — backup time and egress cost grow linearly with data size, regardless of how little
+   changed since the last backup.
+
+4. **Artifacts are opaque and hard to test.** You never see or inspect the artifact that
+   `kando location push` wrote. There is no way to browse, verify, or manually restore from
+   it outside the blueprint. Debugging a failed restore means replaying the entire blueprint
+   just to get back to a state you can examine.
+
+5. **No escape hatch when the blueprint breaks.** With the PVC-snapshot approach, a Kasten
+   restore point is a standard CSI snapshot — if the blueprint's restore logic no longer
+   matches your needs (schema change, operator upgrade, etc.) you can still do a granular PVC
+   restore and recover individual databases or tables manually. With `kando location push` the
+   data is locked inside an opaque artifact: the only way to access it is to run the blueprint.
+   If the blueprint no longer works, you must first fix or rewrite it to recreate the backup
+   artifact before you can recover anything.
+
+6. **Data mover selection is ignored.** Kasten policies let you choose the data mover (Kopia,
+   Veeam VBR, etc.) for PVC export. `kando location push` always uses Kopia internally — it
+   does not honour the policy's data mover selection. If your organisation requires VBR for
+   compliance or deduplication, a blueprint that uses `kando location push` will silently
+   bypass it and write through Kopia regardless.
+
+Avoid `backup` / `restore` actions and `kando location push` / `kando location pull` in Kasten
+blueprints. Use PVC snapshots (patterns 1–8) and let Kasten be the data mover.
 
 Owned PVCs means the PVCs owned by the resource on which the blueprint apply. 
 
