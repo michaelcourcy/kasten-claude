@@ -44,6 +44,33 @@ actions:
                 exit 1
               fi
 
+  backupPosthook:
+    # Called by Kasten AFTER all PVC snapshots are ready.
+    # Kills the background lock-holding process, which closes the mariadb session
+    # and releases the FLUSH TABLES WITH READ LOCK automatically.
+    # UNLOCK TABLES is a safety fallback in case the PID file is missing.
+    phases:
+      - func: KubeExec
+        name: unquiesceMariaDB
+        args:
+          namespace: "{{ .Object.metadata.namespace }}"
+          pod: "{{ .Object.metadata.name }}-0"
+          container: mariadb
+          command:
+            - bash
+            - -c
+            - |
+              if [ -f /tmp/mariadb-lock.pid ]; then
+                LOCK_PID=$(cat /tmp/mariadb-lock.pid)
+                kill "$LOCK_PID" 2>/dev/null && echo "Lock process $LOCK_PID killed" \
+                  || echo "Process already gone"
+                rm -f /tmp/mariadb-lock.pid /tmp/mariadb-lock.log
+              else
+                echo "No PID file found — releasing via SQL"
+              fi
+              mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" -e "UNLOCK TABLES;" 2>/dev/null || true
+              echo "Unquiesce complete"
+
   restorePrehook:
     # Called by Kasten BEFORE PVC restore.
     # The MariaDB operator actively reconciles the StatefulSet, keeping replicas=1.
@@ -111,30 +138,3 @@ actions:
               set -e
               mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" -e "SELECT 1;"
               echo "MariaDB is healthy"
-
-  backupPosthook:
-    # Called by Kasten AFTER all PVC snapshots are ready.
-    # Kills the background lock-holding process, which closes the mariadb session
-    # and releases the FLUSH TABLES WITH READ LOCK automatically.
-    # UNLOCK TABLES is a safety fallback in case the PID file is missing.
-    phases:
-      - func: KubeExec
-        name: unquiesceMariaDB
-        args:
-          namespace: "{{ .Object.metadata.namespace }}"
-          pod: "{{ .Object.metadata.name }}-0"
-          container: mariadb
-          command:
-            - bash
-            - -c
-            - |
-              if [ -f /tmp/mariadb-lock.pid ]; then
-                LOCK_PID=$(cat /tmp/mariadb-lock.pid)
-                kill "$LOCK_PID" 2>/dev/null && echo "Lock process $LOCK_PID killed" \
-                  || echo "Process already gone"
-                rm -f /tmp/mariadb-lock.pid /tmp/mariadb-lock.log
-              else
-                echo "No PID file found — releasing via SQL"
-              fi
-              mariadb -uroot -p"${MARIADB_ROOT_PASSWORD}" -e "UNLOCK TABLES;" 2>/dev/null || true
-              echo "Unquiesce complete"
