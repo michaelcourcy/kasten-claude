@@ -1,0 +1,24 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: psmdb-pbm-blueprint-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: psmdb-pbm-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: psmdb-minio
+          operator: In
+          values:
+            - "true"
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

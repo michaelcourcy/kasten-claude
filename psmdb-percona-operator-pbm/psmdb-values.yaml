@@ -1,0 +1,60 @@
+replsets:
+  rs0:
+    size: 3
+    resources:
+      requests:
+        cpu: 300m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    volumeSpec:
+      pvc:
+        storageClassName: ebs-sc
+        resources:
+          requests:
+            storage: 5Gi
+
+pmm:
+  enabled: false
+
+sharding:
+  enabled: true
+  balancer:
+    enabled: true
+  configrs:
+    size: 3
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 400m
+        memory: 512Mi
+    volumeSpec:
+      pvc:
+        storageClassName: ebs-sc
+        resources:
+          requests:
+            storage: 3Gi
+  mongos:
+    size: 1
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 400m
+        memory: 512Mi
+
+backup:
+  enabled: true
+  storages:
+    minio-backup:
+      type: s3
+      s3:
+        bucket: pbm-backup
+        region: us-east-1
+        credentialsSecret: my-psmdb-psmdb-db-minio-creds
+        endpointUrl: http://my-psmdb-psmdb-db-minio.psmdb-test.svc:9000
+        insecureSkipTLSVerify: true

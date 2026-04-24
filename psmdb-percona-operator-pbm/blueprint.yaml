@@ -1,0 +1,221 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: psmdb-pbm-blueprint
+  namespace: kasten-io
+actions:
+
+  backupPrehook:
+    outputArtifacts:
+      pbmBackup:
+        keyValue:
+          backupCRName: "{{ .Phases.triggerPbmBackup.Output.backupCRName }}"
+          pbmName: "{{ .Phases.triggerPbmBackup.Output.pbmName }}"
+          clusterName: "{{ .Phases.triggerPbmBackup.Output.clusterName }}"
+          namespace: "{{ .Phases.triggerPbmBackup.Output.namespace }}"
+    phases:
+      - func: KubeTask
+        name: triggerPbmBackup
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              KEEPER="{{ .Object.metadata.name }}"
+              NS="{{ .Object.metadata.namespace }}"
+              CLUSTER="${KEEPER%-minio}"
+              BACKUP_CR_NAME="${CLUSTER}-kasten-$(date +%Y%m%d%H%M%S)"
+
+              echo "Triggering pbm backup: ${BACKUP_CR_NAME} (cluster=${CLUSTER}, ns=${NS})"
+
+              kubectl create -n "${NS}" -f - <<EOF
+              apiVersion: psmdb.percona.com/v1
+              kind: PerconaServerMongoDBBackup
+              metadata:
+                name: ${BACKUP_CR_NAME}
+                namespace: ${NS}
+              spec:
+                clusterName: ${CLUSTER}
+                storageName: minio-backup
+              EOF
+
+              echo "Waiting for backup to complete (timeout 20m)..."
+              ELAPSED=0
+              while [ $ELAPSED -lt 1200 ]; do
+                STATE=$(kubectl get psmdb-backup "${BACKUP_CR_NAME}" -n "${NS}" \
+                  -o jsonpath='{.status.state}' 2>/dev/null || echo "pending")
+                echo "  [${ELAPSED}s] state: ${STATE}"
+                case "${STATE}" in
+                  ready)
+                    echo "Backup completed successfully."
+                    break
+                    ;;
+                  error)
+                    echo "ERROR: pbm backup failed"
+                    kubectl get psmdb-backup "${BACKUP_CR_NAME}" -n "${NS}" -o yaml | tail -30
+                    exit 1
+                    ;;
+                esac
+                sleep 15
+                ELAPSED=$((ELAPSED + 15))
+              done
+
+              if [ $ELAPSED -ge 1200 ]; then
+                echo "ERROR: timed out waiting for pbm backup"
+                kubectl get psmdb-backup "${BACKUP_CR_NAME}" -n "${NS}" -o yaml | tail -20
+                exit 1
+              fi
+
+              PBM_NAME=$(kubectl get psmdb-backup "${BACKUP_CR_NAME}" -n "${NS}" \
+                -o jsonpath='{.status.pbmName}')
+              echo "pbm backup name: ${PBM_NAME}"
+
+              kando output backupCRName "${BACKUP_CR_NAME}"
+              kando output pbmName "${PBM_NAME}"
+              kando output clusterName "${CLUSTER}"
+              kando output namespace "${NS}"
+
+  restorePosthook:
+    inputArtifactNames:
+      - pbmBackup
+    phases:
+      - func: KubeTask
+        name: restoreFromPbm
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NS="{{ .ArtifactsIn.pbmBackup.KeyValue.namespace }}"
+              BACKUP_CR_NAME="{{ .ArtifactsIn.pbmBackup.KeyValue.backupCRName }}"
+              CLUSTER="{{ .ArtifactsIn.pbmBackup.KeyValue.clusterName }}"
+              RESTORE_CR_NAME="${CLUSTER}-kasten-restore-$(date +%Y%m%d%H%M%S)"
+
+              echo "Waiting for PSMDB cluster ${CLUSTER} to be ready before restore..."
+              ELAPSED=0
+              while [ $ELAPSED -lt 600 ]; do
+                STATE=$(kubectl get psmdb "${CLUSTER}" -n "${NS}" \
+                  -o jsonpath='{.status.state}' 2>/dev/null || echo "")
+                echo "  [${ELAPSED}s] cluster state: ${STATE}"
+                if [ "${STATE}" = "ready" ]; then
+                  echo "Cluster is ready."
+                  break
+                fi
+                sleep 15
+                ELAPSED=$((ELAPSED + 15))
+              done
+
+              if [ "${STATE}" != "ready" ]; then
+                echo "ERROR: timed out waiting for cluster ${CLUSTER} to be ready"
+                exit 1
+              fi
+
+              echo "Creating pbm restore CR: ${RESTORE_CR_NAME} (backup=${BACKUP_CR_NAME})"
+
+              kubectl create -n "${NS}" -f - <<EOF
+              apiVersion: psmdb.percona.com/v1
+              kind: PerconaServerMongoDBRestore
+              metadata:
+                name: ${RESTORE_CR_NAME}
+                namespace: ${NS}
+              spec:
+                clusterName: ${CLUSTER}
+                backupName: ${BACKUP_CR_NAME}
+              EOF
+
+              echo "Waiting for restore to complete (timeout 20m)..."
+              ELAPSED=0
+              while [ $ELAPSED -lt 1200 ]; do
+                STATE=$(kubectl get psmdb-restore "${RESTORE_CR_NAME}" -n "${NS}" \
+                  -o jsonpath='{.status.state}' 2>/dev/null || echo "pending")
+                echo "  [${ELAPSED}s] state: ${STATE}"
+                case "${STATE}" in
+                  ready)
+                    echo "Restore completed successfully."
+                    break
+                    ;;
+                  error)
+                    echo "ERROR: pbm restore failed"
+                    kubectl get psmdb-restore "${RESTORE_CR_NAME}" -n "${NS}" -o yaml | tail -30
+                    exit 1
+                    ;;
+                esac
+                sleep 15
+                ELAPSED=$((ELAPSED + 15))
+              done
+
+              if [ $ELAPSED -ge 1200 ]; then
+                echo "ERROR: timed out waiting for pbm restore"
+                kubectl get psmdb-restore "${RESTORE_CR_NAME}" -n "${NS}" -o yaml | tail -20
+                exit 1
+              fi
+
+              echo "Waiting for PSMDB cluster to return to ready state after restore..."
+              kubectl wait psmdb "${CLUSTER}" -n "${NS}" \
+                --for=jsonpath='{.status.state}'=ready --timeout=5m
+
+              echo "pbm restore complete. Cluster is ready."
+
+  delete:
+    inputArtifactNames:
+      - pbmBackup
+    phases:
+      - func: KubeTask
+        name: deletePbmBackup
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              BACKUP_CR_NAME="{{ .ArtifactsIn.pbmBackup.KeyValue.backupCRName }}"
+              PBM_NAME="{{ .ArtifactsIn.pbmBackup.KeyValue.pbmName }}"
+              CLUSTER="{{ .ArtifactsIn.pbmBackup.KeyValue.clusterName }}"
+              NS="{{ .ArtifactsIn.pbmBackup.KeyValue.namespace }}"
+
+              echo "Cleaning up pbm backup: CR=${BACKUP_CR_NAME}, pbmName=${PBM_NAME}, ns=${NS}"
+
+              if ! kubectl get namespace "${NS}" > /dev/null 2>&1; then
+                echo "Namespace ${NS} no longer exists — nothing to clean up."
+                exit 0
+              fi
+
+              # Find any running rs0 pod to run pbm delete-backup
+              RS0_POD=$(kubectl get pod -n "${NS}" \
+                -l "app.kubernetes.io/instance=${CLUSTER},app.kubernetes.io/component=mongod" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || true
+
+              if [ -z "${RS0_POD}" ]; then
+                echo "WARNING: no mongod pod found — cannot run pbm delete-backup. Skipping MinIO cleanup."
+              else
+                echo "Running pbm delete-backup on pod ${RS0_POD}..."
+                kubectl exec -n "${NS}" "${RS0_POD}" -c backup-agent -- \
+                  pbm delete-backup --yes "${PBM_NAME}" 2>&1 || \
+                  echo "WARNING: pbm delete-backup failed (backup may already be deleted)"
+              fi
+
+              if kubectl get psmdb-backup "${BACKUP_CR_NAME}" -n "${NS}" > /dev/null 2>&1; then
+                echo "Deleting PerconaServerMongoDBBackup CR ${BACKUP_CR_NAME}..."
+                kubectl delete psmdb-backup "${BACKUP_CR_NAME}" -n "${NS}"
+              else
+                echo "PerconaServerMongoDBBackup CR ${BACKUP_CR_NAME} not found — already deleted."
+              fi
+
+              echo "Cleanup complete."
