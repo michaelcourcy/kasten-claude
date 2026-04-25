@@ -25,6 +25,31 @@ A dedicated MinIO `Deployment` (the *keeper*) with a permanent PVC stores the CN
 
 Kasten then snapshots the MinIO PVC (and only that PVC — CNPG data PVCs are excluded via policy filter). The MinIO snapshot contains a self-consistent barman archive: a base backup plus all WALs up to the switch.
 
+> **Why the WAL switch is necessary here, but not in a typical barman setup**
+>
+> When barman archives to an external object store (S3, GCS, Azure Blob), the final WAL segment
+> produced by `pg_backup_stop()` will eventually arrive in the bucket on its own — the archiver
+> keeps running, and recovery fetches WAL on demand. There is no snapshot deadline, so the timing
+> of that last segment does not matter in practice.
+>
+> Here the situation is different. The Backup CR reaches `completed` once the **base backup files**
+> are fully uploaded to MinIO. But `pg_backup_stop()` also generates a WAL record at the *stop
+> LSN* — the exact position PostgreSQL must replay to reach a consistent state from that base
+> backup. That record lands in the *currently-active, partially-filled* WAL segment on the primary
+> pod's `pg_wal` directory. Because PostgreSQL's WAL archiver only ships **complete** 16 MB
+> segments, that partial segment stays local and unarchived — potentially indefinitely on an idle
+> cluster.
+>
+> Kasten snapshots the MinIO PVC immediately after the blueprint phase returns. The snapshot is
+> frozen at that instant: no more WAL files will ever be added to it. If the stop-LSN WAL segment
+> has not been archived yet, the snapshot is missing the one WAL piece that makes the base backup
+> usable for recovery.
+>
+> `pg_switch_wal()` closes the current segment and hands it to the WAL archiver right now. The
+> 15-second wait gives the archiver time to upload it to MinIO. After that, the snapshot is taken
+> against a MinIO PVC that contains both the base backup and the complementary WAL needed to reach
+> a consistent recovery point — which is exactly what a barman-based PITR restore requires.
+
 **Why this pattern:**  
 The goal is to give Kasten full ownership of data protection while keeping barman's scope strictly local to the namespace. Barman writes to a MinIO instance that lives in the same namespace — it never leaves it. Kasten then takes over everything beyond that boundary:
 
