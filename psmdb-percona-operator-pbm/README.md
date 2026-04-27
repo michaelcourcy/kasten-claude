@@ -59,22 +59,22 @@ cross-shard transactions, inconsistent chunk metadata in the config server).
 
 ```
 ┌───────────────────────────────────────────┐
-│  Namespace: psmdb-test                     │
-│                                            │
+│  Namespace: psmdb-test                    │
+│                                           │
 │  ┌──────────┐   ┌─────────┐   ┌─────────┐ │
 │  │ cfg rs   │   │  rs0    │   │ mongos  │ │
 │  │ (3 pods) │   │ (3 pods)│   │ (1 pod) │ │
 │  └──────────┘   └─────────┘   └─────────┘ │
 │       │               │                   │
-│  PVCs (excluded   pbm backup-agent         │
-│  from snapshot)   on every pod             │
-│                        │                   │
-│                        ▼                   │
-│                  ┌──────────┐              │
-│                  │  MinIO   │              │
-│                  │  Keeper  │              │
-│                  │   PVC    │◄─────────────┼── Kasten snapshots this
-│                  └──────────┘              │
+│  PVCs (excluded   pbm backup-agent        │
+│  from snapshot)   on every pod            │
+│                        │                  │
+│                        ▼                  │
+│                  ┌──────────┐             │
+│                  │  MinIO   │             │
+│                  │  Keeper  │             │
+│                  │   PVC    │◄────────────┼── Kasten snapshots this
+│                  └──────────┘             │
 └───────────────────────────────────────────┘
 ```
 
