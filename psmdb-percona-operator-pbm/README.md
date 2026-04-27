@@ -275,6 +275,24 @@ the pbm archive), the PSMDB CR, Secrets, and other resources. Once the cluster r
 state, the `restorePosthook` creates a `PerconaServerMongoDBRestore` CR and waits for it to
 complete.
 
+### Simulate data loss
+
+Drop the test collection so the restore has something meaningful to bring back:
+
+```bash
+DBADMIN_USER=$(kubectl -n psmdb-test get secret my-psmdb-psmdb-db-secrets \
+  -o jsonpath="{.data.MONGODB_DATABASE_ADMIN_USER}" | base64 -d)
+DBADMIN_PASS=$(kubectl -n psmdb-test get secret my-psmdb-psmdb-db-secrets \
+  -o jsonpath="{.data.MONGODB_DATABASE_ADMIN_PASSWORD}" | base64 -d)
+
+kubectl exec -n psmdb-test my-psmdb-psmdb-db-mongos-0 -c mongos -- \
+  mongosh "mongodb://localhost:27017/admin" -u "$DBADMIN_USER" -p "$DBADMIN_PASS" \
+  --quiet --eval '
+db.getSiblingDB("testdb").customers.drop();
+print("count after drop:", db.getSiblingDB("testdb").customers.countDocuments());
+'
+```
+
 ### Triggering a RestoreAction
 
 ```bash
