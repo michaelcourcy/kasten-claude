@@ -261,7 +261,7 @@ MINIO_POD=$(kubectl get pods -n psmdb-test -l app=my-psmdb-psmdb-db-minio \
   -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n psmdb-test "$MINIO_POD" -- sh -c "
   mc alias set local http://localhost:9000 minioadmin minioadmin123 2>/dev/null
-  mc ls --recursive local/pbm-backup/ | grep '.pbm.json'
+  mc find local/pbm-backup/ --name '*.pbm.json'
 "
 
 # Check pbm backup list via the backup-agent
