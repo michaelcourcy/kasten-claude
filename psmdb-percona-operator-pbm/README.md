@@ -214,17 +214,6 @@ docs.forEach(d => print(d.name, d.email, d.plan));
 '
 ```
 
-### Delete the workload
-
-```bash
-kubectl delete psmdb my-psmdb-psmdb-db -n psmdb-test
-kubectl wait pods -n psmdb-test -l app.kubernetes.io/instance=my-psmdb-psmdb-db \
-  --for=delete --timeout=3m 2>/dev/null || true
-helm uninstall my-psmdb -n psmdb-test
-kubectl delete namespace psmdb-test
-kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=psmdb-test
-```
-
 ## Deploy the blueprint
 
 ```bash
