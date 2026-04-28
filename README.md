@@ -61,3 +61,7 @@ We are definitely in the pattern 4C. "Database backup via a local MinIO keeper (
 # Mongodb percona 
 
 Create a blueprint for mongodb deployed with the Percona operator
+
+# Mongodb percona sharded
+
+Create a blueprint for mongodb deployed with the Percona operator but in sharded mode and using the backup/restore CR.
