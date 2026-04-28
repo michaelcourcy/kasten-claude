@@ -7,11 +7,12 @@ Backup and restore for [CloudNativePG](https://cloudnative-pg.io/) PostgreSQL cl
 
 | Component | Version |
 |---|---|
-| Kubernetes | `1.32` (EKS) |
-| Kasten | `8.5.4` |
+| Kubernetes | `1.32` (EKS), `1.33` (AKS) |
+| Kasten | `8.5.4`, `8.5.7` |
 | CNPG Helm chart | `cloudnative-pg 0.28.0` |
 | CNPG operator | `1.29.0` |
 | PostgreSQL | `18.3` |
+| pgvector | `0.8.2` (tested — see [PostgreSQL extensions](#postgresql-extensions)) |
 
 ## Pattern
 
@@ -38,6 +39,19 @@ The quiesced replica's PVC snapshot is the sole source of truth for restore.
    **promotes it to primary automatically** — no `initdb` is run.
 5. A fresh replica is created via streaming replication.
 6. `restorePosthook` waits for the cluster condition `Ready`.
+
+## PostgreSQL extensions
+
+This blueprint works with **any PostgreSQL extension** (pgvector, PostGIS, TimescaleDB, etc.)
+without modification. Extension data — columns, indexes (HNSW, IVFFlat, GiST, …), and catalog
+entries — lives entirely in PostgreSQL's data files on the PVC. The WAL-replay-pause strategy
+captures all of it at the storage level, so there is nothing extension-specific to handle during
+backup or restore.
+
+pgvector was explicitly tested end-to-end: vector embeddings, HNSW indexes, and cosine similarity
+queries all survived a full destroy-and-restore cycle. See the
+[pgvector test workload](#deploy-a-pgvector-test-workload-optional) section below for a
+ready-to-use example.
 
 ## Blueprint actions
 
@@ -240,6 +254,97 @@ PRIMARY=$(kubectl get pods -n cnpg-test \
 kubectl exec -n cnpg-test "$PRIMARY" -- \
   psql -U postgres -d kasten_test -c "SELECT * FROM employees ORDER BY id;"
 # Expected: 5 rows — Alice, Bob, Carol, David, Eve
+```
+
+## Deploy a pgvector test workload (optional)
+
+Use this instead of (or in addition to) the plain PostgreSQL workload above to validate
+backup/restore with vector embeddings.
+
+```bash
+kubectl create namespace cnpg-test
+
+cat <<EOF | kubectl apply -f -
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-cluster
+  namespace: cnpg-test
+spec:
+  instances: 2
+  storage:
+    size: 2Gi
+    storageClass: ebs-sc
+  postgresql:
+    shared_preload_libraries:
+      - vector
+EOF
+```
+
+> **Storage class**: `ebs-sc` is the AWS EBS CSI storage class used in our test environment.
+> Replace it with a storage class that supports CSI snapshots on your cluster
+> (e.g. `managed-csi` on AKS, `standard-rwo` on GKE, your custom class on bare-metal, etc.).
+> The class must have a matching `VolumeSnapshotClass` registered with Kasten.
+> Do **not** use legacy in-tree classes (e.g. `gp2` on AWS) — they do not support CSI snapshots.
+
+Wait for the cluster to be ready:
+
+```bash
+kubectl wait cluster.postgresql.cnpg.io pg-cluster -n cnpg-test \
+  --for=condition=Ready --timeout=8m
+```
+
+### Create pgvector test data
+
+```bash
+kubectl exec -n cnpg-test pg-cluster-1 -- \
+  psql -U postgres -c "CREATE DATABASE vector_test;"
+
+kubectl exec -n cnpg-test pg-cluster-1 -- \
+  psql -U postgres -d vector_test -c "
+    CREATE EXTENSION IF NOT EXISTS vector;
+
+    CREATE TABLE documents (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      embedding vector(4) NOT NULL
+    );
+
+    INSERT INTO documents (title, content, embedding) VALUES
+      ('Kubernetes Basics',   'Pods are the smallest deployable units.',         '[0.12, 0.85, 0.33, 0.67]'),
+      ('Docker Overview',     'Containers package code and dependencies.',       '[0.15, 0.82, 0.29, 0.71]'),
+      ('PostgreSQL Indexing', 'B-tree indexes speed up equality queries.',       '[0.91, 0.10, 0.44, 0.22]'),
+      ('pgvector Search',     'HNSW indexes enable fast nearest neighbor search.','[0.88, 0.14, 0.50, 0.19]'),
+      ('Kasten Backup',       'Blueprints define application-aware backup hooks.','[0.55, 0.60, 0.72, 0.41]');
+
+    CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops);
+  "
+```
+
+### Validate pgvector data after restore
+
+```bash
+PRIMARY=$(kubectl get pods -n cnpg-test \
+  -l "cnpg.io/cluster=pg-cluster,cnpg.io/instanceRole=primary" \
+  -o jsonpath='{.items[0].metadata.name}')
+
+# All 5 rows should be present with original embeddings
+kubectl exec -n cnpg-test "$PRIMARY" -- \
+  psql -U postgres -d vector_test -c "SELECT id, title, embedding FROM documents ORDER BY id;"
+
+# Similarity search should return: Kubernetes Basics (1.0), Docker Overview (0.998), Kasten Backup (0.823)
+kubectl exec -n cnpg-test "$PRIMARY" -- \
+  psql -U postgres -d vector_test -c "
+    SELECT id, title, 1 - (embedding <=> '[0.12, 0.85, 0.33, 0.67]') AS cosine_similarity
+    FROM documents
+    ORDER BY embedding <=> '[0.12, 0.85, 0.33, 0.67]'
+    LIMIT 3;
+  "
+
+# HNSW index should be intact
+kubectl exec -n cnpg-test "$PRIMARY" -- \
+  psql -U postgres -d vector_test -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'documents';"
 ```
 
 ## Destroy the test workload
