@@ -270,17 +270,30 @@ ELASTIC_PASS=$(kubectl get secret es-cluster-es-elastic-user \
 kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
   curl -sk -u "elastic:${ELASTIC_PASS}" -X DELETE "https://localhost:9200/test-index"
 
-# 3. Trigger a Kasten RestoreAction (UI or YAML — see CLAUDE.md for the spec)
+# 3. Trigger a Kasten RestoreAction (UI or YAML — see CLAUDE.md for the spec).
+#    The live ES cluster is NOT disrupted; only the MinIO PVC is restored
+#    from the Kasten snapshot.
 
-# 4. After restore completes, verify documents are back
+# 4. After restore completes, verify documents are back.
 kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
   curl -sk -u "elastic:${ELASTIC_PASS}" -X POST "https://localhost:9200/test-index/_refresh"
 kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
   curl -sk -u "elastic:${ELASTIC_PASS}" "https://localhost:9200/test-index/_count"
 # Expected: {"count":5,...}
 
-# 5. Delete the Kasten restore point. The blueprint's `delete` action
-#    removes the corresponding ES snapshot from MinIO automatically.
+# 5. Retire the restore point to trigger the blueprint's `delete` action.
+#    NOTE: `kubectl delete restorepoint <name>` alone does NOT fire the
+#    delete action — Kasten only invokes it when the underlying
+#    RestorePointContent (RPC) is removed. Either delete the RPC directly
+#    or use the Kasten dashboard / RetireAction:
+RPC=$(kubectl get restorepointcontent \
+  -l k10.kasten.io/appNamespace=elasticsearch-eck-minio \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl delete restorepointcontent "${RPC}"
+# Watch the delete actionset run and confirm the ES snapshot was removed:
+kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
+  curl -sk -u "elastic:${ELASTIC_PASS}" \
+       "https://localhost:9200/_snapshot/kasten-repo/_all"
 ```
 
 ## Teardown
