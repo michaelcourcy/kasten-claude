@@ -1,0 +1,110 @@
+# Pattern 5 — MinIO keeper for Elasticsearch S3 snapshot repository
+#
+# The Secret holds two pairs of keys:
+#   - rootUser/rootPassword              → consumed by MinIO as MINIO_ROOT_USER/PASSWORD
+#   - s3.client.default.access_key/secret_key → loaded into the Elasticsearch
+#                                          keystore via ECK secureSettings (same values)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: es-cluster-minio-creds
+  namespace: elasticsearch-eck-minio
+type: Opaque
+stringData:
+  rootUser: minioadmin
+  rootPassword: minioadminpassword
+  s3.client.default.access_key: minioadmin
+  s3.client.default.secret_key: minioadminpassword
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: es-cluster-minio
+  namespace: elasticsearch-eck-minio
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ebs-sc
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: es-cluster-minio
+  namespace: elasticsearch-eck-minio
+  labels:
+    app: es-cluster-minio
+    minio-s3-keeper: "true"
+    kasten.io/workload-name: es-cluster
+    kasten.io/workload-kind: Elasticsearch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: es-cluster-minio
+  template:
+    metadata:
+      labels:
+        app: es-cluster-minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: es-cluster-minio-creds
+                  key: rootUser
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: es-cluster-minio-creds
+                  key: rootPassword
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+        # Sidecar — blueprint phases KubeExec into this container because the
+        # MinIO image ships without curl/sh. Keeps the keeper pod identity
+        # (and the BlueprintBinding's `.Object.*` template context) intact.
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sleep", "infinity"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: es-cluster-minio
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: es-cluster-minio
+  namespace: elasticsearch-eck-minio
+spec:
+  selector:
+    app: es-cluster-minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001

@@ -1,0 +1,30 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: es-cluster
+  namespace: elasticsearch-eck-minio
+spec:
+  version: 8.17.0
+  # Load the MinIO S3 client credentials into every ES node's keystore at
+  # startup. ECK reads only the two listed keys; the rootUser/rootPassword
+  # keys (used by MinIO itself) are ignored.
+  secureSettings:
+    - secretName: es-cluster-minio-creds
+      entries:
+        - key: s3.client.default.access_key
+        - key: s3.client.default.secret_key
+  nodeSets:
+    - name: default
+      count: 3
+      config:
+        node.store.allow_mmap: false
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 2Gi
+            storageClassName: ebs-sc
