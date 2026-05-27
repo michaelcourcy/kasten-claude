@@ -105,14 +105,14 @@ Pattern: Policy preHook that writes PVC/PV info to ConfigMap `pvc-info-snapshot`
 
 ## Elasticsearch ECK Blueprint
 Location: `elasticsearch-eck/`; Status: Backup ✅ / Restore ❌ (restorePrehook bug)
-Pattern: Pattern 3 sub-case A — database snapshot on permanent RWX PVC (`/mnt/snapshot-repo`)
+Pattern: Pattern 3 — database snapshot on a permanent workload PVC (`/mnt/snapshot-repo`, RWX)
 - WaitV2 for CRDs: `apiVersion: v1` + `group: elasticsearch.k8s.elastic.co` (separate fields)
 - ES 8.x snapshot DELETE API: handle `snapshot_missing_exception` explicitly (not query param)
 
 ## Couchbase Autonomous Operator Blueprint
 Location: `couchbase-operator/`
 Files: `blueprint.yaml`, `blueprintbinding.yaml`, `keeper.yaml`, `README.md`
-Pattern: Pattern 4 (keeper Deployment, sub-case B)
+Pattern: Pattern 4 — database dump or snapshot on a permanent Keeper PVC (keeper Deployment)
 
 ### Status (2026-04-09)
 - **Backup**: ✅ Working — backupPrehook runs cbbackupmgr + sync, backupPosthook verifies
@@ -161,7 +161,7 @@ Target: Unsharded PSMDB replica sets only
 ## PSMDB pbm (Percona MongoDB) — MinIO Keeper Blueprint
 Location: `psmdb-percona-operator-pbm/`
 Files: `blueprint.yaml`, `blueprintbinding.yaml`, `minio-keeper.yaml`, `psmdb-values.yaml`, `README.md`
-Pattern: Pattern 4C — MinIO keeper (vendor operator data mover via pbm)
+Pattern: Pattern 5 — MinIO keeper (vendor operator data mover via pbm)
 Target: **Sharded** PSMDB clusters (1+ shards + config server)
 
 ### Status (2026-04-24): ✅ Backup + ✅ Restore — both fully automated
