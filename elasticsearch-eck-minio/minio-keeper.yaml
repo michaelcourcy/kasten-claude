@@ -82,11 +82,12 @@ spec:
               port: 9000
             initialDelaySeconds: 10
             periodSeconds: 5
-        # Sidecar — blueprint phases KubeExec into this container because the
-        # MinIO image ships without curl/sh. Keeps the keeper pod identity
-        # (and the BlueprintBinding's `.Object.*` template context) intact.
-        - name: curl
-          image: curlimages/curl:8.10.1
+        # Sidecar — blueprint phases KubeExec into this container. The MinIO
+        # image ships without curl, so we use the Kanister tools image which
+        # bundles curl + kando (needed for kando output artifact emission)
+        # + sync, all in one Red Hat UBI minimal base.
+        - name: tools
+          image: gcr.io/kasten-images/kanister-tools:8.5.2
           command: ["sleep", "infinity"]
       volumes:
         - name: data

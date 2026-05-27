@@ -3,6 +3,10 @@ kind: Elasticsearch
 metadata:
   name: es-cluster
   namespace: elasticsearch-eck-minio
+  labels:
+    # Excludes this CR from the elasticsearch-eck/blueprintbinding.yaml
+    # (Pattern 3) so only the MinIO-keeper blueprint runs for it.
+    es-backup-pattern: minio-keeper
 spec:
   version: 8.17.0
   # Load the MinIO S3 client credentials into every ES node's keystore at

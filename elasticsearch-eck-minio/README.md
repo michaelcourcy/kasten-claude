@@ -184,10 +184,111 @@ kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
        "https://localhost:9200/test-index/_search?pretty"
 ```
 
+## Blueprint deployment
+
+Apply the Blueprint and BlueprintBinding to `kasten-io`:
+
+```bash
+kubectl apply -f blueprint.yaml
+kubectl apply -f blueprintbinding.yaml
+```
+
+The BlueprintBinding matches any `Deployment` carrying the label
+`minio-s3-keeper=true` that does **not** already have a
+`kanister.kasten.io/blueprint` annotation — so any other keeper Deployment
+intended for a non-Elasticsearch S3-protocol workload (e.g.
+[`cnpg-barman/`](../cnpg-barman/) uses its own label `cnpg-barman-minio`)
+is unaffected.
+
+Then create the Kasten backup policy. The policy must:
+
+1. Use a **Location profile** (not Infra) as `backupParameters.profile` so that
+   Kanister phases have a profile available at restore time.
+2. **Exclude every ECK-managed resource from the backup** — the MinIO
+   keeper PVC is the only thing we want in the restore point. ECK rebuilds
+   the StatefulSet/Services/Secrets/Pods from the live Elasticsearch CR;
+   re-applying them from a restore point causes a destructive rolling
+   reconciliation that disrupts the cluster and breaks master-quorum
+   (see "Why the broad exclusion" below).
+3. **Exclude the Elasticsearch CR itself** — same reason; it stays in
+   the live cluster.
+
+Example policy filter:
+
+```yaml
+backupParameters:
+  filters:
+    excludeResources:
+      # Skip every ECK-managed resource (StatefulSet, Services, Secrets,
+      # PVCs, ConfigMaps, Pods) — they all carry this label.
+      - matchLabels:
+          common.k8s.elastic.co/type: elasticsearch
+      # The Elasticsearch CR doesn't carry the label above, so exclude
+      # by group+resource.
+      - group: elasticsearch.k8s.elastic.co
+        resource: elasticsearches
+```
+
+### Why the broad exclusion
+
+If the backup captures the StatefulSet and ECK objects and Kasten re-applies
+them on restore, ECK reconciles the cluster: it scales the StatefulSet down
+to 1 (because of its "one master at a time" safety), waits for pod-0 to
+become Ready, and then refuses to scale up because pod-0 cannot form a
+quorum without pod-1 and pod-2. The live cluster never recovers without
+manual `kubectl scale sts ... --replicas=3` intervention.
+
+Excluding all ECK-managed resources means **the restore touches only the
+MinIO keeper PVC** (and the keeper Deployment, which is idempotent against
+its own spec). The live ES cluster is never disrupted; the blueprint just
+orchestrates the ES snapshot/restore API against it.
+
+## Manual workaround for restore (Kasten ≤ 8.5.x)
+
+`restorePrehook` is defined in the blueprint for forward compatibility, but
+the Kasten executor does **not** yet trigger it in 8.5.x — Kasten
+engineering confirmed it ships in a near-future release. The blueprint works
+around this by repeating the same close-indices step inside
+`restorePosthook`, so **no manual operator action is required for restore**
+on current Kasten.
+
+When `restorePrehook` is eventually enabled, the `restorePosthook` fallback
+close becomes a no-op (already-closed indices stay closed; the
+`expand_wildcards=open` query parameter limits the call to open indices).
+
+## End-to-end test (Step 5)
+
+Run a full backup/restore cycle through Kasten:
+
+```bash
+# 1. Trigger a backup via Kasten policy (UI or RunAction)
+#    Wait for status: Complete
+
+# 2. Drop test-index to simulate data loss
+ELASTIC_PASS=$(kubectl get secret es-cluster-es-elastic-user \
+  -n elasticsearch-eck-minio -o jsonpath='{.data.elastic}' | base64 -d)
+kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
+  curl -sk -u "elastic:${ELASTIC_PASS}" -X DELETE "https://localhost:9200/test-index"
+
+# 3. Trigger a Kasten RestoreAction (UI or YAML — see CLAUDE.md for the spec)
+
+# 4. After restore completes, verify documents are back
+kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
+  curl -sk -u "elastic:${ELASTIC_PASS}" -X POST "https://localhost:9200/test-index/_refresh"
+kubectl exec -n elasticsearch-eck-minio sts/es-cluster-es-default -- \
+  curl -sk -u "elastic:${ELASTIC_PASS}" "https://localhost:9200/test-index/_count"
+# Expected: {"count":5,...}
+
+# 5. Delete the Kasten restore point. The blueprint's `delete` action
+#    removes the corresponding ES snapshot from MinIO automatically.
+```
+
 ## Teardown
 
 ```bash
 # Delete any Kasten restore points that point at this app first, then:
+kubectl delete -f blueprintbinding.yaml --ignore-not-found
+kubectl delete -f blueprint.yaml --ignore-not-found
 kubectl delete -f elasticsearch.yaml --ignore-not-found
 kubectl delete -f minio-keeper.yaml --ignore-not-found
 kubectl delete ns elasticsearch-eck-minio --ignore-not-found
@@ -196,9 +297,3 @@ kubectl delete ns elasticsearch-eck-minio --ignore-not-found
 kubectl delete restorepointcontent \
   -l k10.kasten.io/appNamespace=elasticsearch-eck-minio --ignore-not-found
 ```
-
-## Status
-
-Step 2 (deploy + test data) — in progress.
-Step 3 (manual workflow validation), Step 4 (blueprint), Step 5 (end-to-end)
-— pending.

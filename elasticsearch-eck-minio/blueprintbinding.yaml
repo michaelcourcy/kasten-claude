@@ -1,24 +1,24 @@
 apiVersion: config.kio.kasten.io/v1alpha1
 kind: BlueprintBinding
 metadata:
-  name: elasticsearch-eck-binding
+  name: elasticsearch-eck-minio-blueprint-binding
   namespace: kasten-io
 spec:
   blueprintRef:
-    name: elasticsearch-eck-blueprint
+    name: elasticsearch-eck-minio-blueprint
     namespace: kasten-io
   resources:
     matchAll:
       - type:
           operator: In
           values:
-            - group: elasticsearch.k8s.elastic.co
-              resource: elasticsearches
+            - group: apps
+              resource: deployments
+      - labels:
+          key: minio-s3-keeper
+          operator: In
+          values:
+            - "true"
       - annotations:
           key: kanister.kasten.io/blueprint
           operator: DoesNotExist
-      - labels:
-          key: es-backup-pattern
-          operator: NotIn
-          values:
-            - minio-keeper

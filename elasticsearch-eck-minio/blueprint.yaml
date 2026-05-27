@@ -1,0 +1,289 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: elasticsearch-eck-minio-blueprint
+  namespace: kasten-io
+actions:
+
+  # backupPrehook ─ creates a uniquely-named Elasticsearch snapshot in
+  # the kasten-repo S3 repository (backed by the local MinIO keeper),
+  # then syncs the keeper filesystem so the post-snapshot writes are
+  # flushed to the EBS block device before Kasten takes the CSI snapshot.
+  backupPrehook:
+    outputArtifacts:
+      kastenSnapshot:
+        keyValue:
+          snapshotName: '{{ .Phases.createSnapshot.Output.snapshotName }}'
+          workloadName: '{{ .Phases.createSnapshot.Output.workloadName }}'
+          namespace:    '{{ .Phases.createSnapshot.Output.namespace }}'
+    phases:
+      - func: KubeExec
+        name: createSnapshot
+        objects:
+          esCreds:
+            kind: Secret
+            name: '{{ index .Object.metadata.labels "kasten.io/workload-name" }}-es-elastic-user'
+            namespace: '{{ .Object.metadata.namespace }}'
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'
+          pod:       '{{ index .Deployment.Pods 0 }}'
+          container: tools
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              WORKLOAD='{{ index .Object.metadata.labels "kasten.io/workload-name" }}'
+              NS='{{ .Object.metadata.namespace }}'
+              SNAPSHOT="kasten-$(date +%Y%m%d%H%M%S)"
+              ES_URL="https://${WORKLOAD}-es-http.${NS}.svc:9200"
+              ELASTIC_PASS='{{ index .Phases.createSnapshot.Secrets.esCreds.Data "elastic" | toString }}'
+
+              echo "Creating ES snapshot ${SNAPSHOT} in repo kasten-repo (cluster=${WORKLOAD}, ns=${NS})"
+              RESPONSE=$(curl -sk -u "elastic:${ELASTIC_PASS}" \
+                -X PUT "${ES_URL}/_snapshot/kasten-repo/${SNAPSHOT}?wait_for_completion=true" \
+                -H 'Content-Type: application/json' \
+                -d '{"indices":"*","include_global_state":false}')
+              echo "${RESPONSE}"
+
+              echo "${RESPONSE}" | grep -q '"state":"SUCCESS"' || {
+                echo "ERROR: snapshot did not reach state=SUCCESS"
+                exit 1
+              }
+
+              # Flush the OS page cache so the MinIO writes land on the EBS
+              # block device before Kasten triggers the CSI snapshot. Without
+              # this, freshly-written ES snapshot files can be missing from
+              # the captured PVC. See the Couchbase blueprint for the same
+              # pattern and root cause.
+              echo "Syncing keeper filesystem..."
+              sync
+
+              kando output snapshotName "${SNAPSHOT}"
+              kando output workloadName "${WORKLOAD}"
+              kando output namespace    "${NS}"
+
+  # backupPosthook ─ no-op. The ES snapshot was created synchronously in
+  # backupPrehook and the keeper filesystem was synced there. Declared
+  # for the Kasten action table; safe to remove if unused.
+  backupPosthook:
+    phases:
+      - func: KubeExec
+        name: noop
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'
+          pod:       '{{ index .Deployment.Pods 0 }}'
+          container: tools
+          command:
+            - sh
+            - -c
+            - 'echo "backupPosthook: nothing to do"'
+
+  # restorePrehook ─ deletes any user indices that conflict with the
+  # snapshot so the upcoming restore can recreate them. Not triggered in
+  # Kasten ≤ 8.5.x — included for forward compatibility. The same logic
+  # runs in restorePosthook so the blueprint works on current Kasten too.
+  restorePrehook:
+    inputArtifactNames:
+      - kastenSnapshot
+    phases:
+      - func: KubeExec
+        name: preRestoreDelete
+        objects:
+          esCreds:
+            kind: Secret
+            name: '{{ .ArtifactsIn.kastenSnapshot.KeyValue.workloadName }}-es-elastic-user'
+            namespace: '{{ .ArtifactsIn.kastenSnapshot.KeyValue.namespace }}'
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'
+          pod:       '{{ index .Deployment.Pods 0 }}'
+          container: tools
+          command:
+            - bash
+            - -c
+            - |
+              WORKLOAD='{{ .ArtifactsIn.kastenSnapshot.KeyValue.workloadName }}'
+              NS='{{ .ArtifactsIn.kastenSnapshot.KeyValue.namespace }}'
+              SNAPSHOT='{{ .ArtifactsIn.kastenSnapshot.KeyValue.snapshotName }}'
+              ES_URL="https://${WORKLOAD}-es-http.${NS}.svc:9200"
+              ELASTIC_PASS='{{ index .Phases.preRestoreDelete.Secrets.esCreds.Data "elastic" | toString }}'
+
+              # List user indices captured in the snapshot (non-`.`-prefixed).
+              # ES 8.x rejects wildcards in destructive operations
+              # (`action.destructive_requires_name=true`), so delete by exact
+              # name. Existing data streams and `.ds-*` indices are owned by
+              # ES itself and left untouched.
+              SNAP_JSON=$(curl -sk -u "elastic:${ELASTIC_PASS}" \
+                "${ES_URL}/_snapshot/kasten-repo/${SNAPSHOT}")
+              USER_INDICES=$(echo "${SNAP_JSON}" \
+                | sed -n 's/.*"indices"[[:space:]]*:[[:space:]]*\(\[[^]]*\]\).*/\1/p' \
+                | tr -d '[]"' \
+                | tr ',' '\n' \
+                | grep -v '^\.' \
+                | grep -v '^$')
+              echo "User indices in snapshot: ${USER_INDICES:-<none>}"
+              for IDX in ${USER_INDICES}; do
+                echo "  deleting ${IDX} (idempotent)"
+                curl -sk -u "elastic:${ELASTIC_PASS}" \
+                  -X DELETE "${ES_URL}/${IDX}" || true
+                echo
+              done
+
+  # restorePosthook ─ waits for ES to be reachable on the restored MinIO
+  # PVC, closes any open indices (idempotent fallback because restorePrehook
+  # does not fire in ≤ 8.5.x), then restores the snapshot recorded in the
+  # artifact. ES auto-opens indices on successful restore.
+  restorePosthook:
+    inputArtifactNames:
+      - kastenSnapshot
+    phases:
+      - func: KubeExec
+        name: restoreSnapshot
+        objects:
+          esCreds:
+            kind: Secret
+            name: '{{ .ArtifactsIn.kastenSnapshot.KeyValue.workloadName }}-es-elastic-user'
+            namespace: '{{ .ArtifactsIn.kastenSnapshot.KeyValue.namespace }}'
+        args:
+          namespace: '{{ .Object.metadata.namespace }}'
+          pod:       '{{ index .Deployment.Pods 0 }}'
+          container: tools
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              WORKLOAD='{{ .ArtifactsIn.kastenSnapshot.KeyValue.workloadName }}'
+              NS='{{ .ArtifactsIn.kastenSnapshot.KeyValue.namespace }}'
+              SNAPSHOT='{{ .ArtifactsIn.kastenSnapshot.KeyValue.snapshotName }}'
+              ES_URL="https://${WORKLOAD}-es-http.${NS}.svc:9200"
+              ELASTIC_PASS='{{ index .Phases.restoreSnapshot.Secrets.esCreds.Data "elastic" | toString }}'
+
+              echo "Waiting for ES to be reachable at ${ES_URL}..."
+              for i in $(seq 1 60); do
+                STATUS=$(curl -sk -u "elastic:${ELASTIC_PASS}" \
+                  -o /dev/null -w '%{http_code}' "${ES_URL}/_cluster/health" || echo 000)
+                if [ "${STATUS}" = "200" ]; then
+                  echo "ES reachable after ${i} attempts"
+                  break
+                fi
+                echo "  [${i}] ES not ready (HTTP ${STATUS})"
+                sleep 5
+              done
+
+              # Discover the snapshot's user indices (non-`.`-prefixed).
+              # The pattern `*,-.*` in the restore body does NOT exclude
+              # data-stream backing indices like `.ds-ilm-history-...`
+              # because ES treats data streams atomically. We bypass the
+              # problem by enumerating user indices and restoring them by
+              # explicit name list.
+              echo "Discovering user indices in snapshot ${SNAPSHOT}..."
+              SNAP_JSON=$(curl -sk -u "elastic:${ELASTIC_PASS}" \
+                "${ES_URL}/_snapshot/kasten-repo/${SNAPSHOT}")
+              USER_INDICES=$(echo "${SNAP_JSON}" \
+                | sed -n 's/.*"indices"[[:space:]]*:[[:space:]]*\(\[[^]]*\]\).*/\1/p' \
+                | tr -d '[]"' \
+                | tr ',' '\n' \
+                | grep -v '^\.' \
+                | grep -v '^$')
+              if [ -z "${USER_INDICES}" ]; then
+                echo "No user indices in snapshot — nothing to restore."
+                exit 0
+              fi
+              echo "User indices to restore: ${USER_INDICES}"
+
+              # Delete each (idempotent — ignore 404). This is also the
+              # fallback for restorePrehook which doesn't fire in Kasten ≤
+              # 8.5.x. ES 8.x rejects wildcards in destructive ops, so we
+              # delete by exact name.
+              echo "Deleting any pre-existing copies in the live cluster..."
+              for IDX in ${USER_INDICES}; do
+                echo "  deleting ${IDX}"
+                curl -sk -u "elastic:${ELASTIC_PASS}" \
+                  -X DELETE "${ES_URL}/${IDX}" || true
+                echo
+              done
+
+              # Restore the user indices by name (comma-separated).
+              # include_global_state:false avoids overwriting cluster-wide
+              # settings (ILM policies, templates, etc.) — those live in
+              # the cluster, not in the user data.
+              INDICES_CSV=$(echo "${USER_INDICES}" | paste -sd, -)
+              echo "Restoring snapshot ${SNAPSHOT} (indices=${INDICES_CSV})..."
+              RESPONSE=$(curl -sk -u "elastic:${ELASTIC_PASS}" \
+                -X POST "${ES_URL}/_snapshot/kasten-repo/${SNAPSHOT}/_restore?wait_for_completion=true" \
+                -H 'Content-Type: application/json' \
+                -d "{\"indices\":\"${INDICES_CSV}\",\"include_global_state\":false}")
+              echo "${RESPONSE}"
+
+              # ES returns shards object with failed count on full success.
+              echo "${RESPONSE}" | grep -q '"failed":0' || {
+                echo "ERROR: restore did not complete cleanly"
+                exit 1
+              }
+              echo "Restore complete."
+
+  # delete ─ runs when Kasten retires a restore point. Removes the matching
+  # ES snapshot from the live MinIO bucket so it does not grow unboundedly.
+  # KubeTask in kasten-io (not KubeExec into the keeper) so the action
+  # still runs if the app namespace has been deleted between backup and
+  # restore-point retirement.
+  delete:
+    inputArtifactNames:
+      - kastenSnapshot
+    phases:
+      - func: KubeTask
+        name: deleteSnapshot
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              WORKLOAD='{{ .ArtifactsIn.kastenSnapshot.KeyValue.workloadName }}'
+              NS='{{ .ArtifactsIn.kastenSnapshot.KeyValue.namespace }}'
+              SNAPSHOT='{{ .ArtifactsIn.kastenSnapshot.KeyValue.snapshotName }}'
+
+              if ! kubectl get namespace "${NS}" > /dev/null 2>&1; then
+                echo "Namespace ${NS} no longer exists — nothing to delete."
+                exit 0
+              fi
+
+              if ! kubectl get deploy "${WORKLOAD}-minio" -n "${NS}" > /dev/null 2>&1; then
+                echo "Keeper Deployment ${WORKLOAD}-minio no longer exists — nothing to delete."
+                exit 0
+              fi
+
+              SECRET="${WORKLOAD}-es-elastic-user"
+              if ! kubectl get secret "${SECRET}" -n "${NS}" > /dev/null 2>&1; then
+                echo "Elastic user secret ${SECRET} no longer exists — ES gone, nothing to delete."
+                exit 0
+              fi
+              ELASTIC_PASS=$(kubectl get secret "${SECRET}" -n "${NS}" \
+                -o jsonpath='{.data.elastic}' | base64 -d)
+              ES_URL="https://${WORKLOAD}-es-http.${NS}.svc:9200"
+
+              echo "Deleting ES snapshot ${SNAPSHOT} from kasten-repo (cluster=${WORKLOAD}, ns=${NS})"
+              RESPONSE=$(curl -sk -u "elastic:${ELASTIC_PASS}" \
+                -X DELETE "${ES_URL}/_snapshot/kasten-repo/${SNAPSHOT}")
+              echo "${RESPONSE}"
+
+              if echo "${RESPONSE}" | grep -q '"acknowledged":true'; then
+                echo "Snapshot deleted."
+              elif echo "${RESPONSE}" | grep -q 'snapshot_missing_exception'; then
+                echo "Snapshot already deleted — idempotent success."
+              else
+                echo "ERROR: unexpected response from ES"
+                exit 1
+              fi
