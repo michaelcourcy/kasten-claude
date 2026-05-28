@@ -137,6 +137,19 @@ skeleton.
 > ready when the fix ships. In the meantime, document the equivalent manual steps in each
 > blueprint's `README.md` so operators know what to run before triggering a Kasten restore.
 
+> **`restorePrehook` only fires when the bound resource already exists in the target
+> namespace.** When `restorePrehook` ships (post-8.5.x), the planned semantics are that the
+> hook is scoped to the live resource Kasten's BlueprintBinding (or annotation) resolves to.
+> If that resource is absent — for example a disaster-recovery restore into an empty or
+> freshly-created namespace where the workload has not been re-created yet — the hook is
+> **silently skipped**, not failed. This means a `restorePrehook` that cleans up live
+> conflicting state (e.g. deletes a leftover CR before the upcoming restore) automatically
+> degrades to a no-op in DR/migration scenarios where there is nothing to clean up. Design
+> the hook with this asymmetry in mind: it runs only on in-place restores, never on
+> namespace-deleted DR restores. The same rule applies to `backupPrehook`, which also
+> requires the bound resource to exist in the live namespace — but in the backup case that
+> is always true by construction (you can't back up a workload that doesn't exist).
+
 ## The backup and restore workflow managed by kasten 
 
 When a blueprint defines `backup` and `restore` actions, the blueprint itself becomes the data
