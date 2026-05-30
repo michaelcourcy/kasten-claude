@@ -78,6 +78,12 @@ echo "Label: env=test"
 echo "Label: tier=backend"
 ```
 
+## Redo the same thing with the mariadb operator
+
+```
+kubectl apply -f mariadb/
+```
+
 ## Clean up
 
 ```bash
