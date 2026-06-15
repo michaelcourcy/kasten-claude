@@ -1,0 +1,238 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: cockroachdb-blueprint
+  namespace: kasten-io
+# ---------------------------------------------------------------------------
+# Pattern 5 — Database backup via a local MinIO keeper.
+#
+# CockroachDB is a distributed SQL database: data is sharded into ranges and
+# replicated (Raft) across nodes. A per-node PVC snapshot is NOT a consistent,
+# restorable copy of the cluster, so Kasten cannot be the data mover by
+# snapshotting the CockroachDB data PVCs. Instead, CockroachDB's own
+# transactionally-consistent BACKUP statement writes to a MinIO instance
+# (local S3 endpoint) running in the application namespace, and Kasten
+# snapshots only the MinIO PVC.
+#
+# The Blueprint binds to the MinIO Deployment (the "keeper"). Naming
+# convention (required):
+#   - keeper Deployment / Service / PVC : <cluster>-minio
+#   - keeper credentials Secret         : <cluster>-minio-creds  (rootUser / rootPassword)
+#   - CockroachDB StatefulSet name       : <cluster>
+#   - CockroachDB pod label              : app=<cluster>
+#   - MinIO bucket                       : <cluster>-backups
+# where <cluster> = keeper Deployment name with the "-minio" suffix removed.
+# ---------------------------------------------------------------------------
+actions:
+  backupPrehook:
+    outputArtifacts:
+      cockroachBackup:
+        keyValue:
+          databases: "{{ .Phases.crdbBackup.Output.databases }}"
+          bucket: "{{ .Phases.crdbBackup.Output.bucket }}"
+          namespace: "{{ .Phases.crdbBackup.Output.namespace }}"
+    phases:
+      - func: KubeTask
+        name: crdbBackup
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              KEEPER="{{ .Object.metadata.name }}"
+              NS="{{ .Object.metadata.namespace }}"
+              CLUSTER="${KEEPER%-minio}"
+              BUCKET="${CLUSTER}-backups"
+              SECRET="${KEEPER}-creds"
+
+              echo "Keeper=${KEEPER} Cluster=${CLUSTER} Namespace=${NS} Bucket=${BUCKET}"
+
+              # --- MinIO credentials (URL-safe values required) ---
+              ACCESS=$(kubectl get secret "${SECRET}" -n "${NS}" -o jsonpath='{.data.rootUser}' | base64 -d)
+              SECRETKEY=$(kubectl get secret "${SECRET}" -n "${NS}" -o jsonpath='{.data.rootPassword}' | base64 -d)
+
+              # --- Ensure the MinIO bucket exists (idempotent) ---
+              MINIO_POD=$(kubectl get pods -n "${NS}" -l "app=${KEEPER}" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+                | awk '$2=="true"{print $1; exit}')
+              if [ -z "${MINIO_POD}" ]; then
+                echo "ERROR: no ready MinIO pod found (label app=${KEEPER})"
+                exit 1
+              fi
+              echo "Ensuring bucket ${BUCKET} exists on MinIO pod ${MINIO_POD}..."
+              kubectl exec -n "${NS}" "${MINIO_POD}" -- mkdir -p "/data/${BUCKET}"
+
+              # --- Find a ready CockroachDB pod to run SQL in ---
+              CRDB_POD=$(kubectl get pods -n "${NS}" -l "app=${CLUSTER}" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+                | awk '$2=="true"{print $1; exit}')
+              if [ -z "${CRDB_POD}" ]; then
+                echo "ERROR: no ready CockroachDB pod found (label app=${CLUSTER})"
+                exit 1
+              fi
+              echo "Running SQL inside CockroachDB pod ${CRDB_POD}"
+
+              ENDPOINT_ENC="http%3A%2F%2F${KEEPER}.${NS}.svc.cluster.local%3A9000"
+              S3URL="s3://${BUCKET}?AWS_ACCESS_KEY_ID=${ACCESS}&AWS_SECRET_ACCESS_KEY=${SECRETKEY}&AWS_ENDPOINT=${ENDPOINT_ENC}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+
+              # --- Discover user databases (exclude built-ins) ---
+              DBS=$(kubectl exec -n "${NS}" "${CRDB_POD}" -- /cockroach/cockroach sql --insecure --format=tsv \
+                -e "SELECT database_name FROM [SHOW DATABASES] WHERE database_name NOT IN ('system','defaultdb','postgres');" \
+                | awk 'NR>1' | tr '\n' ',' | sed 's/,$//')
+              if [ -z "${DBS}" ]; then
+                echo "ERROR: no user databases found to back up"
+                exit 1
+              fi
+              echo "User databases to back up: ${DBS}"
+
+              # --- Transactionally-consistent BACKUP into the MinIO collection ---
+              echo "Running BACKUP DATABASE ${DBS} INTO collection..."
+              kubectl exec -n "${NS}" "${CRDB_POD}" -- /cockroach/cockroach sql --insecure \
+                -e "BACKUP DATABASE ${DBS} INTO '${S3URL}';"
+
+              # --- sync: flush MinIO page cache to the block device BEFORE Kasten
+              #     snapshots the PVC. EBS snapshots bypass the OS page cache; an
+              #     un-synced object would be captured as a 0-byte file. ---
+              echo "Syncing MinIO PVC to disk..."
+              kubectl exec -n "${NS}" "${MINIO_POD}" -- sync
+              sleep 3
+              echo "Backup complete. MinIO PVC is consistent for the Kasten snapshot."
+
+              kando output databases "${DBS}"
+              kando output bucket "${BUCKET}"
+              kando output namespace "${NS}"
+
+  restorePosthook:
+    phases:
+      - func: KubeTask
+        name: crdbRestore
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              KEEPER="{{ .Object.metadata.name }}"
+              NS="{{ .Object.metadata.namespace }}"
+              CLUSTER="${KEEPER%-minio}"
+              BUCKET="${CLUSTER}-backups"
+              SECRET="${KEEPER}-creds"
+
+              echo "Keeper=${KEEPER} Cluster=${CLUSTER} Namespace=${NS} Bucket=${BUCKET}"
+
+              # --- Wait for the restored MinIO keeper to be ready ---
+              echo "Waiting for MinIO keeper to be ready (timeout 5m)..."
+              MINIO_POD=""
+              ELAPSED=0
+              while [ $ELAPSED -lt 300 ]; do
+                MINIO_POD=$(kubectl get pods -n "${NS}" -l "app=${KEEPER}" \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+                  | awk '$2=="true"{print $1; exit}')
+                if [ -n "${MINIO_POD}" ]; then break; fi
+                sleep 5; ELAPSED=$((ELAPSED + 5))
+              done
+              if [ -z "${MINIO_POD}" ]; then
+                echo "ERROR: MinIO keeper not ready after 5m"
+                exit 1
+              fi
+              echo "MinIO keeper ready: ${MINIO_POD}"
+
+              # --- Wait for the CockroachDB cluster to accept SQL ---
+              # The CockroachDB data PVCs are excluded from the Kasten snapshot, so
+              # restore expects an already-provisioned, initialized cluster (the
+              # running cluster for a same-namespace rollback, or a freshly
+              # deployed+initialized cluster for DR — see README).
+              echo "Waiting for a ready CockroachDB pod (timeout 5m)..."
+              CRDB_POD=""
+              ELAPSED=0
+              while [ $ELAPSED -lt 300 ]; do
+                CRDB_POD=$(kubectl get pods -n "${NS}" -l "app=${CLUSTER}" \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+                  | awk '$2=="true"{print $1; exit}')
+                if [ -n "${CRDB_POD}" ]; then break; fi
+                sleep 5; ELAPSED=$((ELAPSED + 5))
+              done
+              if [ -z "${CRDB_POD}" ]; then
+                echo "ERROR: no ready CockroachDB pod found. The cluster must be provisioned"
+                echo "       and initialized before restore (see README DR procedure)."
+                exit 1
+              fi
+              echo "CockroachDB pod ready: ${CRDB_POD}"
+
+              ACCESS=$(kubectl get secret "${SECRET}" -n "${NS}" -o jsonpath='{.data.rootUser}' | base64 -d)
+              SECRETKEY=$(kubectl get secret "${SECRET}" -n "${NS}" -o jsonpath='{.data.rootPassword}' | base64 -d)
+              ENDPOINT_ENC="http%3A%2F%2F${KEEPER}.${NS}.svc.cluster.local%3A9000"
+              S3URL="s3://${BUCKET}?AWS_ACCESS_KEY_ID=${ACCESS}&AWS_SECRET_ACCESS_KEY=${SECRETKEY}&AWS_ENDPOINT=${ENDPOINT_ENC}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+
+              # --- Discover databases present in the LATEST backup ---
+              DBS=$(kubectl exec -n "${NS}" "${CRDB_POD}" -- /cockroach/cockroach sql --insecure --format=tsv \
+                -e "SELECT DISTINCT database_name FROM [SHOW BACKUP LATEST IN '${S3URL}'] WHERE database_name IS NOT NULL AND database_name NOT IN ('system','defaultdb','postgres');" \
+                | awk 'NR>1')
+              if [ -z "${DBS}" ]; then
+                echo "ERROR: no user databases found in the latest backup"
+                exit 1
+              fi
+              echo "Databases in backup:"; echo "${DBS}"
+
+              # --- Drop existing copies then RESTORE (RESTORE DATABASE requires the
+              #     target database not to exist). The logical backup is the
+              #     authoritative, transactionally-consistent source of user data. ---
+              RLIST=""
+              for db in ${DBS}; do
+                echo "Dropping database ${db} if it exists..."
+                kubectl exec -n "${NS}" "${CRDB_POD}" -- /cockroach/cockroach sql --insecure \
+                  -e "DROP DATABASE IF EXISTS ${db} CASCADE;"
+                if [ -z "${RLIST}" ]; then RLIST="${db}"; else RLIST="${RLIST},${db}"; fi
+              done
+
+              echo "Restoring databases ${RLIST} FROM LATEST..."
+              kubectl exec -n "${NS}" "${CRDB_POD}" -- /cockroach/cockroach sql --insecure \
+                -e "RESTORE DATABASE ${RLIST} FROM LATEST IN '${S3URL}';"
+              echo "Restore complete."
+
+  # restorePrehook is not yet triggered by Kasten (<= 8.5.x). It is implemented
+  # for forward compatibility; the same logic also runs in restorePosthook so
+  # restore works today. See README for the manual DR procedure.
+  restorePrehook:
+    phases:
+      - func: KubeTask
+        name: crdbRestorePreNoop
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              echo "restorePrehook placeholder — restore logic runs in restorePosthook."
+
+  delete:
+    inputArtifactNames:
+      - cockroachBackup
+    phases:
+      - func: KubeTask
+        name: crdbDelete
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              echo "Kasten deleted the MinIO PVC snapshot for this restore point."
+              echo "Backup data: bucket={{ .ArtifactsIn.cockroachBackup.KeyValue.bucket }}"
+              echo "             databases={{ .ArtifactsIn.cockroachBackup.KeyValue.databases }}"
+              echo "             namespace={{ .ArtifactsIn.cockroachBackup.KeyValue.namespace }}"
+              echo "The CockroachDB BACKUP collection lives on the MinIO PVC; its"
+              echo "lifecycle is governed by Kasten snapshot retention. Nothing to delete."

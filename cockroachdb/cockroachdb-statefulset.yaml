@@ -1,0 +1,137 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroachdb-public
+  namespace: cockroachdb-test
+  labels:
+    app: cockroachdb
+spec:
+  ports:
+    - port: 26257
+      targetPort: 26257
+      name: sql
+    - port: 8080
+      targetPort: 8080
+      name: http
+  selector:
+    app: cockroachdb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroachdb
+  namespace: cockroachdb-test
+  labels:
+    app: cockroachdb
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  ports:
+    - port: 26257
+      targetPort: 26257
+      name: sql
+    - port: 8080
+      targetPort: 8080
+      name: http
+  publishNotReadyAddresses: true
+  clusterIP: None
+  selector:
+    app: cockroachdb
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cockroachdb-budget
+  namespace: cockroachdb-test
+  labels:
+    app: cockroachdb
+spec:
+  selector:
+    matchLabels:
+      app: cockroachdb
+  maxUnavailable: 1
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cockroachdb
+  namespace: cockroachdb-test
+  labels:
+    app: cockroachdb
+spec:
+  serviceName: cockroachdb
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cockroachdb
+  template:
+    metadata:
+      labels:
+        app: cockroachdb
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - cockroachdb
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cockroachdb
+          image: cockroachdb/cockroach:v24.3.33
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 26257
+              name: sql
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health?ready=1
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          volumeMounts:
+            - name: datadir
+              mountPath: /cockroach/cockroach-data
+          env:
+            - name: COCKROACH_CHANNEL
+              value: kubernetes-insecure
+          command:
+            - "/bin/bash"
+            - "-ecx"
+            - exec /cockroach/cockroach start
+              --logtostderr
+              --insecure
+              --advertise-host $(hostname -f)
+              --http-addr 0.0.0.0
+              --join cockroachdb-0.cockroachdb,cockroachdb-1.cockroachdb,cockroachdb-2.cockroachdb
+              --cache 256MiB
+              --max-sql-memory 256MiB
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+    - metadata:
+        name: datadir
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ebs-sc
+        resources:
+          requests:
+            storage: 5Gi
