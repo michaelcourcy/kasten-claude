@@ -21,4 +21,5 @@ spec:
           key: cnpg-backup-pattern
           operator: NotIn
           values:
-            - barman-minio
+            - barman-minio         # cnpg-barman (in-tree barman-cloud, deprecated)
+            - barman-cloud-plugin  # cnpg-barman-cloud (Barman Cloud Plugin)

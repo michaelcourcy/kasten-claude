@@ -1,0 +1,24 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: cnpg-barman-cloud-blueprint-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: cnpg-barman-cloud-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: cnpg-barman-cloud-minio
+          operator: In
+          values:
+            - "true"
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

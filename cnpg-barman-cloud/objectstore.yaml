@@ -1,0 +1,24 @@
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: pg-cluster-store
+  namespace: cnpg-barman-cloud
+spec:
+  # Recovery-window retention. Keep this at least 2x the Kasten backup interval
+  # so the previous base backup survives on the live MinIO PVC until the next
+  # Kasten snapshot captures it (see README "Sizing retentionPolicy").
+  retentionPolicy: "7d"
+  configuration:
+    destinationPath: s3://cnpg-backup/
+    endpointURL: http://pg-cluster-minio.cnpg-barman-cloud.svc:9000
+    s3Credentials:
+      accessKeyId:
+        name: pg-cluster-minio-creds
+        key: rootUser
+      secretAccessKey:
+        name: pg-cluster-minio-creds
+        key: rootPassword
+    wal:
+      compression: gzip
+    data:
+      compression: gzip

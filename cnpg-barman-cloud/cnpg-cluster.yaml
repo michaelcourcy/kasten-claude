@@ -1,0 +1,22 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-cluster
+  namespace: cnpg-barman-cloud
+  labels:
+    # Keeps the Pattern 1 cnpg-blueprint-binding (which binds on clusters) away
+    # from this cluster. The value must be listed in that binding's NotIn filter.
+    cnpg-backup-pattern: barman-cloud-plugin
+spec:
+  instances: 2
+  storage:
+    size: 1Gi
+    storageClass: ebs-sc
+  # Barman Cloud Plugin (CNPG-I) — replaces the deprecated in-tree
+  # spec.backup.barmanObjectStore. WAL archiving and base backups are handled
+  # by the plugin, configured via the referenced ObjectStore CR.
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: pg-cluster-store

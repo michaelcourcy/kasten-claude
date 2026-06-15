@@ -2,7 +2,18 @@
 
 Kasten blueprint for CloudNativePG clusters that use **barman-cloud WAL archiving to a local MinIO instance**. Kasten snapshots the MinIO PVC (which contains the full barman archive), enabling Point-In-Time Recovery (PITR) from any Kasten restore point.
 
-> ⚠️ **Deprecation notice**: barman-cloud integration in CNPG is deprecated and will be **fully removed in CNPG 1.30.0**. Consider migrating to the [cnpg/](../cnpg/) Pattern 1 blueprint (fence and quiesce a replica) for new deployments. This blueprint targets CNPG ≤ 1.29.x.
+> ⚠️ **Deprecation notice**: the **in-tree** barman-cloud integration used by this blueprint
+> (`spec.backup.barmanObjectStore` on the Cluster + `Backup` with `method: barmanObjectStore`) is
+> deprecated and will be **fully removed in CNPG 1.30.0**. This blueprint targets CNPG ≤ 1.29.x.
+>
+> Two successors exist:
+> - **[cnpg-barman-cloud/](../cnpg-barman-cloud/)** — the **same Pattern 5 / MinIO-keeper design as this
+>   blueprint, upgraded to the [Barman Cloud Plugin](https://cloudnative-pg.io/plugin-barman-cloud/)**
+>   (CNPG-I: `ObjectStore` CR + `spec.plugins` + `Backup` with `method: plugin`). This is the
+>   recommended migration target if you want to keep barman-based PITR on a local MinIO keeper.
+>   Requires CNPG ≥ 1.26 and cert-manager.
+> - **[cnpg/](../cnpg/)** — Pattern 1 (fence and quiesce a replica), no barman at all; choose this if
+>   crash-consistent PVC snapshots are sufficient and you want to drop barman entirely.
 
 ## Versions
 
