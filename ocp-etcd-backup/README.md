@@ -15,6 +15,38 @@ cloud identity — Kasten is the data mover.
 
 ---
 
+## ⚠️ Read this first — an etcd backup is *not* an OpenShift backup
+
+Take an etcd snapshot for what it is, and don't mistake it for a recovery strategy:
+
+- **It captures no application data.** No PVC contents, no object storage — only the
+  cluster's API objects at a point in time. Your databases and files are not in it.
+- **Granular restore is impossible.** etcd restore is all-or-nothing: you roll the
+  *entire* cluster back to the snapshot. You cannot restore a single namespace,
+  workload, or PVC.
+- **It is disruptive and dangerous.** `cluster-restore.sh` takes the API server down
+  and rebuilds the control plane on every master. It is a full-cluster disaster
+  operation, not a routine recovery, and is easy to get wrong.
+
+**The recommended OpenShift recovery model:**
+
+1. **Rebuild the cluster and its infrastructure operators with a solid GitOps
+   process** (ArgoCD/Flux) — declaratively, reproducibly, not from an etcd snapshot.
+2. **Restore the applications onto it with Kasten** — granular, non-disruptive, and
+   *with* their PVC data and object storage. This is what etcd can never do.
+
+Kasten can also back up the infrastructure-operator namespaces themselves — treat
+that as a **fail-over convenience**, not the primary path (GitOps remains the source
+of truth for the platform).
+
+**So why this blueprint?** etcd backups still have their place: **legacy practices /
+compliance requirements** that mandate them, and **forensics** (inspecting cluster
+state at a past point in time). This blueprint makes those etcd snapshots safe,
+scheduled, and snapshot-managed by Kasten — it is **not** a substitute for the
+GitOps + Kasten application-restore model above.
+
+---
+
 ## Pattern
 
 **Pattern 4 — database dump on a permanent Keeper PVC (PVC mounted by keeper).**
@@ -319,6 +351,12 @@ kubectl exec -n etcd-backup $POD -- bash -c 'ls -lh /backup/etcd-backup; etcdutl
 ```
 
 ### 2. Restore the control-plane etcd onto the cluster (manual)
+
+> Before you do this, re-read
+> [**"an etcd backup is not an OpenShift backup"**](#️-read-this-first--an-etcd-backup-is-not-an-openshift-backup).
+> This is a full-cluster disaster operation. In most situations the right answer is
+> to rebuild the cluster via GitOps and restore the applications (with their data)
+> via Kasten — *not* to roll etcd back.
 
 This blueprint deliberately does **not** automate this. Follow the official
 OpenShift procedure, using the files now on the keeper PVC:
