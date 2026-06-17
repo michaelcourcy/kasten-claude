@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: etcd-backup
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: etcd-backup-keeper
+  namespace: etcd-backup
+---
+# Allow the keeper to read ClusterOperator status, so the backupPrehook can verify
+# no control-plane operator is mid-rollout before taking the etcd backup
+# (the equivalent of cluster-backup.sh's own check, which we run with --force).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: etcd-backup-keeper-co-reader
+rules:
+  - apiGroups: ["config.openshift.io"]
+    resources: ["clusteroperators"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: etcd-backup-keeper-co-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: etcd-backup-keeper-co-reader
+subjects:
+  - kind: ServiceAccount
+    name: etcd-backup-keeper
+    namespace: etcd-backup
+---
+# Permanent backup PVC. Kasten snapshots THIS PVC; the snapshot is the restore
+# point. It is also the volume an admin can inspect through the keeper pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ocp-etcd-backup
+  namespace: etcd-backup
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocp-etcd-backup-keeper
+  namespace: etcd-backup
+  labels:
+    app: ocp-etcd-backup-keeper
+    etcd-backup-keeper: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO PVC: never two pods mounting it at once
+  selector:
+    matchLabels:
+      app: ocp-etcd-backup-keeper
+  template:
+    metadata:
+      labels:
+        app: ocp-etcd-backup-keeper
+        etcd-backup-keeper: "true"
+    spec:
+      serviceAccountName: etcd-backup-keeper
+      # Run on a control-plane node: cluster-backup.sh + the etcd static-pod
+      # resources and certs only exist on the masters.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/master
+                    operator: Exists
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        seLinuxOptions:
+          type: spc_t          # allow reads of host /etc/kubernetes under SELinux
+        runAsUser: 0
+        runAsGroup: 0
+      containers:
+        - name: keeper
+          image: michaelcourcy/ocp-etcd-backup:8.5.12
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args: ["echo 'ocp-etcd-backup keeper ready'; sleep infinity"]
+          volumeMounts:
+            - name: etc-kubernetes
+              mountPath: /etc/kubernetes
+              readOnly: true
+            - name: backup
+              mountPath: /backup
+      volumes:
+        - name: etc-kubernetes
+          hostPath:
+            path: /etc/kubernetes
+            type: Directory
+        - name: backup
+          persistentVolumeClaim:
+            claimName: ocp-etcd-backup

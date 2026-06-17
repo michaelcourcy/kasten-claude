@@ -1,0 +1,140 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: ocp-etcd-backup
+  namespace: kasten-io
+# OpenShift etcd backup — Pattern 4 (database dump on a permanent Keeper PVC).
+#
+# Adapted from https://github.com/Jaiganeshjk12/etcd-bp-azcopy with the azcopy
+# upload and federated-identity logic removed: the etcd snapshot is written to a
+# PERMANENT PVC mounted by the keeper Deployment, and Kasten snapshots that PVC.
+# The PVC snapshot IS the restore point — no object-store client, no delete action.
+#
+# The keeper pod (Deployment `*-keeper`, container `keeper`) runs on a control-plane
+# node, mounts host /etc/kubernetes read-only, and mounts the backup PVC at /backup.
+# backupPrehook KubeExec's into it and runs the node's own cluster-backup.sh.
+actions:
+  backupPrehook:
+    phases:
+    - func: KubeExec
+      name: etcdBackup
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        pod: "{{ index .Deployment.Pods 0 }}"
+        container: keeper
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          BACKUP_DIR=/backup/etcd-backup
+          HOST_SCRIPT=/etc/kubernetes/static-pod-resources/etcd-certs/configmaps/etcd-scripts/cluster-backup.sh
+
+          echo "=== OpenShift etcd backup pre-hook ==="
+          echo "Node: $(cat /etc/hostname 2>/dev/null || echo unknown)"
+
+          if [ ! -x "$HOST_SCRIPT" ]; then
+            echo "ERROR: $HOST_SCRIPT not found. Is the keeper running on a control-plane node"
+            echo "       with host /etc/kubernetes mounted read-only?"
+            exit 1
+          fi
+
+          # Operator-progression safety check.
+          # A reliable etcd backup requires that no control-plane rollout is in
+          # progress, otherwise the captured static-pod resources may be inconsistent
+          # with etcd. cluster-backup.sh enforces this itself ONLY when run without
+          # --force, using `oc` + the node localhost.kubeconfig (server
+          # https://localhost:6443) which this non-hostNetwork pod cannot reach.
+          # So we run --force below and perform the equivalent check here against the
+          # in-cluster API with kubectl + the keeper ServiceAccount token (which has
+          # get/list on clusteroperators) — exactly as the upstream etcd-bp-azcopy
+          # blueprint does in its checkOperatorProgression phase.
+          echo "Checking control-plane operators are not progressing ..."
+          for op in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+            status=$(kubectl get co "$op" -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' 2>/dev/null || true)
+            echo "  $op: Progressing=${status:-<unknown>}"
+            if [ -z "$status" ]; then
+              echo "ERROR: could not read Progressing status for $op. Check kubectl access / RBAC. Aborting!"
+              exit 1
+            fi
+            if [ "$status" != "False" ]; then
+              echo "ERROR: $op is progressing (rollout in flight). A reliable backup requires no rollout in progress. Aborting!"
+              exit 1
+            fi
+          done
+          echo "All control-plane operators are stable."
+
+          # Idempotent: start each run from a clean backup dir so the restore point
+          # contains exactly one consistent snapshot.
+          rm -rf "$BACKUP_DIR"
+          mkdir -p "$BACKUP_DIR"
+
+          # --force because the script's built-in operator-progression check (above)
+          # is unreachable from this pod; we already performed the equivalent check.
+          # --force also marks output filenames __POSSIBLY_DIRTY__ (normalized below).
+          echo "Running cluster-backup.sh --force ..."
+          "$HOST_SCRIPT" --force "$BACKUP_DIR"
+
+          # Normalize the __POSSIBLY_DIRTY__ marker out of the filenames.
+          echo "Normalizing snapshot file names ..."
+          cd "$BACKUP_DIR"
+          shopt -s nullglob
+          for f in *__POSSIBLY_DIRTY__*; do mv "$f" "${f/__POSSIBLY_DIRTY__/}"; done
+          shopt -u nullglob
+
+          echo "Backup directory contents:"
+          ls -lh "$BACKUP_DIR"
+
+          # EBS/Azure-disk snapshots are block-device snapshots that bypass the OS
+          # page cache. Flush to disk so the 89 MB snapshot .db is fully persisted
+          # before Kasten takes the PVC snapshot.
+          echo "Flushing page cache (sync) ..."
+          sync
+          echo "etcd backup pre-hook completed."
+
+  backupPosthook:
+    phases:
+    - func: KubeExec
+      name: etcdVerify
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        pod: "{{ index .Deployment.Pods 0 }}"
+        container: keeper
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          BACKUP_DIR=/backup/etcd-backup
+
+          echo "=== OpenShift etcd backup post-hook: verifying snapshot ==="
+          SNAP=$(ls "$BACKUP_DIR"/snapshot_*.db 2>/dev/null | head -1 || true)
+          if [ -z "$SNAP" ] || [ ! -s "$SNAP" ]; then
+            echo "ERROR: no non-empty snapshot_*.db found in $BACKUP_DIR"
+            ls -lh "$BACKUP_DIR" || true
+            exit 1
+          fi
+
+          echo "Snapshot file: $SNAP ($(du -h "$SNAP" | cut -f1))"
+          etcdutl snapshot status "$SNAP" -w table
+
+          TARBALL=$(ls "$BACKUP_DIR"/static_kuberesources_*.tar.gz 2>/dev/null | head -1 || true)
+          if [ -z "$TARBALL" ] || [ ! -s "$TARBALL" ]; then
+            echo "ERROR: no static_kuberesources_*.tar.gz found in $BACKUP_DIR"
+            exit 1
+          fi
+          echo "Static resources: $TARBALL ($(du -h "$TARBALL" | cut -f1))"
+          echo "etcd backup post-hook verification passed."
+
+  # NOTE: there is intentionally NO restore action.
+  #
+  # Restoring an OpenShift control-plane etcd is a disruptive, manual node-level
+  # procedure (cluster-restore.sh on each master, then restart kubelet/etcd) that
+  # must NEVER be automated from a Kasten restore posthook. When Kasten restores
+  # this namespace it brings the keeper PVC (and Deployment) back with the etcd
+  # snapshot files on it; an admin then runs the documented manual recovery and
+  # can inspect the artifacts through the keeper pod. See README.md.
+  #
+  # There is also intentionally NO delete action: deleting the Kasten restore point
+  # deletes the underlying PVC snapshot, which is the only copy of the backup data.
