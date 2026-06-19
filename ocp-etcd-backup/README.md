@@ -223,6 +223,25 @@ kubectl exec -n etcd-backup $POD -- bash -c '
 
 You should get a `snapshot_*.db` (~90 MB) and a `static_kuberesources_*.tar.gz`.
 
+### Copy the artifact to your laptop
+
+The keeper PVC is always browsable, so you can pull the current backup off it at any
+time (handy for forensics or to stage a manual `cluster-restore.sh`):
+
+```bash
+POD=$(oc get pods -n etcd-backup -l app=ocp-etcd-backup-keeper \
+  --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+
+# whole backup dir (snapshot + static resources)
+oc cp etcd-backup/$POD:/backup/etcd-backup ./etcd-backup-artifact
+
+# or just the snapshot .db
+oc cp etcd-backup/$POD:/backup/etcd-backup/snapshot_<timestamp>.db ./snapshot.db
+```
+
+> `oc cp` (like `kubectl cp`) needs `tar` in the container — the keeper image has it.
+> It strips the leading `/` and may print a harmless warning.
+
 ---
 
 ## Step 3 — Deploy the blueprint
