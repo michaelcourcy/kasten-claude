@@ -1,0 +1,26 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: hcp-etcd-backup-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: hcp-etcd-backup
+    namespace: kasten-io
+  resources:
+    matchAll:
+      # Bind to keeper Deployments labelled hcp-etcd-backup-keeper: "true".
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: hcp-etcd-backup-keeper
+          operator: In
+          values:
+            - "true"
+      # Let an explicit kanister.kasten.io/blueprint annotation override this binding.
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  # Named after the hosted control-plane namespace it protects
+  # (<HOSTED_CLUSTER_NAMESPACE>-<CLUSTER_NAME>-etcd-backup) so the mapping to the
+  # guest is obvious, while still living OUTSIDE clusters-guest1 so the backup
+  # artifact survives a guest teardown/recreate (which the restore procedure
+  # requires). One keeper namespace per hosted cluster.
+  name: clusters-guest1-etcd-backup
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hcp-etcd-backup-keeper
+  namespace: clusters-guest1-etcd-backup
+---
+# The keeper needs to read the HostedCluster (stability check) in the
+# HOSTED_CLUSTER_NAMESPACE (default: clusters).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hcp-etcd-backup-keeper-hostedcluster
+  namespace: clusters
+rules:
+  - apiGroups: ["hypershift.openshift.io"]
+    resources: ["hostedclusters"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hcp-etcd-backup-keeper-hostedcluster
+  namespace: clusters
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hcp-etcd-backup-keeper-hostedcluster
+subjects:
+  - kind: ServiceAccount
+    name: hcp-etcd-backup-keeper
+    namespace: clusters-guest1-etcd-backup
+---
+# The keeper needs to find the etcd pod, check the etcd StatefulSet is ready, and
+# exec into the etcd pod to run `etcdctl snapshot save`, in the CONTROL_PLANE
+# namespace (default: clusters-guest1 = <HOSTED_CLUSTER_NAMESPACE>-<CLUSTER_NAME>).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hcp-etcd-backup-keeper-exec
+  namespace: clusters-guest1
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hcp-etcd-backup-keeper-exec
+  namespace: clusters-guest1
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hcp-etcd-backup-keeper-exec
+subjects:
+  - kind: ServiceAccount
+    name: hcp-etcd-backup-keeper
+    namespace: clusters-guest1-etcd-backup
+---
+# Permanent backup PVC. Kasten snapshots THIS PVC; the snapshot is the restore
+# point. It is also the volume an admin can inspect through the keeper pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hcp-etcd-backup
+  namespace: clusters-guest1-etcd-backup
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hcp-etcd-backup-keeper
+  namespace: clusters-guest1-etcd-backup
+  labels:
+    app: hcp-etcd-backup-keeper
+    hcp-etcd-backup-keeper: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO PVC: never two pods mounting it at once
+  selector:
+    matchLabels:
+      app: hcp-etcd-backup-keeper
+  template:
+    metadata:
+      labels:
+        app: hcp-etcd-backup-keeper
+        hcp-etcd-backup-keeper: "true"
+    spec:
+      serviceAccountName: hcp-etcd-backup-keeper
+      containers:
+        - name: keeper
+          image: michaelcourcy/hcp-etcd-backup:8.5.12
+          imagePullPolicy: Always
+          # Target hosted cluster. The blueprint reads these env vars when it
+          # KubeExec's into the keeper, so the blueprint stays generic and one
+          # keeper Deployment is deployed per hosted cluster to protect.
+          env:
+            - name: CLUSTER_NAME
+              value: "guest1"
+            - name: HOSTED_CLUSTER_NAMESPACE
+              value: "clusters"
+          command: ["/bin/bash", "-c"]
+          args: ["echo 'hcp-etcd-backup keeper ready'; sleep infinity"]
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+      volumes:
+        - name: backup
+          persistentVolumeClaim:
+            claimName: hcp-etcd-backup

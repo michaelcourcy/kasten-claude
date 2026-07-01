@@ -1,0 +1,165 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: hcp-etcd-backup
+  namespace: kasten-io
+# Hosted Control Plane (HCP) etcd backup — Pattern 4 (dump on a permanent Keeper PVC).
+#
+# Sibling of the standalone `ocp-etcd-backup` blueprint, but the etcd here is the
+# control plane of a HOSTED cluster (HyperShift / MCE): an ordinary StatefulSet
+# (pods etcd-0/1/2, container `etcd`) with PVCs in the control-plane namespace
+# (<HOSTED_CLUSTER_NAMESPACE>-<CLUSTER_NAME>, e.g. clusters-guest1) on the
+# management ("hub") cluster.
+#
+# The keeper Deployment (`*-keeper`, container `keeper`) lives in its OWN
+# namespace (clusters-<name>-etcd-backup) and mounts a PERMANENT PVC at /backup.
+# backupPrehook KubeExec's into the keeper; the keeper `kubectl exec`s into a
+# running hosted etcd pod and runs the documented `etcdctl snapshot save`
+# (localhost:2379 + the etcd pod's own client certs), then streams the .db out
+# onto the keeper PVC. Kasten snapshots that PVC — the PVC snapshot IS the restore
+# point. No object-store client, no delete action.
+#
+# The target hosted cluster is identified by CLUSTER_NAME / HOSTED_CLUSTER_NAMESPACE
+# env vars set on the keeper container (see keeper.yaml), so this blueprint is
+# generic: one keeper Deployment per hosted cluster, bound via BlueprintBinding.
+#
+# Procedure source: OpenShift "Backing up and restoring etcd on a hosted cluster
+# in an on-premise environment" (hosted_control_planes docs).
+actions:
+  backupPrehook:
+    phases:
+    - func: KubeExec
+      name: hcpEtcdBackup
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        pod: "{{ index .Deployment.Pods 0 }}"
+        container: keeper
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          : "${CLUSTER_NAME:?CLUSTER_NAME env not set on keeper container}"
+          : "${HOSTED_CLUSTER_NAMESPACE:?HOSTED_CLUSTER_NAMESPACE env not set on keeper container}"
+          CPNS="${HOSTED_CLUSTER_NAMESPACE}-${CLUSTER_NAME}"
+          BACKUP_DIR=/backup/hcp-etcd-backup
+          SNAP="${BACKUP_DIR}/snapshot.db"
+
+          echo "=== HCP etcd backup pre-hook ==="
+          echo "Hosted cluster:        ${CLUSTER_NAME}"
+          echo "HostedCluster ns:      ${HOSTED_CLUSTER_NAMESPACE}"
+          echo "Control-plane ns:      ${CPNS}"
+
+          # --- Stability check ------------------------------------------------
+          # A reliable etcd snapshot requires a healthy, non-progressing control
+          # plane. Abort if the HostedCluster is not Available, or is Progressing.
+          echo "Checking HostedCluster ${CLUSTER_NAME} is Available and not Progressing ..."
+          avail=$(kubectl get hostedcluster "${CLUSTER_NAME}" -n "${HOSTED_CLUSTER_NAMESPACE}" \
+            -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+          prog=$(kubectl get hostedcluster "${CLUSTER_NAME}" -n "${HOSTED_CLUSTER_NAMESPACE}" \
+            -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' 2>/dev/null || true)
+          echo "  Available=${avail:-<unknown>}  Progressing=${prog:-<unknown>}"
+          if [ "${avail}" != "True" ]; then
+            echo "ERROR: HostedCluster ${CLUSTER_NAME} is not Available. Aborting!"
+            exit 1
+          fi
+          if [ "${prog}" = "True" ]; then
+            echo "ERROR: HostedCluster ${CLUSTER_NAME} is Progressing (rollout in flight). Aborting!"
+            exit 1
+          fi
+
+          # --- etcd StatefulSet readiness ------------------------------------
+          ready=$(kubectl get statefulset etcd -n "${CPNS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+          desired=$(kubectl get statefulset etcd -n "${CPNS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
+          echo "etcd StatefulSet readiness: ${ready:-0}/${desired:-?}"
+          if [ -z "${ready}" ] || [ "${ready}" != "${desired}" ]; then
+            echo "ERROR: etcd StatefulSet is not fully ready (${ready:-0}/${desired:-?}). Aborting!"
+            exit 1
+          fi
+
+          # --- Pick a running etcd pod ---------------------------------------
+          ETCD_POD=$(kubectl get pods -n "${CPNS}" -l app=etcd \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -z "${ETCD_POD}" ]; then
+            echo "ERROR: no Running etcd pod found in ${CPNS}. Aborting!"
+            exit 1
+          fi
+          echo "Taking snapshot from etcd pod: ${ETCD_POD}"
+
+          # --- Take the etcd snapshot inside the etcd pod --------------------
+          # Documented procedure: etcdctl snapshot save against localhost:2379
+          # using the etcd pod's own client certs. Written to the etcd pod's
+          # /var/lib (its data volume), then streamed out to the keeper PVC.
+          kubectl exec -n "${CPNS}" -c etcd "${ETCD_POD}" -- \
+            env ETCDCTL_API=3 /usr/bin/etcdctl \
+            --cacert /etc/etcd/tls/etcd-ca/ca.crt \
+            --cert /etc/etcd/tls/client/etcd-client.crt \
+            --key /etc/etcd/tls/client/etcd-client.key \
+            --endpoints=https://localhost:2379 \
+            snapshot save /var/lib/snapshot.db
+
+          # Idempotent: start from a clean backup dir so the restore point holds
+          # exactly one consistent snapshot.
+          rm -rf "${BACKUP_DIR}"
+          mkdir -p "${BACKUP_DIR}"
+
+          # Stream the .db out to the keeper PVC. No `-t`: TTY would corrupt the
+          # binary stream with CR translation.
+          echo "Streaming snapshot to ${SNAP} ..."
+          kubectl exec -n "${CPNS}" -c etcd "${ETCD_POD}" -- cat /var/lib/snapshot.db > "${SNAP}"
+
+          # Remove the temporary snapshot from the etcd pod's data volume.
+          kubectl exec -n "${CPNS}" -c etcd "${ETCD_POD}" -- rm -f /var/lib/snapshot.db || true
+
+          echo "Backup directory contents:"
+          ls -lh "${BACKUP_DIR}"
+
+          # Verify the snapshot is well-formed before Kasten snapshots the PVC.
+          echo "Verifying snapshot ..."
+          etcdutl snapshot status "${SNAP}" -w table
+
+          # Azure-disk/EBS snapshots bypass the OS page cache; flush so the .db is
+          # fully persisted before Kasten takes the PVC snapshot.
+          echo "Flushing page cache (sync) ..."
+          sync
+          echo "HCP etcd backup pre-hook completed."
+
+  backupPosthook:
+    phases:
+    - func: KubeExec
+      name: hcpEtcdVerify
+      args:
+        namespace: "{{ .Deployment.Namespace }}"
+        pod: "{{ index .Deployment.Pods 0 }}"
+        container: keeper
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          SNAP=/backup/hcp-etcd-backup/snapshot.db
+
+          echo "=== HCP etcd backup post-hook: verifying snapshot ==="
+          if [ ! -s "${SNAP}" ]; then
+            echo "ERROR: no non-empty snapshot.db found at ${SNAP}"
+            ls -lh /backup/hcp-etcd-backup/ || true
+            exit 1
+          fi
+          echo "Snapshot file: ${SNAP} ($(du -h "${SNAP}" | cut -f1))"
+          etcdutl snapshot status "${SNAP}" -w table
+          echo "HCP etcd backup post-hook verification passed."
+
+  # NOTE: there is intentionally NO restore action.
+  #
+  # Re-injecting an etcd snapshot into a hosted cluster is the disruptive,
+  # documented manual procedure (pause reconciliation, scale the etcd StatefulSet
+  # to 0, `etcdutl snapshot restore` into data-etcd-0 via a data-access pod, scale
+  # back up, roll out the HostedCluster). It must NEVER run from a Kasten hook.
+  # When Kasten restores the keeper namespace it brings the keeper PVC (and
+  # Deployment) back with snapshot.db on it; an admin then runs the documented
+  # recovery and can inspect the artifact through the keeper pod. See README.md.
+  #
+  # There is also intentionally NO delete action: deleting the Kasten restore point
+  # deletes the underlying PVC snapshot, which is the only copy of the backup data.
