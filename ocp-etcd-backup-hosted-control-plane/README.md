@@ -114,26 +114,26 @@ old `snapshot.db`, so you can restore that earlier point anywhere to recover it.
 
 ```
 management ("hub") cluster
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  namespace: clusters-guest1        namespace: clusters-guest2   (per-guest CPs)│
-│   ┌───────────┐ etcd StatefulSet    ┌───────────┐ etcd StatefulSet             │
-│   │ etcd-0/1/2│ (app=etcd)          │ etcd-0/1/2│ (app=etcd)                    │
-│   └─────▲─────┘                     └─────▲─────┘                              │
-│         │ kubectl exec: etcdctl snapshot save (localhost:2379 + in-pod certs)  │
-│         └───────────────┬───────────────────┘                                 │
-│  namespace: clusters                                                           │
-│   ┌──────────────────────┴───────────────┐  image: michaelcourcy/            │
-│   │ ONE keeper pod (Deployment)           │         hcp-etcd-backup           │
-│   │  loops `kubectl get hostedcluster -n  │                                    │
-│   │        clusters` and snapshots each   │── writes ──┐                       │
-│   │  - kubectl (exec) · etcdutl (verify)  │            │                       │
-│   └───────────────────────────────────────┘           ▼                       │
-│                       permanent PVC  hcp-etcd-backup                           │
-│                         /backup/guest1/snapshot.db                             │
-│                         /backup/guest2/snapshot.db  ...                        │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                       │
-              Kasten snapshots this PVC ▼  = one restore point, all guests
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│   namespace: clusters-guest1        namespace: clusters-guest2   (per-guest CPs) │
+│    ┌───────────┐ etcd StatefulSet    ┌───────────┐ etcd StatefulSet              │
+│    │ etcd-0/1/2│ (app=etcd)          │ etcd-0/1/2│ (app=etcd)                    │
+│    └─────▲─────┘                     └─────▲─────┘                               │
+│          │  kubectl exec: etcdctl snapshot save (localhost:2379 + in-pod certs)  │
+│          └───────────────┬───────────────────┘                                   │
+│   namespace: clusters                                                            │
+│    ┌─────────────────────┴─────────────────┐  image: michaelcourcy/              │
+│    │ ONE keeper pod (Deployment)            │         hcp-etcd-backup            │
+│    │  loops all HostedClusters in its ns    │                                    │
+│    │  and snapshots each guest              │── writes ──┐                       │
+│    │  - kubectl (exec) · etcdutl (verify)   │            │                       │
+│    └────────────────────────────────────────┘           ▼                        │
+│                         permanent PVC  hcp-etcd-backup                           │
+│                           /backup/guest1/snapshot.db                             │
+│                           /backup/guest2/snapshot.db   ...                       │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼  Kasten snapshots this PVC = one restore point, all guests
 ```
 
 ---
