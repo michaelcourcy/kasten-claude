@@ -1,54 +1,33 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  # Named after the hosted control-plane namespace it protects
-  # (<HOSTED_CLUSTER_NAMESPACE>-<CLUSTER_NAME>-etcd-backup) so the mapping to the
-  # guest is obvious, while still living OUTSIDE clusters-guest1 so the backup
-  # artifact survives a guest teardown/recreate (which the restore procedure
-  # requires). One keeper namespace per hosted cluster.
-  name: clusters-guest1-etcd-backup
----
+# Fleet keeper for HCP etcd backup.
+#
+# ONE keeper Deployment (+ ONE permanent PVC) lives in the HostedCluster namespace
+# (`clusters`) and backs up EVERY hosted cluster in that namespace. The blueprint
+# binds to this keeper Deployment; its backupPrehook loops over all HostedClusters
+# in the keeper's own namespace and writes one snapshot per guest to
+# /backup/<hostedcluster-name>/snapshot.db. Adding a new guest requires NO extra
+# setup — the loop picks it up on the next policy run.
+#
+# The keeper needs cluster-scoped read/exec because the control planes it snapshots
+# live in the DYNAMIC per-guest namespaces `clusters-<name>` (created/destroyed as
+# guests come and go), so a namespaced Role cannot cover them.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: hcp-etcd-backup-keeper
-  namespace: clusters-guest1-etcd-backup
----
-# The keeper needs to read the HostedCluster (stability check) in the
-# HOSTED_CLUSTER_NAMESPACE (default: clusters).
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: hcp-etcd-backup-keeper-hostedcluster
   namespace: clusters
+---
+# Cluster-scoped so the keeper can reach every current and future hosted cluster:
+#   - hostedclusters: stability check (Available / not Progressing)
+#   - pods + pods/exec: find a running etcd pod and run `etcdctl snapshot save`
+#   - statefulsets: check etcd is fully ready
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hcp-etcd-backup-keeper
 rules:
   - apiGroups: ["hypershift.openshift.io"]
     resources: ["hostedclusters"]
     verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: hcp-etcd-backup-keeper-hostedcluster
-  namespace: clusters
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: hcp-etcd-backup-keeper-hostedcluster
-subjects:
-  - kind: ServiceAccount
-    name: hcp-etcd-backup-keeper
-    namespace: clusters-guest1-etcd-backup
----
-# The keeper needs to find the etcd pod, check the etcd StatefulSet is ready, and
-# exec into the etcd pod to run `etcdctl snapshot save`, in the CONTROL_PLANE
-# namespace (default: clusters-guest1 = <HOSTED_CLUSTER_NAMESPACE>-<CLUSTER_NAME>).
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: hcp-etcd-backup-keeper-exec
-  namespace: clusters-guest1
-rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
@@ -60,39 +39,38 @@ rules:
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
-  name: hcp-etcd-backup-keeper-exec
-  namespace: clusters-guest1
+  name: hcp-etcd-backup-keeper
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: hcp-etcd-backup-keeper-exec
+  kind: ClusterRole
+  name: hcp-etcd-backup-keeper
 subjects:
   - kind: ServiceAccount
     name: hcp-etcd-backup-keeper
-    namespace: clusters-guest1-etcd-backup
+    namespace: clusters
 ---
 # Permanent backup PVC. Kasten snapshots THIS PVC; the snapshot is the restore
-# point. It is also the volume an admin can inspect through the keeper pod.
+# point. It holds one subdir per hosted cluster: /backup/<name>/snapshot.db.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: hcp-etcd-backup
-  namespace: clusters-guest1-etcd-backup
+  namespace: clusters
 spec:
   accessModes:
     - ReadWriteOnce
   storageClassName: managed-csi
   resources:
     requests:
-      storage: 10Gi
+      storage: 20Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hcp-etcd-backup-keeper
-  namespace: clusters-guest1-etcd-backup
+  namespace: clusters
   labels:
     app: hcp-etcd-backup-keeper
     hcp-etcd-backup-keeper: "true"
@@ -110,20 +88,27 @@ spec:
         hcp-etcd-backup-keeper: "true"
     spec:
       serviceAccountName: hcp-etcd-backup-keeper
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: keeper
           image: michaelcourcy/hcp-etcd-backup:8.5.12
           imagePullPolicy: Always
-          # Target hosted cluster. The blueprint reads these env vars when it
-          # KubeExec's into the keeper, so the blueprint stays generic and one
-          # keeper Deployment is deployed per hosted cluster to protect.
+          # The keeper loops over HostedClusters in its OWN namespace; the
+          # downward API tells it which namespace that is. No per-cluster config.
           env:
-            - name: CLUSTER_NAME
-              value: "guest1"
-            - name: HOSTED_CLUSTER_NAMESPACE
-              value: "clusters"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           command: ["/bin/bash", "-c"]
-          args: ["echo 'hcp-etcd-backup keeper ready'; sleep infinity"]
+          args: ["echo 'hcp-etcd-backup fleet keeper ready'; sleep infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: backup
               mountPath: /backup
