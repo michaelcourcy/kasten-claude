@@ -51,6 +51,67 @@ Kasten application restore.
 
 ---
 
+## A small reminder : where are hosted control plane in the Openshift Multicluster Architecture ?
+
+There are **four layers** in play. It helps to know which one is locked to the one below it and
+which is freely swappable, because it explains why the choices in this guide (drop Azure, use
+KubeVirt, MCE-not-ACM) are all safe:
+
+```
+   ACM        fleet console · policy/governance · observability · app lifecycle
+    │  ── REQUIRES ──▶ MCE   (ACM cannot exist without MCE; it always includes it)
+    ▼
+   MCE        multicluster lifecycle engine. Manages, interchangeably:
+    │           • standalone provisioned clusters   (own control-plane VMs — no HyperShift)
+    │           • imported existing clusters         (EKS/AKS/GKE/on-prem — no HyperShift)
+    │           • hosted clusters                     (HyperShift — OPTIONAL capability)
+    │  ── optionally enables ──▶ HyperShift
+    ▼
+   HyperShift  provides HostedCluster (control-plane pods) + NodePool (workers).
+    │           The NodePool runs on one of several providers — pick one:
+    │             • KubeVirt (OpenShift Virtualization)        ← the one we use
+    │             • AWS
+    │             • Azure
+    │             • Agent  (bare metal / pre-provisioned hosts)
+    │             • OpenStack
+    │             • IBM PowerVS
+    │  ── uses one provider ──▶ KubeVirt
+    ▼
+   KubeVirt    workers become VMs on the hub (this guide)
+```
+
+**The headline API each layer provides** (what you actually `oc get`):
+
+| Layer | Main API resource(s) it provides | What the object represents |
+|---|---|---|
+| **ACM** | `MultiClusterHub` · `Policy` · `Application` · `MultiClusterObservability` | the management layer: fleet governance, app lifecycle, observability |
+| **MCE** | `ManagedCluster` (+ `MultiClusterEngine`; Hive `ClusterDeployment` for provisioning) | one registry entry per managed cluster — hub, hosted, or imported |
+| **HyperShift** | `HostedCluster` · `NodePool` | a guest's control plane + its worker-node group(s) |
+| **KubeVirt** | `VirtualMachine` · `VirtualMachineInstance` (+ `HyperConverged` for the operator) | the actual worker-node VMs running on the hub |
+
+**Read each boundary as "is the upper layer locked to the lower one?"**
+
+| Boundary | Locked? | Why |
+|---|---|---|
+| KubeVirt → **HyperShift** | ❌ No | HyperShift works with KubeVirt **or** AWS, Azure, Agent (bare metal), OpenStack, IBM PowerVS… KubeVirt is just *one* NodePool provider. |
+| HyperShift → **MCE** | ❌ No | MCE manages HyperShift-hosted clusters **or** standalone provisioned clusters **or** imported existing clusters. HyperShift is an *optional* MCE capability (a toggle). |
+| MCE → **ACM** | ✅ **Yes** | ACM is built on top of MCE and **always includes it**. There is no ACM without MCE. |
+
+A `HostedCluster` is **ALWAYS** a `ManagedCluster` but the contrary is not true, for instance a standalone cluster that you import
+is a `ManagedCluster` but not a `HostedCluster`.
+
+So `HostedCluster` is the thing we backup in this blueprint, if you have 2  `HostedCluster` guest1 and guest2  in your openshift cluster 
+you'll find 
+
+- `HostedCluster` guest1 and guest2 living in the `clusters` namespace 
+- `clusters-guest1` and `clusters-guest2` namespaces where the control plane executes
+- `guest1` and `guest2` namespaces — private mailbox + RBAC-locked workspace, where work for it is queued, its status lives, and its agent is confined 
+- `klusterlet-guest1` and `klusterlet-guest2` namespaces that read and execute the work in the queues
+
+So we backup the `clusters` namespace but the blueprint will carry the etcd snap into the `clusters-guest1` and `clusters-guest2` namespaces and store it in the PVC keeper that live on the `clusters` namespace.
+
+---
+
 ## Pattern & design
 
 **Pattern 4 — dump on a permanent Keeper PVC (PVC mounted by keeper).**
@@ -123,14 +184,14 @@ management ("hub") cluster
 │          └───────────────┬───────────────────┘                                   │
 │   namespace: clusters                                                            │
 │    ┌─────────────────────┴─────────────────┐  image: michaelcourcy/              │
-│    │ ONE keeper pod (Deployment)            │         hcp-etcd-backup            │
-│    │  loops all HostedClusters in its ns    │                                    │
-│    │  and snapshots each guest              │── writes ──┐                       │
-│    │  - kubectl (exec) · etcdutl (verify)   │            │                       │
-│    └────────────────────────────────────────┘           ▼                        │
-│                         permanent PVC  hcp-etcd-backup                           │
-│                           /backup/guest1/snapshot.db                             │
-│                           /backup/guest2/snapshot.db   ...                       │
+│    │ ONE keeper pod (Deployment)           │         hcp-etcd-backup             │
+│    │  loops all HostedClusters in its ns   │                                     │
+│    │  and snapshots each guest             │── writes ──┐                        │
+│    │  - kubectl (exec) · etcdutl (verify)  │            │                        │
+│    └───────────────────────────────────────┘            ▼                        │
+│                                       permanent PVC  hcp-etcd-backup             │
+│                                       /backup/guest1/snapshot.db                 │
+│                                       /backup/guest2/snapshot.db   ...           │
 └──────────────────────────────────────────────────────────────────────────────────┘
                           │
                           ▼  Kasten snapshots this PVC = one restore point, all guests
