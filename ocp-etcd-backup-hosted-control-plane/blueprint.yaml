@@ -190,6 +190,9 @@ actions:
           for d in "${BACKUP_ROOT}"/*/; do
             [ -d "${d}" ] || continue
             name=$(basename "${d}")
+            # lost+found is a filesystem artifact on a freshly-formatted PVC, not a
+            # guest dir — skip it (same guard as the prune loop in backupPrehook).
+            [ "${name}" = "lost+found" ] && continue
             snap="${d}snapshot.db"
             if [ ! -s "${snap}" ]; then
               echo "[${name}] ERROR: missing/empty snapshot.db"; bad=$((bad+1)); continue
