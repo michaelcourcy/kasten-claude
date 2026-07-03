@@ -350,8 +350,11 @@ You need a **Location** profile so Kasten wires up the Kanister hooks (the bluep
 writes to it). Any S3/Azure/GCS Location profile works.
 
 ```bash
-# Location profile must be type "Location" (not "Infra"), or restore can't extract it:
-kubectl get profile <name> -n kasten-io -o jsonpath='{.spec.type}'
+# The policy needs a profile of type "Location" (S3/Azure/GCS) — an "Infra" profile
+# won't do, because restore extracts the location profile from the RestorePointContent.
+# List the Location profiles available (excludes Infra):
+kubectl get profiles.config.kio.kasten.io -n kasten-io -o json \
+  | jq -r '.items[] | select(.spec.type=="Location") | .metadata.name'
 ```
 
 Create an on-demand policy bound to the `clusters` namespace and run it:
