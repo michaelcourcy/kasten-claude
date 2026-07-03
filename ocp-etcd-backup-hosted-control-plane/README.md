@@ -120,9 +120,13 @@ A single **keeper Deployment** runs the backup-tool image, mounts one permanent 
 `/backup`, and lives in the HostedCluster namespace (`clusters`). The blueprint binds to
 the keeper Deployment; `backupPrehook` `KubeExec`s into the keeper, which:
 
-1. lists all HostedClusters **in its own namespace** (`kubectl get hostedcluster -n $POD_NAMESPACE`),
-2. for each guest: checks it is stable, `kubectl exec`s into a running hosted etcd pod,
-   runs the documented `etcdctl snapshot save`, and streams the `.db` out to
+1. lists all HostedClusters in the keeper's own namespace — the `clusters` namespace,
+   where `HostedCluster` objects live (`$POD_NAMESPACE`, injected from the keeper pod via
+   the downward API, resolves to `clusters`; so `kubectl get hostedcluster -n $POD_NAMESPACE`
+   is `kubectl get hostedcluster -n clusters`),
+2. for each guest: checks it is stable, derives the guest's **control-plane** namespace
+   `clusters-<name>`, `kubectl exec`s into a running hosted etcd pod there, runs the
+   documented `etcdctl snapshot save`, and streams the `.db` out to
    `/backup/<hostedcluster-name>/snapshot.db`.
 
 Kasten then snapshots the single keeper PVC — the PVC snapshot **is** the restore point

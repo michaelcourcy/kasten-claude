@@ -9,10 +9,12 @@ metadata:
 # ONE keeper Deployment in the HostedCluster namespace (`clusters`) backs up EVERY
 # hosted cluster in that namespace. The blueprint binds to the keeper Deployment;
 # backupPrehook KubeExec's into the keeper, which loops over all HostedClusters in
-# its OWN namespace and, for each guest, runs the documented `etcdctl snapshot save`
-# inside a running hosted etcd pod (pods etcd-0/1/2, container `etcd`, in the
-# per-guest control-plane namespace `<hostedcluster-namespace>-<name>`), then
-# streams the .db out to /backup/<name>/snapshot.db.
+# its OWN namespace — that is the `clusters` namespace where HostedCluster objects
+# live, NOT a per-guest `clusters-<name>` namespace (POD_NAMESPACE from the downward
+# API = the keeper's namespace = `clusters`). For each guest it runs the documented
+# `etcdctl snapshot save` inside a running hosted etcd pod (pods etcd-0/1/2, container
+# `etcd`, in the per-guest CONTROL-PLANE namespace `<hostedcluster-namespace>-<name>`,
+# e.g. `clusters-<name>`), then streams the .db out to /backup/<name>/snapshot.db.
 #
 # Kasten snapshots the single keeper PVC — the PVC snapshot IS the restore point
 # and holds one snapshot.db per guest. Adding a new guest needs NO extra setup:
@@ -48,7 +50,8 @@ actions:
           echo "=== HCP fleet etcd backup pre-hook ==="
           echo "HostedCluster namespace (keeper namespace): ${HCNS}"
 
-          # All hosted clusters in the keeper's own namespace.
+          # All HostedClusters in the keeper's own namespace (= `clusters`, where
+          # HostedCluster objects live; POD_NAMESPACE = the keeper pod's namespace).
           HCS=$(kubectl get hostedcluster -n "${HCNS}" \
             -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
           if [ -z "${HCS}" ]; then
