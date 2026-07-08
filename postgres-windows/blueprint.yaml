@@ -1,0 +1,140 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: postgres-winvm-blueprint
+  namespace: kasten-io
+
+# Quiesce blueprint for PostgreSQL running inside a Windows Server KubeVirt VM.
+#
+# Pattern: Quiesce — Kasten is the data mover. Kasten snapshots the VM's
+# DataVolume PVC and owns the guest-filesystem freeze/thaw; this blueprint only
+# issues a Postgres CHECKPOINT before the snapshot (Postgres replays WAL on boot).
+#
+# Guest transport: KubeVirt exposes no direct guest-exec API, so guest commands
+# run through the QEMU guest agent:
+#   kubectl exec <virt-launcher-pod> -c compute -- virsh qemu-agent-command <domain> <json>
+# Each action shares one worker script (&worker) dispatched by its argument
+# (checkpoint | verify-restore). Phases run in kasten-io as the kanister-svc
+# service account, which can exec into the VM's virt-launcher pod.
+#
+# Credentials: the Postgres password reaches only the phases that need it, via
+# PG_PASSWORD (Secret postgres-winvm-creds). It is embedded in the PowerShell
+# command as a single-quoted literal — never passed in the guest-exec env array,
+# which would replace the guest PATH and break powershell.exe resolution.
+
+actions:
+  backupPrehook:
+    phases:
+      - func: KubeTask
+        name: checkpoint
+        args:
+          namespace: kasten-io
+          image: &image michaelcourcy/kasten-tools:8.5.2
+          podOverride:
+            serviceAccountName: kanister-svc
+            containers:
+              - name: container
+                env: &pgSecretEnv
+                  - name: PG_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: postgres-winvm-creds
+                        key: password
+          command:
+            - bash
+            - -c
+            - &worker |
+              set -euo pipefail
+
+              VM_NS="{{ .Object.metadata.namespace }}"
+              VM_NAME="{{ .Object.metadata.name }}"
+              DOMAIN="${VM_NS}_${VM_NAME}"
+              ACTION="${1:?internal error: missing action argument}"
+              PSQL='C:\Program Files\PostgreSQL\18\bin\psql.exe'
+
+              launcher_pod() {
+                kubectl get pod -n "$VM_NS" -l "vm.kubevirt.io/name=$VM_NAME" \
+                  -o jsonpath='{.items[0].metadata.name}'
+              }
+
+              qga() {
+                kubectl exec -n "$VM_NS" "$1" -c compute -- \
+                  virsh qemu-agent-command "$DOMAIN" "$2"
+              }
+
+              # Run a PowerShell command in the guest and wait for it to exit.
+              guest_powershell() {
+                local pod="$1" cmd="$2" timeout="${3:-60}" req pid status
+                req=$(jq -n --arg c "$cmd" '{execute:"guest-exec",arguments:{
+                  path:"powershell.exe",
+                  arg:["-NoProfile","-NonInteractive","-Command",$c],
+                  "capture-output":true}}')
+                pid=$(qga "$pod" "$req" | jq -r '.return.pid')
+                for _ in $(seq 1 "$timeout"); do
+                  status=$(qga "$pod" "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}")
+                  if [ "$(jq -r '.return.exited' <<<"$status")" = "true" ]; then
+                    jq -r '.return."out-data" // "" | @base64d' <<<"$status"
+                    jq -r '.return."err-data" // "" | @base64d' <<<"$status" >&2
+                    return "$(jq -r '.return.exitcode' <<<"$status")"
+                  fi
+                  sleep 1
+                done
+                return 124
+              }
+
+              # PowerShell prefix that exports PGPASSWORD from the injected secret
+              pgpassword_prefix() {
+                printf "\$env:PGPASSWORD='%s'; " "${PG_PASSWORD//\'/\'\'}"
+              }
+
+              case "$ACTION" in
+
+                # Flush dirty buffers so the upcoming snapshot is quick to recover.
+                checkpoint)
+                  pod=$(launcher_pod)
+                  [ -n "$pod" ] || { echo "ERROR: no virt-launcher pod for $VM_NAME" >&2; exit 1; }
+                  echo "issuing CHECKPOINT on $VM_NAME (pod $pod)"
+                  guest_powershell "$pod" \
+                    "\$ErrorActionPreference='Stop'; $(pgpassword_prefix)& '$PSQL' -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CHECKPOINT;'"
+                  echo "issuing CHECKPOINT on $VM_NAME (pod $pod)"
+                  ;;
+
+                # After restore, wait for the rebooted guest, then confirm Postgres
+                # came back up and accepts connections.
+                verify-restore)
+                  echo "waiting for guest agent on restored $VM_NAME ..."
+                  pod=""
+                  for _ in $(seq 1 60); do
+                    pod=$(launcher_pod 2>/dev/null || true)
+                    if [ -n "$pod" ] && qga "$pod" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+                      echo "guest agent up (pod $pod)"; break
+                    fi
+                    sleep 10
+                  done
+                  [ -n "$pod" ] || { echo "ERROR: guest agent did not return after restore" >&2; exit 1; }
+                  guest_powershell "$pod" \
+                    "\$ErrorActionPreference='Stop'; $(pgpassword_prefix)& '$PSQL' -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -tAc 'SELECT 1;'"
+                  echo "restore verification complete (Postgres accepting connections)"
+                  ;;
+
+                *)
+                  echo "ERROR: unknown action '$ACTION'" >&2; exit 1
+                  ;;
+              esac
+            - --
+            - checkpoint
+
+  # verify Postgres is accepting connections.
+  restorePosthook:
+    phases:
+      - func: KubeTask
+        name: verifyRestore
+        args:
+          namespace: kasten-io
+          image: *image
+          podOverride:
+            serviceAccountName: kanister-svc
+            containers:
+              - name: container
+                env: *pgSecretEnv
+          command: [bash, -c, *worker, --, verify-restore]
