@@ -1,0 +1,35 @@
+# Binds the postgres-winvm blueprint to KubeVirt VirtualMachines that opt in
+# with the label `kasten.bjones/postgres-winvm: "true"`.
+#
+# We intentionally do NOT bind ALL VirtualMachines — only Windows VMs that run
+# Postgres should be quiesced this way. The `DoesNotExist` guard on the
+# kanister.kasten.io/blueprint annotation lets you still override an individual
+# VM with a more specific blueprint via annotation without conflict.
+#
+# Alternative (single VM): skip this binding and annotate the VM directly:
+#   kubectl annotate vm <vm-name> -n <ns> \
+#     kanister.kasten.io/blueprint=postgres-winvm-blueprint
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: postgres-winvm-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: postgres-winvm-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: kubevirt.io
+              resource: virtualmachines
+      - labels:
+          key: kasten.bjones/postgres-winvm
+          operator: In
+          values:
+            - "true"
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist
