@@ -510,7 +510,7 @@ the PVC will be included in the restore point.
 ### 1. Fence and quiesce a replica
 
 - **Principle**: Fence (halt) replication synchronization and quiesce a replica to take a backup of the application volumes.
-- **Example**: [cnpg](./cnpg/)
+- **Example**: [cnpg](./cnpg/), [psmdb-percona-operator](./psmdb-percona-operator/)
 - **Pro**: No impact on the primary, because only a replica is quiesced.
 - **Cons**: At restore time, the operator must be able to promote the replica to primary, or you have to manually reconfigure your workload.
 - **BlueprintBinding**: Yes — attach to the workload CR.
@@ -528,7 +528,7 @@ the PVC will be included in the restore point.
 ### 3. Database snapshot on a permanent workload PVC (PVC mounted by workload)
 
 - **Principle**: The workload is configured to mount a permanent backup PVC. The `backupPrehook` runs the database snapshot tool via `KubeExec` into the workload pod (or a sidecar). The PVC is pre-existing when Kasten runs its discovery pass.
-- **Example**: [elasticsearch-eck](./elasticsearch-eck/)
+- **Example**: [elasticsearch-eck](./elasticsearch-eck/), [db2u-maximo](./db2u-maximo/)
 - **Pro**: Database snapshot allows efficient incrementality by appending files at each snapshot. BlueprintBinding works because the PVC is discovered through the workload's ownership chain.
 - **Cons**: Requires changing the workload configuration to mount the backup PVC.
 - **BlueprintBinding**: Yes — attach to the workload CR.
@@ -537,7 +537,7 @@ the PVC will be included in the restore point.
 ### 4. Database dump or snapshot on a permanent Keeper PVC (PVC mounted by keeper)
 
 - **Principle**: A dedicated keeper Deployment mounts the backup PVC permanently and runs the backup tool image (e.g. the database server image that includes the backup tool). The `backupPrehook` uses `KubeExec` into the keeper pod to write the dump or snapshot to the PVC. Kasten discovers the PVC through the keeper Deployment's ownership chain.
-- **Example**: [couchbase-operator](./couchbase-operator/)
+- **Example**: [couchbase-operator](./couchbase-operator/), [ocp-etcd-backup](./ocp-etcd-backup/), [ocp-etcd-backup-hosted-control-plane](./ocp-etcd-backup-hosted-control-plane/), [rhoso-galera](./rhoso-galera/)
 - **Pro**: No change to the main workload configuration. PVC is always discovered because the keeper keeps it mounted. `KubeExec` avoids temporary pod lifecycle management. BlueprintBinding attaches to the keeper Deployment.
 - **Cons**: Requires deploying an extra Deployment alongside the workload. The keeper image must include the backup tool (e.g. `couchbase/server:<version>` for `cbbackupmgr`).
 - **BlueprintBinding**: Yes — attach to the keeper Deployment using a generic component label (e.g. `couchbase-keeper: "true"`) so one binding covers multiple keepers in the same namespace.
@@ -578,7 +578,7 @@ these conventions:
   `backupPrehook` triggers the workload's native backup to point at the local MinIO service
   (`http://<minio-svc>:9000`). After Kasten snapshots the MinIO PVC, `restorePosthook` triggers
   the workload to restore from it.
-- **Example**: [cnpg-barman](./cnpg-barman/)
+- **Example**: [cnpg-barman](./cnpg-barman/), [cnpg-barman-cloud](./cnpg-barman-cloud/), [cockroachdb](./cockroachdb/), [elasticsearch-eck-minio](./elasticsearch-eck-minio/), [psmdb-percona-operator-pbm](./psmdb-percona-operator-pbm/)
 - **Pro**: No custom dump image needed — MinIO is the off-the-shelf keeper image. The workload's
   existing S3-protocol backup mechanism is reused as-is. BlueprintBinding works because MinIO's
   PVC is permanent. Incremental if the workload's S3 tool supports it (e.g. wal-g, pgBackRest
