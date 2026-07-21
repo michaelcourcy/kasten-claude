@@ -236,13 +236,46 @@ management ("hub") cluster
 `etcdctl snapshot save` runs **inside each hosted etcd pod** (which already has `etcdctl`
 and the client certs), not in the keeper — the keeper only orchestrates and verifies.
 
-To rebuild:
+To rebuild (pinned defaults — `kubectl` `v1.31.6`, etcd `v3.5.18`):
 
 ```bash
 cd images/hcp-etcd-backup
 docker build --platform linux/amd64 -t michaelcourcy/hcp-etcd-backup:8.5.12 .
 docker push michaelcourcy/hcp-etcd-backup:8.5.12
 ```
+
+### Rebuilding for other Kubernetes / etcd versions
+
+The Dockerfile exposes two build args so you can match the image to **your** environment
+without editing it — pick the values from two independent places:
+
+| Build arg | Default | Match it to | Example |
+|---|---|---|---|
+| `KUBECTL_VERSION` | `v1.31.6` | the **hub** (management cluster) Kubernetes version — the keeper `exec`s against the hub API | `v1.32.0` for k8s 1.32 |
+| `ETCD_SOURCE_IMAGE` | `quay.io/coreos/etcd:v3.5.18` | the **guests'** etcd version — `etcdutl` must be ≥ the version that wrote the snapshot | `quay.io/coreos/etcd:v3.5.24` for etcd 3.5.24 |
+
+> **Why they come from different clusters:** `kubectl` talks to the hub's API server, so
+> its skew rule is against the *hub* Kubernetes version. `etcdutl` only reads/verifies the
+> `snapshot.db` produced inside each guest's etcd pod, so it tracks the *guests'* etcd
+> version. The two are unrelated — set each independently.
+
+Example — build for **Kubernetes 1.32** (hub) and **etcd 3.5.24** (guests), and tag the
+image so the version pin is visible:
+
+```bash
+cd images/hcp-etcd-backup
+docker build --platform linux/amd64 \
+  --build-arg KUBECTL_VERSION=v1.32.0 \
+  --build-arg ETCD_SOURCE_IMAGE=quay.io/coreos/etcd:v3.5.24 \
+  -t michaelcourcy/hcp-etcd-backup:k8s1.32-etcd3.5.24 .
+docker push michaelcourcy/hcp-etcd-backup:k8s1.32-etcd3.5.24
+```
+
+> After pushing a differently-tagged image, update the keeper's `image:` in
+> [`keeper.yaml`](keeper.yaml) (the `containers[0].image` of the Deployment) to the tag you
+> built, then redeploy with `oc apply -k .`. Pick a real patch release for `KUBECTL_VERSION`
+> (e.g. the latest `v1.32.x` from [dl.k8s.io](https://dl.k8s.io)) and an etcd tag that
+> actually exists on `quay.io/coreos/etcd`.
 
 ---
 
