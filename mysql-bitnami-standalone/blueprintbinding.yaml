@@ -1,0 +1,33 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: mysql-bitnami-standalone-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: mysql-bitnami-standalone-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      # Bind only Bitnami MySQL primary StatefulSets.
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: statefulsets
+      - labels:
+          key: app.kubernetes.io/name
+          operator: In
+          values:
+            - mysql
+      # In replication mode the chart also creates a "secondary" StatefulSet;
+      # only the primary should carry the quiesce blueprint.
+      - labels:
+          key: app.kubernetes.io/component
+          operator: In
+          values:
+            - primary
+      # Let an explicit annotation on a specific StatefulSet win over this binding.
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

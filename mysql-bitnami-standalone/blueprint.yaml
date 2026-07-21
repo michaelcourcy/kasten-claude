@@ -1,0 +1,114 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: mysql-bitnami-standalone-blueprint
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    # Called by Kasten BEFORE PVC snapshots are initiated.
+    # Starts a background mysql session that holds FLUSH TABLES WITH READ LOCK
+    # for the duration of the snapshot. The session stays alive via DO SLEEP(3600)
+    # until backupPosthook kills the process. This guarantees the lock is actually
+    # held when Kasten takes the PVC snapshot — not just at flush time. A plain
+    # exec that runs FTWRL and returns would release the lock immediately, because
+    # the lock is bound to the session that acquired it.
+    #
+    # Why FLUSH TABLES WITH READ LOCK:
+    #   - InnoDB user tables: crash-consistent via the redo log regardless, but the
+    #     flush reduces recovery time by minimising dirty pages.
+    #   - MyISAM system tables (mysql.*): no redo log — the lock is essential to
+    #     prevent partially written system-table pages from being captured.
+    # FLUSH LOGS: rotates the binary log to a clean position.
+    #
+    # NOTE: The Bitnami image exposes the root password as a FILE, not an env var
+    # (MYSQL_ROOT_PASSWORD_FILE points at the mounted secret), so we cat the file.
+    phases:
+      - func: KubeExec
+        name: quiesceMySQL
+        args:
+          namespace: "{{ .Object.metadata.namespace }}"
+          pod: "{{ .Object.metadata.name }}-0"
+          container: mysql
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              RP=$(cat "$MYSQL_ROOT_PASSWORD_FILE")
+              rm -f /tmp/mysql-lock.pid /tmp/mysql-lock.log
+              nohup mysql -uroot -p"$RP" \
+                -e "FLUSH TABLES WITH READ LOCK; FLUSH LOGS; DO SLEEP(3600);" \
+                > /tmp/mysql-lock.log 2>&1 &
+              LOCK_PID=$!
+              echo "$LOCK_PID" > /tmp/mysql-lock.pid
+              sleep 3
+              if kill -0 "$LOCK_PID" 2>/dev/null; then
+                echo "Lock acquired (PID=$LOCK_PID)"
+              else
+                echo "ERROR: Failed to acquire lock"
+                cat /tmp/mysql-lock.log
+                exit 1
+              fi
+
+  backupPosthook:
+    # Called by Kasten AFTER all PVC snapshots are ready.
+    # Kills the background lock-holding process, which closes the mysql session
+    # and releases the FLUSH TABLES WITH READ LOCK automatically.
+    # UNLOCK TABLES is a safety fallback in case the PID file is missing.
+    phases:
+      - func: KubeExec
+        name: unquiesceMySQL
+        args:
+          namespace: "{{ .Object.metadata.namespace }}"
+          pod: "{{ .Object.metadata.name }}-0"
+          container: mysql
+          command:
+            - bash
+            - -c
+            - |
+              RP=$(cat "$MYSQL_ROOT_PASSWORD_FILE")
+              if [ -f /tmp/mysql-lock.pid ]; then
+                LOCK_PID=$(cat /tmp/mysql-lock.pid)
+                kill "$LOCK_PID" 2>/dev/null && echo "Lock process $LOCK_PID killed" \
+                  || echo "Process already gone"
+                rm -f /tmp/mysql-lock.pid /tmp/mysql-lock.log
+              else
+                echo "No PID file found — releasing via SQL"
+              fi
+              mysql -uroot -p"$RP" -e "UNLOCK TABLES;" 2>/dev/null || true
+              echo "Unquiesce complete"
+
+  restorePosthook:
+    # Called by Kasten AFTER PVC restore and the StatefulSet manifest are back.
+    # Bitnami MySQL is a plain StatefulSet with NO operator, so Kasten replaces the
+    # data PVC natively (scale down -> swap PVC -> scale up) and no restorePrehook
+    # is required. InnoDB performs crash recovery automatically on startup.
+    # This hook simply waits for the pod to be Ready and confirms the DB is writable.
+    phases:
+      - func: WaitV2
+        name: waitForMySQLReady
+        args:
+          timeout: 300s
+          conditions:
+            anyOf:
+              - condition: '{{ range .status.conditions }}{{ if and (eq .type "Ready") (eq .status "True") }}true{{ end }}{{ end }}'
+                objectReference:
+                  apiVersion: v1
+                  group: ""
+                  name: "{{ .Object.metadata.name }}-0"
+                  namespace: "{{ .Object.metadata.namespace }}"
+                  resource: pods
+      - func: KubeExec
+        name: verifyMySQL
+        args:
+          namespace: "{{ .Object.metadata.namespace }}"
+          pod: "{{ .Object.metadata.name }}-0"
+          container: mysql
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              RP=$(cat "$MYSQL_ROOT_PASSWORD_FILE")
+              mysql -uroot -p"$RP" -e "SELECT 1;"
+              echo "MySQL is healthy"
