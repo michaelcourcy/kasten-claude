@@ -280,23 +280,39 @@ privileged SCC are needed. It is all in [`keeper.yaml`](keeper.yaml).
 ## Step 1 — Deploy the fleet keeper (once)
 
 [`keeper.yaml`](keeper.yaml) creates the ServiceAccount, ClusterRole/ClusterRoleBinding,
-the permanent PVC `hcp-etcd-backup` (20Gi) and the keeper Deployment — all in the
-`clusters` namespace. It does **not** create the `clusters` namespace (HyperShift/MCE owns it).
+the permanent PVC `hcp-etcd-backup` (20Gi) and the keeper Deployment. It does **not**
+create the HostedCluster namespace itself (HyperShift/MCE owns it).
+
+**Set your HostedCluster namespace once.** Every command block in this guide uses
+`$HCNS`; export it in your shell before you start (re-export it if you open a new shell):
 
 ```bash
-kubectl apply -f keeper.yaml
-kubectl rollout status deployment/hcp-etcd-backup-keeper -n clusters
+export HCNS=clusters     # the HyperShift default; change if your guests live elsewhere
 ```
 
-> For a HyperShift install that hosts clusters in a different namespace, deploy the keeper
-> into that namespace instead (change the four `namespace:` fields and the
-> ClusterRoleBinding subject). One keeper per HostedCluster namespace.
+The target namespace is **not** hardcoded in `keeper.yaml`. It is set in one place —
+the `namespace:` line of [`kustomization.yaml`](kustomization.yaml) — and Kustomize
+stamps it onto the SA, PVC, and Deployment **and** rewrites the ClusterRoleBinding
+subject namespace to match. Point the kustomization at `$HCNS` and deploy with `-k`:
+
+```bash
+sed -i.bak "s/^namespace:.*/namespace: ${HCNS}/" kustomization.yaml && rm -f kustomization.yaml.bak
+oc apply -k .            # or: kubectl apply -k .
+kubectl rollout status deployment/hcp-etcd-backup-keeper -n "$HCNS"
+```
+
+> **Different HostedCluster namespace?** Setting `$HCNS` (above) and running the `sed` is
+> the only change needed — do **not** hand-patch namespaces in `keeper.yaml`. Do not deploy
+> with a bare `kubectl apply -f keeper.yaml -n <ns>`: `-n` sets `metadata.namespace` but never
+> the ClusterRoleBinding subject's `namespace`, leaving the keeper with no RBAC (backups then
+> fail at run time with `forbidden`). One keeper per HostedCluster namespace — for several,
+> copy this directory, set `namespace:` in each, and `oc apply -k` each.
 
 Confirm the keeper can see the fleet:
 
 ```bash
-KP=$(kubectl get pods -n clusters -l app=hcp-etcd-backup-keeper -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n clusters $KP -- kubectl get hostedcluster -n clusters
+KP=$(kubectl get pods -n "$HCNS" -l app=hcp-etcd-backup-keeper -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n "$HCNS" $KP -- kubectl get hostedcluster -n "$HCNS"
 ```
 
 ---
@@ -306,8 +322,8 @@ kubectl exec -n clusters $KP -- kubectl get hostedcluster -n clusters
 Prove the flow works before involving Kasten — this is what `backupPrehook` automates:
 
 ```bash
-KP=$(kubectl get pods -n clusters -l app=hcp-etcd-backup-keeper -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n clusters $KP -- bash -c '
+KP=$(kubectl get pods -n "$HCNS" -l app=hcp-etcd-backup-keeper -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n "$HCNS" $KP -- bash -c '
   HCNS="${POD_NAMESPACE}"
   for hc in $(kubectl get hostedcluster -n "$HCNS" -o jsonpath="{range .items[*]}{.metadata.name}{\"\n\"}{end}"); do
     cpns="${HCNS}-${hc}"
@@ -357,10 +373,12 @@ kubectl get profiles.config.kio.kasten.io -n kasten-io -o json \
   | jq -r '.items[] | select(.spec.type=="Location") | .metadata.name'
 ```
 
-Create an on-demand policy bound to the `clusters` namespace and run it:
+Create an on-demand policy bound to the HostedCluster namespace (`$HCNS`) and run it.
+Note the unquoted heredoc (`<<EOF`) so `$HCNS` expands — set `<YOUR_LOCATION_PROFILE>`
+by hand:
 
 ```bash
-kubectl apply -f - <<'EOF'
+kubectl apply -f - <<EOF
 apiVersion: config.kio.kasten.io/v1alpha1
 kind: Policy
 metadata:
@@ -379,7 +397,7 @@ spec:
     matchExpressions:
       - key: k10.kasten.io/appNamespace
         operator: In
-        values: [clusters]
+        values: ["${HCNS}"]
 EOF
 
 kubectl create -f - <<'EOF'
@@ -402,7 +420,7 @@ Watch it and confirm the loop fired for every guest:
 ```bash
 kubectl get runaction -n kasten-io -w
 kubectl logs -n kasten-io deploy/kanister-svc --tail=400 | grep -E "hcpFleetEtcd|Backup summary|OK:|FAIL:"
-kubectl get restorepoint -n clusters
+kubectl get restorepoint -n "$HCNS"
 ```
 
 ---
@@ -423,20 +441,20 @@ kubectl get restorepoint -n clusters
 ### 1. Restore the backup artifact with Kasten
 
 ```bash
-RP=$(kubectl get restorepoint -n clusters -o jsonpath='{.items[0].metadata.name}')
+RP=$(kubectl get restorepoint -n "$HCNS" -o jsonpath='{.items[0].metadata.name}')
 kubectl create -f - <<EOF
 apiVersion: actions.kio.kasten.io/v1alpha1
 kind: RestoreAction
 metadata:
   generateName: restore-hcp-etcd-
-  namespace: clusters
+  namespace: ${HCNS}
 spec:
   subject:
     apiVersion: apps.kio.kasten.io/v1alpha1
     kind: RestorePoint
     name: $RP
-    namespace: clusters
-  targetNamespace: clusters
+    namespace: ${HCNS}
+  targetNamespace: ${HCNS}
 EOF
 ```
 
@@ -450,7 +468,7 @@ touching the guest. It is the validation run when this blueprint was developed (
 ConfigMap `etcd-restore-test/marker` on `guest1` was recovered out of the backup):
 
 ```bash
-NS=clusters
+NS="$HCNS"
 GUEST=guest1
 
 # 0. get the guest's snapshot.db off the keeper PVC (or a Kasten artifact restore)
@@ -505,7 +523,7 @@ using the guest's `snapshot.db` from `/backup/<name>/` on the keeper PVC:
 
 ```bash
 CLUSTER_NAME=guest1
-HOSTED_CLUSTER_NAMESPACE=clusters
+HOSTED_CLUSTER_NAMESPACE="$HCNS"
 CPNS=${HOSTED_CLUSTER_NAMESPACE}-${CLUSTER_NAME}
 
 # 1. pause reconciliation
@@ -565,8 +583,8 @@ the backups. There is no external object-store copy to clean up, so the blueprin
 The keeper pod is permanent, so you can always browse the current fleet artifacts:
 
 ```bash
-KP=$(kubectl get pods -n clusters -l app=hcp-etcd-backup-keeper -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -it -n clusters $KP -- bash
+KP=$(kubectl get pods -n "$HCNS" -l app=hcp-etcd-backup-keeper -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -it -n "$HCNS" $KP -- bash
 #   ls -lhR /backup
 #   etcdutl snapshot status /backup/<name>/snapshot.db -w table
 ```
@@ -582,11 +600,13 @@ kubectl delete blueprintbinding hcp-etcd-backup-binding -n kasten-io --ignore-no
 kubectl delete blueprint hcp-etcd-backup -n kasten-io --ignore-not-found
 
 # Restore points and their snapshot content
-kubectl delete restorepoint -l k10.kasten.io/appNamespace=clusters -n clusters
-kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=clusters
+kubectl delete restorepoint -l k10.kasten.io/appNamespace="$HCNS" -n "$HCNS"
+kubectl delete restorepointcontent -l k10.kasten.io/appNamespace="$HCNS"
 
-# Keeper + permanent PVC (this deletes the backup data!) and its cluster-scoped RBAC
-kubectl delete -f keeper.yaml
+# Keeper + permanent PVC (this deletes the backup data!) and its cluster-scoped RBAC.
+# Use -k (not -f keeper.yaml): the namespace lives in kustomization.yaml, so a bare
+# -f would target the wrong namespace.
+kubectl delete -k .
 
 # (optional, on the guest) the marker used for restore validation
 oc --kubeconfig <guest-kubeconfig> delete namespace etcd-restore-test --ignore-not-found

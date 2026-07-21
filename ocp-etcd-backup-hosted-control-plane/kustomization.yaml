@@ -1,0 +1,21 @@
+# Deploy the HCP etcd-backup fleet keeper into YOUR HostedCluster namespace.
+#
+#   oc apply -k .
+#
+# Change the single `namespace:` value below to the namespace where your
+# HostedCluster objects live (the HyperShift default is `clusters`). Kustomize's
+# namespace transformer then:
+#   - stamps metadata.namespace on the ServiceAccount, PVC, and Deployment, and
+#   - rewrites the ClusterRoleBinding subject namespace to the same value
+#     (because the subject references a ServiceAccount defined in this kustomization).
+# The ClusterRole and ClusterRoleBinding stay cluster-scoped (they have no namespace).
+#
+# One keeper per HostedCluster namespace: if you host guests in several namespaces,
+# copy this directory, change `namespace:` in each, and apply each with `oc apply -k`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: clusters   # ← the ONLY value to edit
+
+resources:
+  - keeper.yaml

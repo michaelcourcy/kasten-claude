@@ -8,13 +8,17 @@
 # setup — the loop picks it up on the next policy run.
 #
 # The keeper needs cluster-scoped read/exec because the control planes it snapshots
-# live in the DYNAMIC per-guest namespaces `clusters-<name>` (created/destroyed as
+# live in the DYNAMIC per-guest namespaces `<hcns>-<name>` (created/destroyed as
 # guests come and go), so a namespaced Role cannot cover them.
+#
+# NOTE: the target namespace is intentionally NOT set here. Deploy with Kustomize
+# (`oc apply -k .` — see kustomization.yaml and the README); its `namespace:`
+# transformer stamps metadata.namespace on the SA/PVC/Deployment AND rewrites the
+# ClusterRoleBinding subject namespace to match — the one line the customer edits.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: hcp-etcd-backup-keeper
-  namespace: clusters
 ---
 # Cluster-scoped so the keeper can reach every current and future hosted cluster:
 #   - hostedclusters: stability check (Available / not Progressing)
@@ -49,7 +53,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: hcp-etcd-backup-keeper
-    namespace: clusters
+    # namespace stamped by the Kustomize namespace transformer (see kustomization.yaml)
 ---
 # Permanent backup PVC. Kasten snapshots THIS PVC; the snapshot is the restore
 # point. It holds one subdir per hosted cluster: /backup/<name>/snapshot.db.
@@ -57,7 +61,6 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: hcp-etcd-backup
-  namespace: clusters
 spec:
   accessModes:
     - ReadWriteOnce
@@ -70,7 +73,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hcp-etcd-backup-keeper
-  namespace: clusters
   labels:
     app: hcp-etcd-backup-keeper
     hcp-etcd-backup-keeper: "true"
