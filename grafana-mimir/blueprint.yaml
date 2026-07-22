@@ -1,0 +1,138 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: grafana-mimir-blueprint
+  namespace: kasten-io
+# ---------------------------------------------------------------------------
+# Grafana Mimir (mimir-distributed chart, in-cluster MinIO object storage).
+#
+# Pattern 5 — database snapshot via a local MinIO keeper. Mimir's entire durable
+# state (TSDB blocks, recording rules, Alertmanager state) lives in the MinIO
+# object storage, which is backed by the single `mimir-minio` PVC. Kasten is the
+# data mover by CSI-snapshotting that PVC (select it with a policy resource
+# filter on label app=minio; exclude the transient ingester / store-gateway /
+# compactor / Kafka PVCs).
+#
+# Bind this blueprint to the MinIO Deployment (annotation or BlueprintBinding).
+# `.Object` therefore refers to the `mimir-minio` Deployment, and
+# `.Object.metadata.namespace` is the Mimir application namespace.
+#
+# Only two hooks are needed:
+#   backupPrehook   — flush every ingester's in-memory series to MinIO so the
+#                     snapshot is complete up to ~the moment of backup.
+#   restorePosthook — after the MinIO PVC is restored, kick the store-gateways
+#                     and compactor to re-discover the restored blocks promptly.
+#
+# There is intentionally NO backupPosthook (flush does not stop ingestion, so
+# there is nothing to un-quiesce) and NO restorePrehook (Mimir needs no
+# pre-restore preparation — MinIO is not reconciled by an operator, and recovery
+# is purely post-restore block re-discovery). See README.md.
+# ---------------------------------------------------------------------------
+actions:
+
+  backupPrehook:
+    # Called by Kasten BEFORE PVC snapshots are initiated.
+    # Force every ingester to flush its in-memory/WAL series to the MinIO object
+    # storage (POST /ingester/flush?wait=true). Each ingester owns a different
+    # shard of the series, so all of them must be flushed. This maximises how
+    # complete the mimir-minio PVC snapshot is; ingestion is NOT stopped.
+    #
+    # KubeTask runs in kasten-io: it uses kubectl to enumerate ingester pods
+    # across namespaces (needs the Kasten service account RBAC) and curl to call
+    # each ingester's admin HTTP API (port 8080).
+    phases:
+      - func: KubeTask
+        name: flushIngesters
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              echo "=== Mimir backup prehook: flushing ingesters in namespace ${NS} ==="
+
+              # Enumerate Running ingester pod IPs (each holds a distinct shard).
+              IPS=$(kubectl get pods -n "${NS}" \
+                      -l app.kubernetes.io/component=ingester \
+                      --field-selector=status.phase=Running \
+                      -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}')
+
+              if [ -z "${IPS}" ]; then
+                echo "ERROR: no Running ingester pods found in ${NS}"
+                exit 1
+              fi
+
+              RC=0
+              for ip in ${IPS}; do
+                echo "-> flushing ingester ${ip}:8080 (wait=true)"
+                # Synchronous flush; 204 No Content on success.
+                CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 120 \
+                        -XPOST "http://${ip}:8080/ingester/flush?wait=true" || echo "000")
+                echo "   HTTP ${CODE}"
+                case "${CODE}" in
+                  2*) ;;                       # 200/204 = flushed
+                  *) echo "   WARNING: flush did not succeed for ${ip}"; RC=1 ;;
+                esac
+              done
+
+              if [ "${RC}" -ne 0 ]; then
+                echo "ERROR: one or more ingesters failed to flush"
+                exit 1
+              fi
+              echo "=== All ingesters flushed to MinIO object storage ==="
+
+  restorePosthook:
+    # Called by Kasten AFTER the (MinIO) PVC has been restored.
+    # The store-gateways and compactor discover blocks from the object storage on
+    # a periodic sync (default up to ~15m). Recreating their pods forces an
+    # immediate re-sync of the restored bucket so recovered metrics become
+    # queryable promptly, and this phase WAITS (kubectl wait --for=condition=Ready)
+    # until they are back — so the restore action only reports Complete once the
+    # restored blocks are actually loaded. A Mimir store-gateway's readiness probe
+    # passes only after its initial bucket sync finishes, so "pod Ready" ==
+    # "blocks loaded". Idempotent — safe to retry.
+    #
+    # KubeTask runs in kasten-io: uses kubectl (Kasten service account RBAC) to
+    # roll and wait on the StatefulSets in the Mimir application namespace.
+    phases:
+      - func: KubeTask
+        name: rediscoverBlocks
+        args:
+          namespace: kasten-io
+          image: michaelcourcy/kasten-tools:8.5.2
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              echo "=== Mimir restore posthook: re-discovering restored blocks in ${NS} ==="
+
+              # Force store-gateways + compactor to re-read the restored bucket by
+              # deleting their pods (they are recreated by the StatefulSet controller).
+              # We DELETE rather than `kubectl rollout restart` + `rollout status`
+              # because these StatefulSets use the OnDelete update strategy (managed
+              # by the mimir-rollout-operator) and `kubectl rollout status` supports
+              # only RollingUpdate. Deleting with --wait also removes the old pods
+              # before we wait, avoiding a race where the wait would pass instantly
+              # against the still-Ready old pods.
+              echo "-> deleting store-gateway and compactor pods (will be recreated)"
+              kubectl delete pod -n "${NS}" -l app.kubernetes.io/component=store-gateway --wait=true
+              kubectl delete pod -n "${NS}" -l app.kubernetes.io/component=compactor --wait=true
+
+              # Give the controllers a moment to recreate the pods, then wait for
+              # them to be Ready. A Mimir store-gateway's readiness probe passes only
+              # after its initial bucket sync completes, so a successful wait means
+              # the restored blocks are loaded and queryable.
+              sleep 10
+              echo "-> waiting for store-gateway pods to be Ready (== bucket synced)"
+              kubectl wait --for=condition=Ready pod -n "${NS}" \
+                -l app.kubernetes.io/component=store-gateway --timeout=15m
+              echo "-> waiting for compactor pod to be Ready"
+              kubectl wait --for=condition=Ready pod -n "${NS}" \
+                -l app.kubernetes.io/component=compactor --timeout=15m
+
+              echo "=== Store-gateways synced and compactor ready; restored blocks are loaded ==="

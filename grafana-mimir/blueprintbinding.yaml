@@ -1,0 +1,32 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: grafana-mimir-blueprint-binding
+  namespace: kasten-io
+# Binds the grafana-mimir blueprint to the in-cluster MinIO Deployment that backs
+# a Mimir cluster's object storage. Opt in by labelling that Deployment:
+#
+#   kubectl label deploy <release>-minio -n <mimir-ns> grafana-mimir-minio=true
+#
+# We do NOT bind all Deployments with app=minio — that label is generic and would
+# match unrelated MinIO instances. The DoesNotExist guard lets an explicit
+# kanister.kasten.io/blueprint annotation on a specific Deployment win instead.
+spec:
+  blueprintRef:
+    name: grafana-mimir-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: grafana-mimir-minio
+          operator: In
+          values:
+            - "true"
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

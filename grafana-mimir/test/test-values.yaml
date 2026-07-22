@@ -1,0 +1,20 @@
+# Test-friendly overrides for validating backup/restore quickly.
+# NOT required for the blueprint to work — they only make restored recent data
+# queryable immediately instead of waiting out the default 12h query_store_after.
+mimir:
+  structuredConfig:
+    querier:
+      # 0s => queriers always consult the store-gateway (bucket), even for recent
+      # data. Lets a full restore serve recently-flushed blocks straight away.
+      query_store_after: 0s
+    blocks_storage:
+      bucket_store:
+        # Re-sync the bucket index quickly so store-gateways pick up restored blocks.
+        sync_interval: 1m
+        # 0s => store-gateways load even very recent blocks (default 10h ignores
+        # them, expecting ingesters to serve recent data). Needed so freshly
+        # flushed / restored blocks are queryable immediately in a test.
+        ignore_blocks_within: 0s
+metaMonitoring:
+  grafanaAgent:
+    installOperator: false
