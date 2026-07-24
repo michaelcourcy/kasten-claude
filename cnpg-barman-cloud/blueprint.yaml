@@ -15,7 +15,7 @@ actions:
         name: triggerBarmanBackup
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.2
+          image: michaelcourcy/kasten-tools:8.5.9
           command:
             - bash
             - -o
@@ -102,7 +102,7 @@ actions:
         name: deleteBarmanBackup
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.2
+          image: michaelcourcy/kasten-tools:8.5.9
           command:
             - bash
             - -o

@@ -212,7 +212,7 @@ actions:
         name: deleteSnapshot
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.2
+          image: michaelcourcy/kasten-tools:8.5.7
           command:
             - bash
             - -o

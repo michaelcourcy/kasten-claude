@@ -85,6 +85,7 @@ retired restore point causes its ES snapshot to be deleted.
 ## Prerequisites
 
 - ECK operator installed in `elastic-system`.
+- `michaelcourcy/kasten-tools:8.5.7` image available (adds `kubectl` + `jq` to `gcr.io/kasten-images/kanister-tools:8.5.7`), built from the shared [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile).
 - A CSI storage class that supports volume snapshots. Examples used here:
   - `ebs-sc` — AWS EBS CSI on EKS.
 

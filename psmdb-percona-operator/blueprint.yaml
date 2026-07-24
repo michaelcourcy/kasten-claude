@@ -15,7 +15,7 @@ actions:
       name: quiesceSecondary
       args:
         namespace: kasten-io
-        image: michaelcourcy/kasten-tools:8.5.2
+        image: michaelcourcy/kasten-tools:8.5.4
         command:
         - bash
         - -o
@@ -97,7 +97,7 @@ actions:
       name: unquiesceSecondary
       args:
         namespace: kasten-io
-        image: michaelcourcy/kasten-tools:8.5.2
+        image: michaelcourcy/kasten-tools:8.5.4
         command:
         - bash
         - -o

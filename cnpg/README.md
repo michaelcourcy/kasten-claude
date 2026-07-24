@@ -116,6 +116,8 @@ then auto-promotes it to primary.
 
 ## Prerequisites
 
+- `michaelcourcy/kasten-tools:8.5.4` image available (adds `kubectl` to `gcr.io/kasten-images/kanister-tools:8.5.4`), built from the shared [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile).
+
 ### Install the CNPG operator
 
 ```bash

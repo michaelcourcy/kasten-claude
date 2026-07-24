@@ -61,7 +61,7 @@ pvcs:
 - Kasten installed in `kasten-io` namespace.
 - The image `michaelcourcy/kasten-tools:8.5.2` must be pullable from the cluster.
   It is the standard `gcr.io/kasten-images/kanister-tools:8.5.2` image with `kubectl`
-  added. See [Dockerfile](../mariadb-community-operator-standalone/images/kasten-tools/Dockerfile)
+  added. See [Dockerfile](../images/kasten-tools/Dockerfile)
   if you need to rebuild it.
 
 ## Deployment

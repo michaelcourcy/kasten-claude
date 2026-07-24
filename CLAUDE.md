@@ -151,10 +151,32 @@ Omit the operator row for workloads deployed without an operator (plain Helm cha
 **Keep the "Blueprint actions" table in `README.md` in sync with the blueprint YAML at all times.**
 Every action defined in the blueprint (`backupPrehook`, `backupPosthook`, `restorePrehook`, `restorePosthook`, etc.) must have a row in that table describing what it does. No action may exist in the YAML without a corresponding row, and no row may exist without a corresponding action in the YAML.
 
-If a custom container image is needed (e.g. a tool image for `KubeTask` or a kubeOps that create a pod), commit its `Dockerfile`
-in a subdirectory of the blueprint folder: `<blueprint-dir>/images/<image-name>/Dockerfile`.
-**Never reference a custom image in a blueprint without a committed Dockerfile.** Document the
-image name, base image, and what was added in the `README.md`.
+If a custom container image is needed (e.g. a tool image for `KubeTask` or a kubeOps that create a pod), commit its `Dockerfile`:
+- **Blueprint-specific image** (only that blueprint uses it) → `<blueprint-dir>/images/<image-name>/Dockerfile`.
+- **Shared/reusable image** (used by more than one blueprint — e.g. `michaelcourcy/kasten-tools`,
+  which is `kanister-tools` + `kubectl` + `jq`) → **one canonical copy** at the repo root:
+  `images/<image-name>/Dockerfile`. Do **not** duplicate it into each blueprint folder — that
+  reintroduces version drift. Each consuming blueprint's `README.md` references the shared file
+  with a relative link (`../images/<image-name>/Dockerfile`) and documents its own build-arg
+  version. See [images/kasten-tools/](images/kasten-tools/) for the reference layout.
+
+**Never reference a custom image in a blueprint without a committed Dockerfile** — every blueprint
+`README.md` must point (directly, or via the shared image) to the `Dockerfile` behind every image
+it uses. Document the image name, base image, and what was added.
+
+**Match the custom image version to the Kasten version installed on the cluster.** When a custom
+image derives from a Kasten image (e.g. `gcr.io/kasten-images/kanister-tools:<version>`), the
+default version — whether a `Dockerfile` `ARG` (e.g. `ARG KASTEN_VERSION=...`) or the base image
+tag — MUST match the Kasten version actually running on the test cluster. Detect it first with
+`helm ls -n kasten-io` (or the OLM CSV command above), then set that exact version as the default.
+Do not carry over a version from a previous blueprint. Mismatched tool/Kasten versions can cause
+subtle incompatibilities and make the test environment unrepresentative.
+
+**Keep every pinned tool version in the Dockerfile equal to what the `README.md` documents.** This
+applies to `kubectl` (`ARG KUBECTL_VERSION` should match the Kubernetes version in the README
+versions table), and to any other tool the image installs at a pinned version. The Dockerfile and
+the README must never disagree on a version — when you change one, change the other in the same
+commit.
 
 Do not assume that the base image contains jq, yq or kubectl, most of the time you have to add them.
 

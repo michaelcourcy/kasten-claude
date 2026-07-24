@@ -56,6 +56,8 @@ from the archive, giving a consistent point-in-time view.
 
 ## Prerequisites
 
+- `michaelcourcy/kasten-tools:8.5.4` image available (adds `kubectl` to `gcr.io/kasten-images/kanister-tools:8.5.4`), built from the shared [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile). Used by the blueprint's `KubeTask` phases; `cbbackupmgr` itself runs in the keeper from the stock `couchbase/server` image.
+
 ### Install the Couchbase Autonomous Operator
 
 ```bash

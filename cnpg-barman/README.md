@@ -111,7 +111,7 @@ No restore hooks are implemented — PITR recovery is a **manual procedure** usi
 ## Prerequisites
 
 - CNPG operator installed (`cloudnative-pg` Helm chart).
-- `michaelcourcy/kasten-tools:8.5.2` image available (adds `kubectl` to `gcr.io/kasten-images/kanister-tools:8.5.2`).
+- `michaelcourcy/kasten-tools:8.5.4` image available (adds `kubectl` to `gcr.io/kasten-images/kanister-tools:8.5.4`). Built from the shared [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile).
 - Blueprint and BlueprintBinding deployed in `kasten-io` namespace.
 - Kasten backup policy configured with the PVC filter described below.
 - The Pattern 1 `cnpg-blueprint-binding` must have the `NotIn: barman-minio` exclusion condition (already present in `cnpg/blueprintbinding.yaml`).

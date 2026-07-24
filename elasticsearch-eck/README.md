@@ -143,7 +143,7 @@ Do **not** use legacy in-tree classes — they do not support CSI snapshots.
 
 The blueprint uses `michaelcourcy/kasten-tools:8.5.2`, which adds `kubectl`, `tar`, `gzip` and  `jq`to
 `gcr.io/kasten-images/kanister-tools:8.5.2` (the base image already contains `curl`).
-See [images/kasten-tools/Dockerfile](images/kasten-tools/Dockerfile).
+See the shared [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile).
 
 ---
 

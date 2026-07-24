@@ -117,17 +117,17 @@ the restored PVC automatically.
 - The blueprint and BlueprintBinding deployed in the `kasten-io` namespace
 - Custom image `michaelcourcy/kasten-tools:<kasten-version>` for `KubeTask` phases that need
   `kubectl` (the standard `gcr.io/kasten-images/kanister-tools` image does not include it).
-  Dockerfile: [`images/kasten-tools/Dockerfile`](images/kasten-tools/Dockerfile)
+  Dockerfile: [`../images/kasten-tools/Dockerfile`](../images/kasten-tools/Dockerfile)
 
 ## Custom images
 
 | Image | Base | Added | Dockerfile |
 |-------|------|-------|------------|
-| `michaelcourcy/kasten-tools:8.5.2` | `gcr.io/kasten-images/kanister-tools:8.5.2` | `kubectl` v1.32.0 | `images/kasten-tools/Dockerfile` |
+| `michaelcourcy/kasten-tools:8.5.2` | `gcr.io/kasten-images/kanister-tools:8.5.2` | `kubectl` v1.32.0 | [`../images/kasten-tools/Dockerfile`](../images/kasten-tools/Dockerfile) (shared, repo-root) |
 
 To rebuild for a different Kasten version:
 ```bash
-docker build --build-arg KASTEN_VERSION=<version> -t michaelcourcy/kasten-tools:<version> images/kasten-tools/
+docker build --build-arg KASTEN_VERSION=<version> -t michaelcourcy/kasten-tools:<version> ../images/kasten-tools/
 docker push michaelcourcy/kasten-tools:<version>
 ```
 
@@ -224,4 +224,4 @@ kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=mariadb-test
 | `operator/mariadb.yaml` | MariaDB CR for the test deployment |
 | `blueprint.yaml` | Kasten Blueprint |
 | `blueprintbinding.yaml` | BlueprintBinding targeting all MariaDB CRs |
-| `images/kasten-tools/Dockerfile` | Dockerfile for `michaelcourcy/kasten-tools` |
+| [`../images/kasten-tools/Dockerfile`](../images/kasten-tools/Dockerfile) | Shared (repo-root) Dockerfile for `michaelcourcy/kasten-tools` |

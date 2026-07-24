@@ -45,7 +45,7 @@ actions:
         name: flushIngesters
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.2
+          image: michaelcourcy/kasten-tools:8.5.13
           command:
             - bash
             - -c
@@ -102,7 +102,7 @@ actions:
         name: rediscoverBlocks
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.2
+          image: michaelcourcy/kasten-tools:8.5.13
           command:
             - bash
             - -c

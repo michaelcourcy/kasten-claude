@@ -18,7 +18,7 @@ actions:
         name: triggerPbmBackup
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.2
+          image: michaelcourcy/kasten-tools:8.5.4
           command:
             - bash
             - -o
@@ -89,7 +89,7 @@ actions:
         name: restoreFromPbm
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.2
+          image: michaelcourcy/kasten-tools:8.5.4
           command:
             - bash
             - -o
@@ -176,7 +176,7 @@ actions:
         name: deletePbmBackup
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.2
+          image: michaelcourcy/kasten-tools:8.5.4
           command:
             - bash
             - -o

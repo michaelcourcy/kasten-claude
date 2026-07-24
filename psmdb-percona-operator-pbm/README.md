@@ -99,7 +99,7 @@ name by stripping the `-minio` suffix.
 ## Prerequisites
 
 - PSMDB operator installed (`percona/psmdb-operator` Helm chart, `watchAllNamespaces=true`).
-- `michaelcourcy/kasten-tools:8.5.2` image available (adds `kubectl` to the base image).
+- `michaelcourcy/kasten-tools:8.5.4` image available (adds `kubectl` to the base image). Built from the shared [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile).
 - Blueprint and BlueprintBinding deployed in the `kasten-io` namespace.
 - Kasten backup policy configured with the PVC filter described below.
 

@@ -57,7 +57,8 @@ exists in exactly one place.
 ### Tools image
 
 The blueprint's KubeTask phases need `kubectl` + `jq` (and `kando` from the
-kanister-tools base). 
+kanister-tools base). It uses `michaelcourcy/kasten-tools:8.5.2`, built from the shared
+[../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile).
 
 ## Install the blueprint
 

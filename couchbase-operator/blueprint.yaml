@@ -76,7 +76,7 @@ actions:
       name: quiesceNamespace
       args:
         namespace: kasten-io
-        image: michaelcourcy/kasten-tools:8.5.2
+        image: michaelcourcy/kasten-tools:8.5.4
         command:
         - /bin/bash
         - -c
@@ -108,7 +108,7 @@ actions:
       name: resumeCluster
       args:
         namespace: kasten-io
-        image: michaelcourcy/kasten-tools:8.5.2
+        image: michaelcourcy/kasten-tools:8.5.4
         command:
         - /bin/bash
         - -c

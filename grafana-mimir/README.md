@@ -217,21 +217,22 @@ kubectl delete namespace mimir-tools
 |---|---|
 | [blueprint.yaml](blueprint.yaml) | The Kanister blueprint (`backupPrehook`, `restorePosthook`). |
 | [blueprintbinding.yaml](blueprintbinding.yaml) | Binds the blueprint to the MinIO Deployment via an opt-in label. |
-| [images/kasten-tools/Dockerfile](images/kasten-tools/Dockerfile) | The tool image used by both hooks. |
+| [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile) | Shared tool image (repo-root) used by both hooks. |
 
 ### Custom image
 
 Both hooks run as `KubeTask` pods that need `kubectl` (enumerate ingester pods / delete
 store-gateway + compactor pods across namespaces) and `curl` (call the ingester admin API). They use
-**`michaelcourcy/kasten-tools:8.5.2`** — Kasten's `gcr.io/kasten-images/kanister-tools:8.5.2`
-base with `kubectl` + `jq` added (base already has `curl`). Dockerfile:
-[images/kasten-tools/Dockerfile](images/kasten-tools/Dockerfile). Rebuild/push:
+**`michaelcourcy/kasten-tools:8.5.13`** — Kasten's `gcr.io/kasten-images/kanister-tools:8.5.13`
+base with `kubectl` + `jq` added (base already has `curl`). It is the shared repo-root image:
+[../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile). The tag matches the Kasten
+version tested on the cluster (see versions table). Rebuild/push:
 
 ```bash
-cd images/kasten-tools
+cd ../images/kasten-tools
 docker buildx build --platform linux/amd64 \
-  --build-arg KASTEN_VERSION=8.5.2 \
-  -t <your-registry>/kasten-tools:8.5.2 --push .
+  --build-arg KASTEN_VERSION=8.5.13 \
+  -t <your-registry>/kasten-tools:8.5.13 --push .
 ```
 
 Both `KubeTask`s run in the **`kasten-io`** namespace so the pod inherits the Kasten
