@@ -2,3 +2,5 @@
 feature-requests/
 # MS Office lock / owner files (created while a doc is open)
 ~$*
+# Internal brown-bag-lunch deck — not part of any blueprint
+bbl.pptx
