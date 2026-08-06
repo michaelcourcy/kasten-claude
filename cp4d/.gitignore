@@ -1,0 +1,35 @@
+# --- Credentials -------------------------------------------------------------
+# cpdctl stores the CP4D password / API key in its config file (obfuscated, not
+# safe to publish). Never commit it, wherever it lands.
+.cpdctl.config.json
+**/.cpdctl.config.json
+*.cpdctl.config.json
+# Generic credential material
+*credentials*
+*.kubeconfig
+kubeconfig
+*.pem
+*.p12
+*.pfx
+*.key
+!*.pub
+.env
+.env.*
+
+# --- Executables / downloaded CLI distributions -------------------------------
+# The cpdctl CLI is downloaded from IBM, not vendored here (see README).
+# This also covers the LICENSE / NOTICES files shipped in its archive.
+bin/
+cpdctl
+*.exe
+*.dll
+*.so
+*.dylib
+*.tar.gz
+*.tgz
+*.zip
+# .sh scripts (restore.sh, images/cp4d-backup/*.sh) ARE part of the blueprint
+# and must stay tracked — do not add *.sh here.
+
+# --- Internal notes -----------------------------------------------------------
+discovery.md

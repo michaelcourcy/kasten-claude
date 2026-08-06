@@ -1,3 +1,4 @@
 .DS_Store
 feature-requests/
-cp4d/
+# MS Office lock / owner files (created while a doc is open)
+~$*
