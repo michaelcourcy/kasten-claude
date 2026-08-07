@@ -26,7 +26,7 @@ WANT_NAME="${3:-}"
 
 CRED_NS="${CRED_NS:-cpd}"
 CRED_SECRET="${CRED_SECRET:-cp4d-backup-cpdctl-creds}"
-IMAGE="${IMAGE:-docker.io/michaelcourcy/cp4d-backup:1.8.244-2}"
+IMAGE="${IMAGE:-docker.io/michaelcourcy/cp4d-backup:1.8.244-3}"
 ENCRYPTION_KEY="${ENCRYPTION_KEY:-}"
 CPDCTL="${CPDCTL:-$(dirname "$0")/bin/cpdctl}"
 

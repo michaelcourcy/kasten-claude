@@ -12,8 +12,28 @@ cpdctl-login.sh
 echo "exporting project $PID ($PROJECT_NAME)"
 ENC=()
 [ -n "$ENCRYPTION_KEY" ] && ENC=(--encryption-key "$ENCRYPTION_KEY")
-cpdctl asset export start --project-id "$PID" --assets-all-assets \
-  "${ENC[@]}" --name "kasten-${PID}" --output-file /tmp/export.zip | grep -iE 'State:|OK'
+
+# An EMPTY project is not an error. cpdctl refuses to export one (SPACES0046E "No assets
+# found for export") and exits non-zero, which — since the keeper now covers every project
+# in the cluster — would let a single empty project fail the entire backup. Treat it as a
+# successful no-op and leave any existing bundle on the PVC untouched, so that emptying a
+# project does not also destroy its last good backup.
+set +e
+OUT=$(cpdctl asset export start --project-id "$PID" --assets-all-assets \
+        "${ENC[@]}" --name "kasten-${PID}" --output-file /tmp/export.zip 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  if printf '%s' "$OUT" | grep -q 'SPACES0046E'; then
+    echo "SKIP: project $PID ($PROJECT_NAME) contains no assets — nothing to export."
+    echo "      Any bundle already on the PVC is left as-is."
+    exit 0
+  fi
+  echo "export FAILED for $PID ($PROJECT_NAME):"
+  printf '%s\n' "$OUT" | tail -20 | sed 's/^/  /'
+  exit "$RC"
+fi
+printf '%s\n' "$OUT" | grep -iE 'State:|OK' || true
 
 rm -rf /backup/.staging && mkdir -p /backup/.staging
 unzip -q /tmp/export.zip -d /backup/.staging

@@ -33,3 +33,7 @@ cpdctl
 
 # --- Internal notes -----------------------------------------------------------
 discovery.md
+# Side investigation: standing up an LDAP IdP to prove that project enumeration is
+# membership-scoped. The conclusion is in README.md; the LDAP setup itself is not a
+# blueprint dependency (any connected IdP works), so it stays out of the published docs.
+ldap.md

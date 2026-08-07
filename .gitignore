@@ -4,3 +4,5 @@ feature-requests/
 ~$*
 # Internal brown-bag-lunch deck — not part of any blueprint
 bbl.pptx
+# cpd-cli scratch (log dir created wherever cpd-cli is invoked)
+cpd-cli-workspace/

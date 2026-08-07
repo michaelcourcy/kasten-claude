@@ -18,14 +18,14 @@ actions:
         name: exportAllProjects
         args:
           namespace: kasten-io          # cluster-wide Kasten SA: read cpd cred secret + manage PVCs/pods in BACKUP_NS
-          image: docker.io/michaelcourcy/cp4d-backup:1.8.244-2
+          image: docker.io/michaelcourcy/cp4d-backup:1.8.244-3
           command:
             - bash
             - -c
             - |
               set -euo pipefail
               export BACKUP_NS="{{ .Namespace.Name }}"          # = cp4d-projects-backup (the namespace being backed up)
-              export IMAGE="docker.io/michaelcourcy/cp4d-backup:1.8.244-2"
+              export IMAGE="docker.io/michaelcourcy/cp4d-backup:1.8.244-3"
               export STORAGE_CLASS="managed-csi"                # cluster-specific CSI snapshot class (see README)
               export KEEPER_SA="cp4d-backup-keeper"
               export CRED_NS="cpd"                              # credential secret lives OUTSIDE the backed-up ns

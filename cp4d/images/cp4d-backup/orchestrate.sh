@@ -3,12 +3,13 @@
 # cluster-wide Kasten SA) BEFORE Kasten's PVC discovery, so every PVC it creates is
 # included in the restore point.
 #
-# For each CP4D analytics project it ensures a permanent, GUID-keyed PVC in $BACKUP_NS
-# and launches one export pod (bounded concurrency) that writes the unzipped bundle
-# into that PVC. It then prunes PVCs of deleted projects and deletes the export pods
-# (so no export pod — and no credential — is captured in the restore point).
+# For each CP4D analytics project it ensures the keeper is an editor on that project
+# (self-enrolling where needed — see below), ensures a permanent, GUID-keyed PVC in
+# $BACKUP_NS, and launches one export pod (bounded concurrency) that writes the unzipped
+# bundle into that PVC. It then prunes PVCs of deleted projects and deletes the export
+# pods (so no export pod — and no credential — is captured in the restore point).
 #
-# Exit non-zero (=> the whole backup fails) if any project could not be exported.
+# Exit non-zero (=> the whole backup fails) if any project could not be enrolled or exported.
 set -euo pipefail
 : "${BACKUP_NS:?BACKUP_NS is required}"
 : "${IMAGE:?IMAGE (keeper image) is required}"
@@ -18,6 +19,8 @@ set -euo pipefail
 : "${MAX_PARALLEL:=4}"
 : "${EXPORT_TIMEOUT:=900s}"
 : "${ENCRYPTION_KEY:=}"
+: "${CRED_NS:=cpd}"
+: "${CRED_SECRET:=cp4d-backup-cpdctl-creds}"
 
 # Environment (all overridable; defaults above):
 #   BACKUP_NS       (required) namespace holding the per-project PVCs and export pods
@@ -28,8 +31,31 @@ set -euo pipefail
 #   MAX_PARALLEL    max export pods running concurrently
 #   EXPORT_TIMEOUT  per-pod wait timeout (kubectl wait --timeout value)
 #   ENCRYPTION_KEY  optional; passed to export-project.sh (empty => plaintext bundle)
+#   CRED_NS         namespace holding the credential secret (read cross-namespace)
+#   CRED_SECRET     name of that secret (keys: url, username, apikey, uid)
 
 cpdctl-login.sh   # authenticate cpdctl from the cross-namespace credential secret
+
+# --- the keeper's own identity, needed to add itself as a project member -------------
+# CP4D requires BOTH user_name and the numeric uid in a member payload (user_name alone
+# is rejected: "Field state cannot be set to ACTIVE without specifying a member id"),
+# and there is no cpdctl "whoami". So the uid is stored in the credential secret
+# alongside the API key rather than resolved at run time.
+if [ -n "${CPD_USERNAME:-}" ] && [ -n "${CPD_UID:-}" ]; then
+  SVC_USER="$CPD_USERNAME"; SVC_UID="$CPD_UID"
+else
+  SVC_USER=$(kubectl get secret -n "$CRED_NS" "$CRED_SECRET" -o jsonpath='{.data.username}' | base64 -d)
+  SVC_UID=$(kubectl  get secret -n "$CRED_NS" "$CRED_SECRET" -o jsonpath='{.data.uid}'      | base64 -d)
+fi
+if [ -z "${SVC_UID}" ]; then
+  echo "FATAL: secret ${CRED_NS}/${CRED_SECRET} has no 'uid' key."
+  echo "       The keeper needs its own numeric uid to enrol itself on projects. Add it:"
+  echo "         kubectl patch secret ${CRED_SECRET} -n ${CRED_NS} -p \\"
+  echo "           \"{\\\"data\\\":{\\\"uid\\\":\\\"\$(printf %s '<uid>' | base64)\\\"}}\""
+  echo "       Get <uid> from: GET /usermgmt/v1/user/<username>  ->  .uid"
+  exit 1
+fi
+echo "keeper identity: ${SVC_USER} (uid ${SVC_UID})"
 
 # sanitize NAME -> DNS-1123-safe fragment (lowercase, [a-z0-9-] only, no
 # leading/trailing dash, <=40 chars). Used to build a readable PVC name; the
@@ -49,6 +75,46 @@ while :; do
 done
 TOTAL=$(grep -c . /tmp/all.tsv || true)
 echo "discovered ${TOTAL} project(s)"
+
+# --- ensure the keeper is an editor on every project (self-enrol where missing) -------
+# Seeing a project and being able to export it are separate rights: cluster-wide
+# visibility comes from the manage_project permission, but `asset export` requires
+# editor-or-above MEMBERSHIP on that specific project (else SPACES0045E). manage_project
+# also permits member management, so the keeper can add itself — meaning a project that
+# nobody enrolled us on is repaired here instead of being silently skipped.
+BM=""; : > /tmp/mine.txt
+while :; do
+  if [ -z "$BM" ]; then cpdctl project list --member "$SVC_USER" --roles admin,editor --limit 100 --output json > /tmp/m.json
+  else                   cpdctl project list --member "$SVC_USER" --roles admin,editor --limit 100 --bookmark "$BM" --output json > /tmp/m.json; fi
+  jq -r '.resources[]?.metadata.guid // empty' /tmp/m.json >> /tmp/mine.txt
+  n=$(jq '.resources // [] | length' /tmp/m.json)
+  BM=$(jq -r '.bookmark // empty' /tmp/m.json)
+  { [ "$n" -lt 100 ] || [ -z "$BM" ]; } && break
+done
+sort -u -o /tmp/mine.txt /tmp/mine.txt
+echo "already an editor on $(grep -c . /tmp/mine.txt || true) of ${TOTAL} project(s)"
+
+ENROLL_FAILED=()
+while IFS=$'\t' read -r pid name; do
+  [ -z "${pid}" ] && continue
+  grep -qxF "${pid}" /tmp/mine.txt && continue
+  echo "  enrolling as editor on '${name}' (${pid})"
+  if ! cpdctl project member create --project-id "${pid}" \
+        --members "[{\"user_name\":\"${SVC_USER}\",\"id\":\"${SVC_UID}\",\"role\":\"editor\",\"state\":\"ACTIVE\",\"type\":\"user\"}]" \
+        >/tmp/enrol.out 2>&1; then
+    echo "  !! could not enrol on '${name}' (${pid}):"; sed 's/^/     /' /tmp/enrol.out
+    ENROLL_FAILED+=("${pid}")
+  fi
+done < /tmp/all.tsv
+
+# Fail before moving any data: an un-enrollable project cannot be exported, and a
+# backup that quietly omits a project is worse than one that fails visibly.
+if [ "${#ENROLL_FAILED[@]}" -gt 0 ]; then
+  echo "BACKUP PREHOOK FAILED: could not become an editor on ${#ENROLL_FAILED[@]} project(s): ${ENROLL_FAILED[*]}"
+  echo "  Check that ${SVC_USER} holds the 'manage_project' permission (it grants both"
+  echo "  cluster-wide project visibility and member management), and that uid ${SVC_UID} is correct."
+  exit 1
+fi
 
 BATCH="b$(date +%s)"
 declare -A PID_SEEN

@@ -68,7 +68,7 @@ Detected on the cluster where this blueprint was developed and tested.
 | Kasten | 8.5.12 (Helm `k10-8.5.12`) |
 | Cloud Pak for Data / IBM Software Hub | 5.2.x (Watson Studio `ws` 11.2.0) |
 | cpdctl | 1.8.244 |
-| Keeper image | `docker.io/michaelcourcy/cp4d-backup:1.8.244-2` |
+| Keeper image | `docker.io/michaelcourcy/cp4d-backup:1.8.244-3` |
 
 Detect your Kasten version:
 
@@ -107,7 +107,7 @@ cpdctl config is rendered to a tmpfs path at runtime and never persisted.
 
 ```bash
 cd images/cp4d-backup
-docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:1.8.244-2 --push .
+docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:1.8.244-3 --push .
 ```
 
 > Use an **immutable tag** (or `imagePullPolicy: Always`, which the pod specs already set). A reused
@@ -116,22 +116,196 @@ docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:1.8.24
 
 ### 2. CP4D credentials — a service-user API key in the `cpd` namespace
 
-Use a **dedicated CP4D service user** (least privilege — access only to the projects to back up),
-not the admin. Generate its **platform API key** and store it in a Secret **in `cpd`** (deliberately
-*outside* the backed-up namespace, so it is never captured in a restore point):
+Use a **dedicated CP4D service user** rather than the admin — a distinct identity you can audit and
+revoke independently, scoped to the projects you choose. The keeper authenticates headlessly with
+that user's **platform API key**, which is stored in a Secret **in `cpd`** — deliberately *outside*
+the backed-up namespace, so it is never captured in a restore point.
+
+> Note that "dedicated" is not the same as "low-privilege": granting `manage_project` below makes
+> this identity able to reach every project's data in the cluster — see the warning immediately
+> below before deciding.
+
+> 🚨 **THE SERVICE USER MUST HOLD `manage_project`, AND IT WILL BACK UP EVERY PROJECT IN THE
+> CLUSTER.** Both halves matter. Measured 2026-08-07 on CP4D 5.2.x:
+>
+> | Capability | What grants it |
+> |---|---|
+> | **See** a project (`cpdctl project list`) | the **`manage_project`** permission — cluster-wide, no membership needed. Without it a user sees only its own projects, and *the Administrator role is no exemption*: `cpadmin` could not see another user's project until added as a collaborator. |
+> | **Export** a project (`asset export start`) | **editor-or-above membership on that specific project**. No platform permission substitutes — a role carrying `administrator` + `manage_project` + `monitor_project` still fails `SPACES0045E … missing required editor member role`. |
+> | **Add a member** to a project | `manage_project` **also grants this** — a holder that is a member of nothing added *itself* as editor (`HTTP 200`), where `cpadmin` was refused `403 "not a member of the project"`. |
+>
+> These are two separate authorization systems: a **role** bundles *platform* permissions (what you
+> may do to the cluster), while **project membership** is a per-project entry governing access to
+> that project's *data*. That third row is what lets the blueprint bridge them —
+> [orchestrate.sh](images/cp4d-backup/orchestrate.sh) enumerates every project and **enrols itself
+> as editor on any it is not already a member of**, before exporting anything. A project nobody
+> granted it access to is repaired rather than silently skipped, and if enrolment fails the whole
+> backup fails loudly (before any data moves) rather than quietly omitting that project.
+>
+> **The consequence you must accept:** the keeper backs up **every analytics project in the
+> cluster**, including ones created later, and grants itself editor on each to do so. Project owners
+> will see the service user appear in their collaborator list. `manage_project` therefore means *"can
+> reach the data of every project"* — a **higher** privilege than the Administrator role. Do not
+> describe this identity as least-privilege; its API key is a cluster-wide data-access credential, so
+> protect the Secret accordingly. If some projects must stay untouched, this blueprint is not
+> currently able to exclude them.
+
+**The keeper authenticates with the API key alone — never a password.**
+[cpdctl-login.sh](images/cp4d-backup/cpdctl-login.sh) runs
+`cpdctl config user set svc --username … --apikey …`, and the Secret holds only `url`, `username`
+and `apikey`. No CP4D password ever exists in the cluster.
+
+A platform API key belongs to **one user**, and the API returns the key of whoever the bearer token
+belongs to. There is no admin endpoint to mint a key on another user's behalf: you must obtain the
+key **as the service user**. Getting this wrong is the common mistake — a token obtained with admin
+credentials yields the *admin's* key, and the blueprint then runs with far more privilege than
+intended.
+
+**How you get that key depends on which identity provider backs the user** — but only for this
+one-time step. Once the key exists, the keeper behaves identically either way (verified against an
+OpenShift-federated user):
+
+| The service user is backed by | Get the API key |
+|---|---|
+| **LDAP**, or the **built-in admin** (`cpadmin`) | **Scriptable** — the two REST calls below. IAM can verify the password itself (its own store, or an LDAP bind), so `{username, password}` returns a token. |
+| **OpenShift OAuth, OIDC, or SAML** | **Through the web UI** — sign in as that user, then *Profile and settings → API key*, and skip to step 3 below with the value. Federated login is a browser redirect; the password never reaches CP4D, so there is no scriptable token call. |
+
+Either way the key itself is identical, never expires, and goes into the same Secret.
+
+### Scriptable path (LDAP or built-in admin)
+
+Two REST calls, both against the `cpd` route:
 
 ```bash
-# Get the user's platform API key from CP4D (run as that user's bearer token):
-#   TOKEN via POST /icp4d-api/v1/authorize {username,password}
-#   GET /usermgmt/v1/user/apiKey  ->  {"apiKey":"..."}
+CPD_HOST=$(oc get route cpd -n cpd -o jsonpath='{.spec.host}')
 
+# ---- the only two values you supply by hand ----
+SVC_USER='<service-user>'
+SVC_PW='<service-user-password>'
+
+# ...unless the user is the built-in admin (cpadmin), in which case read both from the
+# secret instead of typing them — uncomment these two lines and skip the two above:
+# SVC_USER=$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_username}' | base64 -d)
+# SVC_PW=$(oc  get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_password}' | base64 -d)
+
+# 1. Exchange the service user's username + password for a bearer token.
+#    Response: {"token":"<JWT>","message":"success","_messageCode_":"success"}
+TOKEN=$(curl -sSk -X POST "https://${CPD_HOST}/icp4d-api/v1/authorize" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"${SVC_USER}\",\"password\":\"${SVC_PW}\"}" \
+  | jq -r .token)
+
+# Fail loudly instead of carrying an empty token into step 2.
+if [ -z "$TOKEN" ] || [ "$TOKEN" = null ]; then
+  echo "auth failed. Re-run the curl WITHOUT '| jq -r .token' to see the real error:"
+  echo "  401 'User unauthorized to invoke this endpoint' means either a wrong password"
+  echo "  OR the user is not authorized on the platform (Access control -> Add users)."
+  return 2>/dev/null || exit 1
+fi
+
+# 2. Read that user's platform API key using the token.
+#    Response: {"apiKey":"<40 chars>","expire_at":null,"message":"success","_messageCode_":"success"}
+APIKEY=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/apiKey" \
+  -H "Authorization: Bearer ${TOKEN}" | jq -r .apiKey)
+
+# 3. Read the user's numeric uid. The keeper needs it to add itself as a project member:
+#    CP4D rejects a member payload carrying only user_name ("Field state cannot be set to
+#    ACTIVE without specifying a member id"), and there is no cpdctl "whoami".
+SVC_UID=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/${SVC_USER}" \
+  -H "Authorization: Bearer ${TOKEN}" | jq -r .uid)
+
+# 4. Store url + username + apikey + uid for the keeper to read cross-namespace.
 kubectl create secret generic cp4d-backup-cpdctl-creds -n cpd \
-  --from-literal=url=https://<cpd-route-host> \
-  --from-literal=username=<service-user> \
-  --from-literal=apikey=<api-key>
+  --from-literal=url="https://${CPD_HOST}" \
+  --from-literal=username="${SVC_USER}" \
+  --from-literal=apikey="${APIKEY}" \
+  --from-literal=uid="${SVC_UID}"
 ```
 
-Find the CP4D route host: `oc get route cpd -n cpd -o jsonpath='https://{.spec.host}{"\n"}'`.
+Verify the Secret is usable before deploying anything else. This mirrors exactly what
+[cpdctl-login.sh](images/cp4d-backup/cpdctl-login.sh) does inside the keeper — it reads the same
+three keys (`url`, `username`, `apikey`) and runs the same two `cpdctl config` commands:
+
+```bash
+./bin/cpdctl config user set svc \
+  --username "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.username}' | base64 -d)" \
+  --apikey   "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.apikey}'   | base64 -d)"
+./bin/cpdctl config profile set svc-check \
+  --url "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.url}' | base64 -d)" --user svc
+./bin/cpdctl config profile use svc-check
+./bin/cpdctl project list          # must list the projects to back up — and only those
+```
+
+### Grant the service user `manage_project` — REQUIRED
+
+The blueprint does not work correctly without it: the keeper would enumerate only the projects it
+already belongs to and would silently back up a subset of the cluster.
+`manage_project` is not in any of the eight built-in roles, so you have to create a role for it.
+The permission catalog validates names strictly — `manage_projects` (plural) is rejected with
+*"Request body contains permissions that are not known to the platform"*; the accepted names are
+**`manage_project`** and **`monitor_project`**:
+
+```bash
+# 1. Create a role carrying cluster-wide project visibility.
+ROLE_ID=$(curl -sSk -X POST "https://${CPD_HOST}/usermgmt/v1/role" \
+  -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
+  -d '{"role_name":"Backup Reader","description":"Cluster-wide project visibility for the backup keeper",
+       "permissions":["manage_project","sign_in_only"]}' | jq -r '.id')
+
+# 2. Assign it when authorizing the service user (POST /usermgmt/v1/user takes user_roles).
+#    Updating an existing user's roles via PUT is schema-picky — set the role at creation time,
+#    or change it in the UI (Access control -> the user -> Roles).
+```
+
+Verified: a user holding `manage_project` and a member of **no** projects listed every project in
+the cluster, while the same user without it saw only its own.
+
+### Coverage is handled by the blueprint
+
+You do **not** need to add the service user to each project by hand.
+[orchestrate.sh](images/cp4d-backup/orchestrate.sh) does it on every run: it enumerates all
+projects, lists the ones it is already an editor on, and enrols itself on the difference before
+launching any export pod. Validated end-to-end on 2026-08-07 — a keeper that was an editor on **0**
+projects enrolled itself on a freshly created project and exported it (145 KB bundle).
+
+If you want to see the current state, or diagnose an enrolment failure, these are the two lists the
+script compares:
+
+```bash
+SVC_USER=<service-user>
+
+# A. Every project in the cluster (this is what manage_project buys you)
+./bin/cpdctl project list --output json \
+  | sed -n '/^{/,$p' | jq -r '.resources[].metadata.guid' | sort > /tmp/visible.txt
+
+# B. The ones it can already export (editor-or-above membership)
+./bin/cpdctl project list --member "$SVC_USER" --roles admin,editor --output json \
+  | sed -n '/^{/,$p' | jq -r '.resources[]?.metadata.guid' | sort > /tmp/exportable.txt
+
+# A - B = what the next run will enrol itself on.
+comm -23 /tmp/visible.txt /tmp/exportable.txt
+```
+
+> `sed -n '/^{/,$p'` guards against a pagination line `cpdctl` can print before the JSON, which
+> otherwise breaks `jq`. Note `comm` requires **sorted** input — without the `sort` it silently
+> reports wrong differences rather than warning.
+
+If enrolment fails, the prehook aborts **before any data moves** with
+`BACKUP PREHOOK FAILED: could not become an editor on N project(s)`. The usual causes are the
+service user missing `manage_project`, or a wrong `uid` in the credential Secret.
+
+**Notes on the two calls**
+
+| | |
+|---|---|
+| **The API key does not expire** | `expire_at` comes back `null`. Unlike the bearer token, it is a long-lived credential — treat the Secret accordingly, and rotate it deliberately. |
+| **The bearer token is short-lived** | The JWT from step 1 carries a **12-hour** lifetime. It is only needed to fetch the key; the keeper never uses it — it authenticates with `--apikey`, which is why no password lives in the cluster. |
+| **`-k` skips TLS verification** | The `cpd` route usually presents the cluster's ingress certificate. Drop `-k` and pass `--cacert <ca.crt>` if you have the CA — leaving `-k` in a scripted, repeatable procedure is a habit worth avoiding. |
+| **Regenerating the key breaks the Secret** | If the service user's API key is regenerated (CP4D UI → *Profile and settings → API key*, or the API), update the Secret — the keeper authenticates with whatever is stored, and a stale key fails at `cpdctl` login time, i.e. inside `backupPrehook`, failing the whole backup. |
+| **Don't leave the key in your shell history** | The commands above keep it in a variable rather than on a command line. If you paste a key literally, clear it afterwards. |
+
+> **Endpoints verified** against CP4D 5.2.x on 2026-08-07: `POST /icp4d-api/v1/authorize` → `200`
+> with a `token`; `GET /usermgmt/v1/user/apiKey` → `200` with `apiKey` + `expire_at`.
 
 ### 3. Namespace, keeper ServiceAccount, and scoped RBAC
 
@@ -236,7 +410,7 @@ The hook attaches at `spec.actions[].backupParameters.hooks.preHook` = `{bluepri
 
 | Action | Trigger | What it does |
 |---|---|---|
-| `backupPrehook` | Before Kasten's PVC discovery/snapshot | Runs `orchestrate.sh`: authenticates cpdctl (cross-ns secret), enumerates all CP4D analytics projects, ensures one permanent GUID-keyed PVC per project, launches one export pod per project (bounded concurrency, one retry, atomic unzip to `/backup/current`), prunes PVCs of deleted projects, deletes export pods so nothing sensitive is captured. Exits non-zero (fails the whole backup) if any project fails to export. |
+| `backupPrehook` | Before Kasten's PVC discovery/snapshot | Runs `orchestrate.sh`: authenticates cpdctl (cross-ns secret), enumerates **all** CP4D analytics projects, **enrols itself as editor on any project it is not already a member of** (aborting before any data moves if that fails), ensures one permanent GUID-keyed PVC per project, launches one export pod per project (bounded concurrency, one retry, atomic unzip to `/backup/current`), prunes PVCs of deleted projects, deletes export pods so nothing sensitive is captured. Exits non-zero (fails the whole backup) if any project fails to enrol or export. |
 
 > There is **no restore action in the blueprint**. Restore is deliberately handled by the
 > standalone [restore.sh](restore.sh), not a Kasten restore hook — more robust and a better fit for
@@ -441,6 +615,21 @@ kubectl get restorepoint -n cp4d-projects-backup
 project, all CSI-snapshotted into one restore point; a granular cross-namespace restore of a single
 PVC + `restore.sh` recreated the project with its notebook, job, file data asset, connected data
 asset, and connection.
+
+**Self-enrolment re-validated on 2026-08-07** (keeper image `1.8.244-3`). A project was created by a
+*different* user (`cp4dsvc`) with one data asset; the keeper (`cpadmin`, holding `manage_project`)
+was **not** a member of it. After one `RunAction`:
+
+| Check | Result |
+|---|---|
+| Keeper added to the foreign project | `cpadmin role=editor state=ACTIVE` — added automatically |
+| Foreign project got its own PVC | `cp4d-e2e-foreign-project-ace60e4e` |
+| Bundle written to that PVC | 76 files, `.cp4d-project-name=e2e-foreign-project`, the uploaded data asset present under `assets/.METADATA/` |
+| An **empty** project in the same run | PVC created, export skipped, backup still succeeded (`SPACES0046E` is treated as a no-op) |
+| Stale PVCs of deleted projects | pruned |
+
+That is the whole point of the design: a project nobody granted the keeper access to was protected
+on the next backup with no operator action.
 
 ---
 
