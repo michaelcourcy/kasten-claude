@@ -21,17 +21,17 @@ into a namespace, and recreate the projects with a script.
 
 ```
                           cp4d namespace                      cp4d-projects-backup namespace
-                     ┌──────────────────────┐            ┌──────────────────────────────────────┐
-   Kasten policy     │  CP4D / Watson Studio │            │  1 PVC per project (permanent, GUID-  │
-   (backup ns) ─────▶│  projects + cpdctl API│            │  keyed): cp4d-<name>-<guid>           │
-        │            │                       │            │   ├─ cp4d-my-new-project-21a0ff72      │
-        │ preHook    │  cred secret          │            │   ├─ cp4d-sales-3f9c1a2b               │
-        ▼            │  cp4d-backup-cpdctl-   │            │   └─ ...                               │
+                     ┌──────────────────────-┐            ┌──────────────────────────────────────┐
+   Kasten policy     │  CP4D / Watson Studio │            │  1 PVC per project (permanent, GUID- │
+   (backup ns) ─────▶│  projects + cpdctl API│            │  keyed): cp4d-<name>-<guid>          │
+        │            │                       │            │   ├─ cp4d-my-new-project-21a0ff72    │
+        │ preHook    │  cred secret          │            │   ├─ cp4d-sales-3f9c1a2b             │
+        ▼            │  cp4d-backup-cpdctl-  │            │   └─ ...                             │
   backupPrehook      │  creds (OUTSIDE the   │            └──────────────────────────────────────┘
   (action hook)      │  backed-up namespace) │                         ▲   Kasten snapshots these PVCs
         │            └──────────┬────────────┘                         │
-        │ runs orchestrate.sh              reads cred secret            │ one export pod per project
-        │ (KubeTask in kasten-io,          cross-namespace (RBAC)       │ (keeper SA), writes the
+        │ runs orchestrate.sh              reads cred secret           │ one export pod per project
+        │ (KubeTask in kasten-io,          cross-namespace (RBAC)      │ (keeper SA), writes the
         │  cluster-wide Kasten SA)  ───────────────────────────────────┘ UNZIPPED cpdctl export to /backup/current
         ▼
   enumerate projects → ensure PVC per project → launch export pods → wait → prune → cleanup pods
