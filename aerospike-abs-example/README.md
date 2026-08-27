@@ -52,9 +52,30 @@ The `kasten-tools` tag **must** equal that version — see
 
 ### Why not snapshot the Aerospike volumes
 
-Aerospike stores namespace data on **raw block devices, one PVC per pod**, and each node holds only
-its own subset of the 4096 partitions. A single PVC snapshot *is* crash-consistent within that
-volume, but that is not sufficient:
+The first reason is the decisive one, and it comes from Aerospike's own solution architects.
+
+**On the deployments that most need a backup, there is nothing to snapshot.** Aerospike is chosen for
+latency, and that pushes operators to put the namespace data on **local NVMe attached directly to the
+worker node** rather than on network-attached storage, which adds latency and caps IOPS. Local
+instance storage has no snapshot API and no CSI driver offering `VolumeSnapshot`, so no
+snapshot-based backup is possible at all — not unreliable, simply unavailable. It also means
+**losing the node loses the data**: there is no volume to re-attach elsewhere. For these clusters a
+logical backup is not an optimisation, it is the only protection that exists. The target deployment
+for this blueprint is exactly that shape: ~40 TB across ~30 nodes, all on local NVMe.
+
+> **Do not confuse local NVMe with the NVMe protocol.** On AWS Nitro instances, network-attached EBS
+> volumes also appear as `/dev/nvme*` devices. Those *can* be snapshotted. What cannot be snapshotted
+> is **instance store** — physically attached, ephemeral, gone when the instance goes. Check whether
+> the device is backed by a PVC with a snapshot-capable CSI driver, not what the device is called.
+
+> ⚠️ **Consequence for the keeper.** If the database is on local NVMe, the keeper PVC must **not** be.
+> Put it on network-attached, snapshot-capable storage, or you have recreated the original problem:
+> a dump that Kasten cannot snapshot and that dies with its node.
+
+Even where the data volumes *are* snapshot-capable, as on the EBS-backed test cluster used here,
+snapshotting them is still the wrong choice. Aerospike stores namespace data on **raw block devices,
+one PVC per pod**, and each node holds only its own subset of the 4096 partitions. A single PVC
+snapshot *is* crash-consistent within that volume, but that is not sufficient:
 
 - **No cross-volume/cross-node consistency.** Aerospike's own documentation states snapshots are
   *"consistent within a volume, but may not be consistent between volumes"*. A 3-node namespace
@@ -536,12 +557,17 @@ kubectl rollout status statefulset/aerospike-backup-keeper -n aerospike-test
 - `securityContext.fsGroup: 65532` — absctl runs as `uid=65532(abtuser) gid=65532(abtgroup)`.
 - The image ENTRYPOINT is `absctl` itself, so `command` overrides it with a sleep. The image is
   Alpine — **`/bin/sh` only, no bash**, and no `jq`, `curl` or `kando`.
-- The PVC holds exactly **one** dump (`--remove-files` overwrites in place), so size for the dump,
-  not for a retention chain.
+- Each PVC holds a whole **chain** for its own partition range — the newest full plus the
+  incrementals after it — not a single dump. Size it for
+  `(dataset / replicas) x (fulls retained) + incremental headroom`.
 - The volumeClaimTemplate is labelled `app=aerospike-backup-keeper`, deliberately **not**
   `app=aerospike-cluster`, which is what the policy excludes.
 - `ABSCTL_INCREMENTALS_BEFORE_FULL` controls the chain length — see
   [Incremental chains](#incremental-chains). Each PVC must hold a whole chain, not one dump.
+- **The keeper PVC must be on snapshot-capable, network-attached storage** — never on local NVMe,
+  even when the database is. Kasten protects the data by snapshotting *this* volume; if it cannot be
+  snapshotted there is no backup. See
+  [Why not snapshot the Aerospike volumes](#why-not-snapshot-the-aerospike-volumes).
 - `replicas` controls the number of partition backup-shards — see [Partition backup-shards](#backup-shards).
   Each replica gets its own PVC from the `volumeClaimTemplate`, so a backup-shard needs roughly
   `dataset / replicas` per chain member. Changing `replicas` **wipes every volume and forces a full**.
@@ -583,28 +609,38 @@ kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=aerospike-test
 
 ## Step 3 — Validate the workflow without a blueprint
 
+> **Use a scratch directory, not the chain layout.** The blueprint owns
+> `/backup/<namespace>/{full,incr}-<timestamp>/` and enumerates the top level of `/backup` to
+> discover namespaces. A hand-made directory there would be mistaken for a namespace. Write manual
+> tests to a **dot-directory**, which `ls -1` does not list and the blueprint therefore ignores.
+
 ```bash
 SEED=aerocluster.aerospike-test.svc.cluster.local
 POD=aerospike-backup-keeper-0
+SCRATCH=/backup/.manual          # dot-directory: invisible to the blueprint
 
 # Which namespaces exist?
 kubectl exec -n aerospike-test aerocluster-0-0 -c aerospike-server -- asinfo -v namespaces
 
-# Dump one namespace
+# Dump one namespace. --remove-files makes repeated manual runs idempotent; the
+# blueprint does NOT use it, because each chain member is a new directory.
 kubectl exec -n aerospike-test $POD -c absctl -- \
-  absctl backup --host $SEED --port 3000 -n test -d /backup/test --remove-files --parallel 4
+  absctl backup --host $SEED --port 3000 -n test -d $SCRATCH --remove-files --parallel 4
 
 # CRITICAL: flush the page cache before snapshotting (see the warning in Step 4)
 kubectl exec -n aerospike-test $POD -c absctl -- sync
 
 # Inspect
-kubectl exec -n aerospike-test $POD -c absctl -- sh -c 'ls -l /backup/test; du -sk /backup/test'
+kubectl exec -n aerospike-test $POD -c absctl -- sh -c "ls -l $SCRATCH; du -sk $SCRATCH"
 
 # Truncate and restore
 kubectl exec -n aerospike-test aerocluster-0-0 -c aerospike-server -- \
   asinfo -v "truncate-namespace:namespace=test"
 kubectl exec -n aerospike-test $POD -c absctl -- \
-  absctl restore --host $SEED --port 3000 -n test -d /backup/test --parallel 4
+  absctl restore --host $SEED --port 3000 -n test -d $SCRATCH --parallel 4
+
+# Clean up so it cannot be confused with a real chain
+kubectl exec -n aerospike-test $POD -c absctl -- rm -rf $SCRATCH
 ```
 
 Emulate what Kasten does to the keeper PVC with a CSI snapshot, following
