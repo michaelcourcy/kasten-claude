@@ -1,0 +1,100 @@
+---
+# 3-node Aerospike Enterprise cluster managed by AKO.
+#
+# FEATURE KEY — IMPORTANT
+# -----------------------
+# You MUST mount your own features.conf as a secret. The evaluation key bundled
+# in the aerospike-server-enterprise image at /etc/aerospike/features.conf is
+# NOT usable under AKO: AKO mounts an emptyDir named "confdir" at /etc/aerospike
+# in the aerospike-server container, which overlays the image's directory and
+# hides the bundled file. Omitting feature-key-file therefore fails with:
+#
+#   unable to open file /etc/aerospike/features.conf: No such file or directory
+#
+# Create the secret from your feature-key file before applying this manifest:
+#
+#   kubectl create secret generic aerospike-secret -n aerospike-test \
+#     --from-file=features.conf=<path-to-your-features.conf>
+#
+# size must not exceed the asdb-cluster-nodes-limit of your key.
+apiVersion: asdb.aerospike.com/v1
+kind: AerospikeCluster
+metadata:
+  name: aerocluster
+  namespace: aerospike-test
+spec:
+  size: 3
+  image: aerospike/aerospike-server-enterprise:8.1.2.4
+
+  storage:
+    filesystemVolumePolicy:
+      initMethod: deleteFiles
+      cascadeDelete: true
+    blockVolumePolicy:
+      # MUST zeroize. A freshly provisioned EBS block volume contains non-zero
+      # data, and Aerospike refuses to use a device that is neither already an
+      # Aerospike device nor erased:
+      #   CRITICAL (drv_ssd): /test/dev/xvdf: not an Aerospike device but not
+      #   erased - check config or erase device
+      # AKO supports only "dd" or "blkdiscard" for block volumes. EBS does not
+      # reliably support discard/TRIM, so use dd.
+      initMethod: dd
+      cascadeDelete: true
+    volumes:
+      # Aerospike work directory (smd, udf) — filesystem volume.
+      - name: workdir
+        aerospike:
+          path: /opt/aerospike
+        source:
+          persistentVolume:
+            storageClass: ebs-sc
+            volumeMode: Filesystem
+            size: 2Gi
+      # Namespace data device — RAW BLOCK device, no filesystem.
+      # These are the PVCs that must be EXCLUDED from the Kasten policy:
+      # see "Why not snapshot the Aerospike device PVCs" in README.md.
+      - name: nsdata
+        aerospike:
+          path: /test/dev/xvdf
+        source:
+          persistentVolume:
+            storageClass: ebs-sc
+            volumeMode: Block
+            size: 10Gi
+      # Feature-key file mounted from the aerospike-secret secret.
+      - name: aerospike-config-secret
+        source:
+          secret:
+            secretName: aerospike-secret
+        aerospike:
+          path: /etc/aerospike/secret
+
+  podSpec:
+    multiPodPerHost: true
+    aerospikeContainer:
+      resources:
+        requests:
+          cpu: 200m
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+
+  aerospikeConfig:
+    service:
+      feature-key-file: /etc/aerospike/secret/features.conf
+      cgroup-mem-tracking: true
+    network:
+      service:
+        port: 3000
+      fabric:
+        port: 3001
+      heartbeat:
+        port: 3002
+    namespaces:
+      - name: test
+        replication-factor: 2
+        storage-engine:
+          type: device
+          devices:
+            - /test/dev/xvdf

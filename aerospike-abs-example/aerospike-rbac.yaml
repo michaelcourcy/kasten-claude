@@ -1,0 +1,30 @@
+---
+# RBAC for the Aerospike cluster pods.
+#
+# NOTE: the AKO documentation's "namespace-scoped access" snippet creates only a
+# RoleBinding. That is NOT sufficient: the aerospike-init container calls
+# `akoinit` which lists `nodes` at CLUSTER scope, and a RoleBinding can never
+# grant access to a cluster-scoped resource. Without the ClusterRoleBinding below
+# the init container crash-loops with:
+#
+#   Error: nodes is forbidden: User
+#   "system:serviceaccount:aerospike-test:aerospike-operator-controller-manager"
+#   cannot list resource "nodes" in API group "" at the cluster scope
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aerospike-operator-controller-manager
+  namespace: aerospike-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aerospike-cluster-aerospike-test
+subjects:
+  - kind: ServiceAccount
+    name: aerospike-operator-controller-manager
+    namespace: aerospike-test
+roleRef:
+  kind: ClusterRole
+  name: aerospike-cluster
+  apiGroup: rbac.authorization.k8s.io

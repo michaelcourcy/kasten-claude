@@ -1,0 +1,67 @@
+---
+# Kasten backup + export policy for the aerospike-test namespace.
+#
+# Three things make this policy correct:
+#
+# 1. backupParameters.profile MUST be a Location profile (S3/GCS/Azure Blob), not
+#    an Infra profile. Only a Location profile is recorded in the
+#    RestorePointContent in a Kanister-compatible form, which is what lets
+#    restorePosthook run at all.
+#    Check with: kubectl get profile <name> -n kasten-io -o jsonpath='{.spec.type}'
+#
+# 2. The Aerospike PVCs MUST be excluded. They are raw block devices holding a
+#    per-node subset of partitions, with no cross-volume consistency and no
+#    coverage of system metadata. Restoring them would bring the cluster up with
+#    stale records that the additive absctl restore would not remove. Excluding
+#    them means the cluster comes back empty and the .asb dump on the keeper PVC
+#    is the single source of truth.
+#
+#    The AKO-provisioned PVCs (nsdata-* and workdir-*) all carry the label
+#    app=aerospike-cluster. The keeper PVC carries app=aerospike-backup-keeper,
+#    so it stays in the snapshot.
+#
+# 3. The export action is REQUIRED to measure deduplication (Step 6 of
+#    AGENTS.md). Deduplication happens on export to object storage; a
+#    snapshot-only policy exports nothing and cannot be measured. It is also what
+#    makes the restore points durable beyond the cluster.
+#
+# NOTE ON exportParameters: no migrationToken is needed in this manifest. Kasten
+# generates one on admission — after applying, the policy shows
+#   exportParameters.migrationToken: aerospike-absctl-backup-lab-s3-migration-token
+# Verify the policy validated before running it:
+#   kubectl get policy aerospike-absctl-backup -n kasten-io -o jsonpath='{.status.validation}'
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: Policy
+metadata:
+  name: aerospike-absctl-backup
+  namespace: kasten-io
+spec:
+  comment: >-
+    Aerospike via absctl keeper PVC (pattern 4). Full logical dump every run;
+    the Aerospike raw block device PVCs are excluded on purpose.
+  frequency: "@onDemand"
+  actions:
+    - action: backup
+      backupParameters:
+        profile:
+          name: lab-s3
+          namespace: kasten-io
+        filters:
+          excludeResources:
+            - resource: persistentvolumeclaims
+              matchLabels:
+                app: aerospike-cluster
+    - action: export
+      exportParameters:
+        frequency: "@onDemand"
+        profile:
+          name: lab-s3
+          namespace: kasten-io
+        exportData:
+          enabled: true
+  selector:
+    matchExpressions:
+      - key: k10.kasten.io/appNamespace
+        operator: In
+        values:
+          - aerospike-test

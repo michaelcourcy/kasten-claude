@@ -1,0 +1,164 @@
+---
+# absctl KEEPER — pattern 4 (permanent Keeper PVC).
+#
+# WHY A KEEPER AT ALL
+#   Kasten's PVC discovery runs BEFORE backupPrehook, so the backup volume must
+#   already exist and be owned by a workload when discovery happens. The keeper's
+#   only job is to keep that PVC mounted so Kasten finds it through the
+#   StatefulSet's ownership chain, and to provide a stable container that has
+#   absctl on its PATH.
+#
+# WHY A StatefulSet AND NOT A Deployment
+#   A StatefulSet gives a DETERMINISTIC pod name (aerospike-backup-keeper-0), so
+#   the blueprint never has to discover it. It also sets up the partitioned
+#   variant (one PVC and one partition range per replica) without changing shape.
+#
+# WHY absctl AND NOT THE AEROSPIKE BACKUP SERVICE
+#   ABS is a lifecycle manager: it owns its own cron schedules and its own
+#   retention. Inside a Kasten blueprint that is a category error — Kasten owns
+#   backup frequency and retention. Running ABS alongside a Kasten policy means
+#   two schedulers and two retention regimes over the same bytes.
+#
+#   absctl is the primitive: one invocation, one backup, no opinions about time.
+#   Every run writes a COMPLETE dump over the previous one (--remove-files), so:
+#     - there is no chain, no chain state, and nothing to prune
+#     - a restore point is always self-contained
+#     - deleted records can never be resurrected (no incremental chain => the
+#       "Gap A" problem documented in earlier revisions of this blueprint is gone)
+#     - the Aerospike namespace list is discovered from the live cluster, so a
+#       namespace can never be silently left unprotected
+#
+#   The cost is that each run rewrites the dump. Whether that is expensive
+#   depends entirely on how well Kasten's Kopia export deduplicates it — which
+#   is measured, not assumed. See "Export deduplication" in README.md.
+apiVersion: v1
+kind: Service
+metadata:
+  # Headless service, required by the StatefulSet. Not used by the blueprint
+  # (which reaches the keeper through kubectl exec, not the network) but it gives
+  # the pod stable DNS and is needed for the partitioned variant.
+  name: aerospike-backup-keeper
+  namespace: aerospike-test
+  labels:
+    app: aerospike-backup-keeper
+spec:
+  clusterIP: None
+  selector:
+    app: aerospike-backup-keeper
+  ports:
+    - name: placeholder
+      port: 9999
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aerospike-backup-keeper
+  namespace: aerospike-test
+  labels:
+    app: aerospike-backup-keeper
+    # Selector used by the BlueprintBinding in blueprintbinding.yaml.
+    aerospike-absctl-keeper: "true"
+spec:
+  serviceName: aerospike-backup-keeper
+  # 1 replica = the whole keyspace in one dump. The partitioned variant raises
+  # this and gives each replica its own partition range.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aerospike-backup-keeper
+  template:
+    metadata:
+      labels:
+        app: aerospike-backup-keeper
+    spec:
+      securityContext:
+        # absctl runs as uid=65532(abtuser) gid=65532(abtgroup); fsGroup makes
+        # the mounted PVC group-writable for it.
+        fsGroup: 65532
+      containers:
+        - name: absctl
+          image: aerospike/absctl:v1.1.0
+          # The image ENTRYPOINT is absctl itself. Override it: the keeper only
+          # has to stay alive and hold the volume. Alpine base — /bin/sh only,
+          # there is no bash in this image.
+          command: ["/bin/sh", "-c", "trap : TERM INT; sleep infinity & wait"]
+          env:
+            # ---------------------------------------------------------------
+            # INCREMENTAL CHAIN LENGTH
+            # ---------------------------------------------------------------
+            # How many incremental backups to take before forcing a new full.
+            #   0  = never take an incremental; every run is a full dump
+            #   3  = full, incr, incr, incr, then full again (and prune)
+            #
+            # The blueprint reads this value from the RUNNING pod
+            # (kubectl exec -- printenv), so changing it here and rolling the
+            # StatefulSet is enough — the blueprint needs no edit.
+            #
+            # Trade-off. A longer chain transfers far less on export, but widens
+            # the window in which a DELETED record can be resurrected by a
+            # restore: absctl incrementals carry changed and new records, never
+            # deletions. The next full "heals" that window, so this value is
+            # effectively the maximum exposure.
+            #
+            # 3 is the shipped default because operators of this workload class
+            # generally accept that trade: Aerospike is usually a serving or
+            # session layer where records are re-derivable and the objective is
+            # fast recovery, not exact deletion history. Set 0 when a deletion
+            # must never come back (compliance erasure, or a namespace holding
+            # the authoritative copy of something) - at the cost of a full
+            # export every run.
+            - name: ABSCTL_INCREMENTALS_BEFORE_FULL
+              value: "3"
+            # ---------------------------------------------------------------
+            # SCAN CONCURRENCY  --  size against the DATABASE, not the keeper
+            # ---------------------------------------------------------------
+            # Total scan threads hitting the Aerospike cluster is
+            #   replicas x ABSCTL_PARALLEL_PER_BACKUP_SHARD
+            # Over-subscribe it and backup-shards do not just stop getting faster, they
+            # FAIL: "ResultCode: TIMEOUT ... MAX_RETRIES_EXCEEDED". Measured on a
+            # 3-node cluster capped at 2 vCPU per pod, 4 backup-shards x 4 threads = 16
+            # killed every backup-shard; 4 backup-shards x 1 thread succeeded.
+            #
+            # Rule of thumb: keep replicas x parallel at or below the total vCPU
+            # the Aerospike pods can actually spare for scanning, then raise it
+            # while watching for TIMEOUT in the blueprint logs.
+            - name: ABSCTL_PARALLEL_PER_BACKUP_SHARD
+              value: "4"
+            # Client socket timeout for record reads. The default 10s is too
+            # tight once several backup-shards compete for the same nodes.
+            - name: ABSCTL_SOCKET_TIMEOUT_MS
+              value: "60000"
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # absctl does the scan, compression and write, so give it real
+              # headroom. Raise for large namespaces.
+              cpu: "2"
+              memory: 2Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: backup
+        labels:
+          # Deliberately NOT app=aerospike-cluster: that label is what the Kasten
+          # policy excludes. This PVC must stay IN the backup.
+          app: aerospike-backup-keeper
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ebs-sc
+        resources:
+          requests:
+            # Holds exactly ONE full logical dump (--remove-files overwrites in
+            # place), so size for the dump, not for a retention chain:
+            #   size >= logical dataset size * safety factor
+            # Sizing. Each backup-shard holds a whole CHAIN for its own partition
+            # range: retention.full copies of (dataset / replicas) plus the
+            # incrementals between them. 20Gi here holds a ~5GB single-shard
+            # dump with room for a chain; at replicas=4 each backup-shard needs only a
+            # quarter of that, so the same template is generous.
+            storage: 20Gi

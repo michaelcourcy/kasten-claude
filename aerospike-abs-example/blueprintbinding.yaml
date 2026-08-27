@@ -1,0 +1,33 @@
+---
+# Binds the Aerospike absctl blueprint to the keeper StatefulSet.
+#
+# The binding targets the KEEPER, not the AerospikeCluster CR. That is what
+# preserves SRP/OCP: adding another workload type to the cluster never requires
+# touching this blueprint, and the Aerospike CR stays free of Kasten annotations.
+#
+# The DoesNotExist condition on kanister.kasten.io/blueprint leaves an escape
+# hatch: annotate a specific keeper with that annotation and this binding stops
+# targeting it, so a more specific blueprint can take over.
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: aerospike-absctl-keeper-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: aerospike-absctl-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: statefulsets
+      - labels:
+          key: aerospike-absctl-keeper
+          operator: In
+          values: ["true"]
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

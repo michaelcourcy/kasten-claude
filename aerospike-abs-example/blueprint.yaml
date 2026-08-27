@@ -1,0 +1,697 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: aerospike-absctl-blueprint
+  namespace: kasten-io
+# ---------------------------------------------------------------------------
+# Pattern 4 — Database dump on a permanent Keeper PVC, using absctl.
+# 
+# WHY NOT SNAPSHOT THE AEROSPIKE VOLUMES
+#   Aerospike stores namespace data on RAW BLOCK devices, one PVC per pod, and
+#   each node holds only its own subset of the 4096 partitions. An individual PVC
+#   snapshot IS crash-consistent within that one volume, but that is not enough:
+#     - No cross-volume/cross-node consistency. Aerospike's own docs state that
+#       snapshots are "consistent within a volume, but may not be consistent
+#       between volumes"; a 3-node namespace needs 6 volumes (nsdata + workdir)
+#       cut at the same instant, which plain CSI VolumeSnapshot does not provide.
+#     - Crash-consistent != no acknowledged writes lost. Writes sit in an 8MiB
+#       streaming write buffer until it fills or flush-max-ms expires, so a block
+#       snapshot cannot see them without commit-to-device.
+#     - System metadata (SMD) lives on the workdir volume and Aerospike documents
+#       it as NOT covered by snapshot-based backup.
+#   So the Aerospike device PVCs are EXCLUDED from the policy and absctl produces
+#   a logical dump onto a permanent keeper PVC that Kasten snapshots instead.
+#
+# WHY absctl AND NOT THE AEROSPIKE BACKUP SERVICE
+#   ABS owns cron schedules and retention. Inside a Kasten blueprint that means
+#   two schedulers and two retention regimes over the same bytes. absctl is the
+#   primitive: one invocation, one backup, no opinions about time. Kasten owns
+#   frequency and retention, exclusively.
+#
+# FULL DUMP EVERY RUN
+#   Each run rewrites the dump in place (--remove-files). Consequences:
+#     - no chain, no chain state, nothing to prune
+#     - every restore point is self-contained
+#     - deleted records can NEVER be resurrected (there is no incremental chain)
+#     - the namespace list is discovered from the live cluster, so a namespace
+#       cannot be silently left unprotected
+#   The apparent cost — rewriting the dump every run — is largely absorbed by
+#   Kasten's content-addressed Kopia export. That is measured, not assumed:
+#   see "Export deduplication" in README.md.
+#
+# EVERYTHING IS DISCOVERED, NOTHING IS CONFIGURED
+#   - keeper pod          : <StatefulSet name>-0 (deterministic, no discovery)
+#   - Aerospike server pod: label app=aerospike-cluster in the same namespace
+#   - seed host           : the aerospike.com/cr label on those pods gives the
+#                           AerospikeCluster name, which is also its headless
+#                           Service name
+#   - Aerospike namespaces: asinfo -v namespaces (backup) / the directories
+#                           present on the keeper PVC (restore)
+#   There is no ConfigMap, no annotation and no hardcoded hostname to drift.
+#
+# ONE IMAGE
+#   ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.4 provides kubectl, jq and
+#   kando. Phases run as KubeTask in kasten-io so they inherit the Kanister
+#   service account, which has the cross-namespace pods/exec permission this
+#   design needs. absctl lives in the keeper pod and asinfo in the Aerospike
+#   server pods; both are reached with kubectl exec, so no custom image is built
+#   and no tool is duplicated.
+# ---------------------------------------------------------------------------
+actions:
+
+  # =========================================================================
+  # backupPrehook — runs BEFORE Kasten snapshots the keeper PVC.
+  # Produces a complete logical dump of every Aerospike namespace.
+  # =========================================================================
+  backupPrehook:
+    outputArtifacts:
+      aerospikeBackup:
+        keyValue:
+          keeper: "{{ .Phases.absctlBackup.Output.keeper }}"
+          namespace: "{{ .Phases.absctlBackup.Output.namespace }}"
+          cluster: "{{ .Phases.absctlBackup.Output.cluster }}"
+          namespaces: "{{ .Phases.absctlBackup.Output.namespaces }}"
+          dumpKiB: "{{ .Phases.absctlBackup.Output.dumpKiB }}"
+          summary: "{{ .Phases.absctlBackup.Output.summary }}"
+    phases:
+      - func: KubeTask
+        name: absctlBackup
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.4
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              # Disable pathname expansion: namespace names are word-split below
+              # and must never be treated as globs.
+              set -f
+
+              KEEPER="{{ .Object.metadata.name }}"
+              NS="{{ .Object.metadata.namespace }}"
+              POD="${KEEPER}-0"
+
+              echo "Keeper StatefulSet=${KEEPER} pod=${POD} namespace=${NS}"
+
+              # --- Wait for the keeper pod ---------------------------------
+              # Poll rather than `kubectl wait`: wait errors out immediately if
+              # the pod does not exist YET, which happens whenever the keeper
+              # StatefulSet pod is being (re)created.
+              echo "Waiting for keeper pod ${POD} to be ready (timeout 5m)..."
+              ELAPSED=0
+              while [ "${ELAPSED}" -lt 300 ]; do
+                READY=$(kubectl get pod "${POD}" -n "${NS}" \
+                  -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+                [ "${READY}" = "true" ] && break
+                sleep 5; ELAPSED=$((ELAPSED + 5))
+              done
+              if [ "${READY}" != "true" ]; then
+                echo "ERROR: keeper pod ${POD} did not become ready within 5m."
+                echo "The keeper is a StatefulSet, so its pod name is <name>-0."
+                kubectl get pods -n "${NS}" -l app=aerospike-backup-keeper || true
+                exit 1
+              fi
+              echo "Keeper pod ready."
+
+              # --- Discover the Aerospike cluster --------------------------
+              # AKO labels every server pod app=aerospike-cluster and records the
+              # AerospikeCluster name in aerospike.com/cr. That CR name is also
+              # the name of the headless Service, which is the seed host.
+              SRV_POD=$(kubectl get pods -n "${NS}" -l app=aerospike-cluster \
+                -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+                | awk '$2=="true"{print $1; exit}')
+              if [ -z "${SRV_POD}" ]; then
+                echo "ERROR: no ready Aerospike server pod found in ${NS} (label app=aerospike-cluster)."
+                exit 1
+              fi
+              CR=$(kubectl get pod "${SRV_POD}" -n "${NS}" \
+                -o jsonpath='{.metadata.labels.aerospike\.com/cr}')
+              if [ -z "${CR}" ]; then
+                echo "ERROR: pod ${SRV_POD} has no aerospike.com/cr label; cannot derive the seed host."
+                exit 1
+              fi
+              SEED="${CR}.${NS}.svc.cluster.local"
+              echo "Aerospike server pod=${SRV_POD} cluster=${CR} seed=${SEED}:3000"
+
+              # --- Discover the Aerospike namespaces ----------------------
+              # Read from the live cluster, so a namespace added to the database
+              # is protected automatically with no configuration change.
+              NAMESPACES=$(kubectl exec -n "${NS}" "${SRV_POD}" -c aerospike-server -- \
+                asinfo -v namespaces | tr -d '\r' | tr ';' ' ')
+              if [ -z "${NAMESPACES// /}" ]; then
+                echo "ERROR: asinfo reported no Aerospike namespaces on ${CR}."
+                exit 1
+              fi
+              echo "Aerospike namespaces to back up: ${NAMESPACES}"
+
+              # --- Dump each namespace ------------------------------------
+              # --remove-files replaces the previous dump in place, so the PVC
+              # holds exactly one complete dump per namespace and the file paths
+              # are stable across runs (which is what lets Kopia deduplicate).
+              # --- Replica count = number of partition backup-shards ---------------
+              # Each StatefulSet replica owns a fixed slice of the namespace's
+              # 4096 partitions and writes to its OWN PVC. replicas=1 is the
+              # degenerate case: one backup-shard covering 0-4096, which absctl treats
+              # exactly as "no partition filter".
+              REPLICAS=$(kubectl get statefulset "${KEEPER}" -n "${NS}" \
+                -o jsonpath='{.spec.replicas}' | tr -d '\r ')
+              case "${REPLICAS}" in ''|*[!0-9]*) REPLICAS=1 ;; esac
+              if [ "$((4096 % REPLICAS))" -ne 0 ]; then
+                echo "ERROR: replicas=${REPLICAS} does not divide 4096 evenly."
+                echo "       Use a power of two (1, 2, 4, 8, 16, 32 ...) so the"
+                echo "       4096 partitions tile exactly with no gap or overlap."
+                exit 1
+              fi
+              BACKUP_SHARD=$((4096 / REPLICAS))
+              echo "Keeper replicas: ${REPLICAS} -> ${BACKUP_SHARD} partitions per backup-shard"
+
+              # --- Scan concurrency, read from the RUNNING keeper -----------
+              # THE AEROSPIKE CLUSTER IS THE SHARED RESOURCE, NOT THE KEEPER.
+              # Total scan concurrency is REPLICAS x PARALLEL. Over-subscribe it
+              # and the backup-shards do not merely stop getting faster — they FAIL with
+              #   ResultCode: TIMEOUT ... MAX_RETRIES_EXCEEDED
+              # Observed on a 3-node cluster limited to 2 vCPU per pod: 4 backup-shards
+              # x parallel 4 = 16 scan threads killed every backup-shard. Size
+              # REPLICAS x PARALLEL against the database's capacity.
+              PARALLEL=$(kubectl exec -n "${NS}" "${KEEPER}-0" -c absctl -- \
+                sh -c 'printenv ABSCTL_PARALLEL_PER_BACKUP_SHARD 2>/dev/null || echo 4' \
+                | tr -d '\r ')
+              case "${PARALLEL}" in ''|*[!0-9]*) PARALLEL=4 ;; esac
+              SOCKET_TIMEOUT=$(kubectl exec -n "${NS}" "${KEEPER}-0" -c absctl -- \
+                sh -c 'printenv ABSCTL_SOCKET_TIMEOUT_MS 2>/dev/null || echo 60000' \
+                | tr -d '\r ')
+              case "${SOCKET_TIMEOUT}" in ''|*[!0-9]*) SOCKET_TIMEOUT=60000 ;; esac
+              echo "Per-shard scan threads: ${PARALLEL} (total across backup-shards: $((REPLICAS * PARALLEL)))"
+              echo "absctl socket timeout: ${SOCKET_TIMEOUT} ms"
+
+              # --- Incremental chain length, read from the RUNNING keeper ---
+              MAXINCR=$(kubectl exec -n "${NS}" "${KEEPER}-0" -c absctl -- \
+                sh -c 'printenv ABSCTL_INCREMENTALS_BEFORE_FULL 2>/dev/null || echo 0' \
+                | tr -d '\r ')
+              case "${MAXINCR}" in ''|*[!0-9]*) MAXINCR=0 ;; esac
+              echo "Incrementals before a forced full: ${MAXINCR} (0 = always full)"
+
+              # One UTC stamp for the whole run, so every backup-shard's chain member
+              # for this run carries the same name and the chains stay aligned.
+              STAMP=$(kubectl exec -n "${NS}" "${KEEPER}-0" -c absctl -- \
+                date -u +%Y%m%dT%H%M%SZ | tr -d '\r ')
+              echo "Run stamp: ${STAMP}"
+
+              stamp_to_absctl() {
+                echo "$1" | sed -E 's/^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$/\1-\2-\3_\4:\5:\6/'
+              }
+
+              # --- Wait for every replica to be ready ----------------------
+              for i in $(seq 0 $((REPLICAS - 1))); do
+                P="${KEEPER}-${i}"
+                ELAPSED=0
+                while [ "${ELAPSED}" -lt 300 ]; do
+                  RDY=$(kubectl get pod "${P}" -n "${NS}" \
+                    -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+                  [ "${RDY}" = "true" ] && break
+                  sleep 5; ELAPSED=$((ELAPSED + 5))
+                done
+                if [ "${RDY}" != "true" ]; then
+                  echo "ERROR: keeper pod ${P} not ready after 5m."
+                  exit 1
+                fi
+              done
+              echo "All ${REPLICAS} keeper pod(s) ready."
+
+              WORK=$(mktemp -d)
+              SUMMARY=""
+
+              for ASNS in ${NAMESPACES}; do
+                echo "========================================================"
+                echo "Namespace ${ASNS}"
+
+                # --- Decide full vs incremental, per backup-shard -----------------
+                # A backup-shard forces a FULL when any of these hold:
+                #   * it has no full backup yet (new PVC, or first ever run)
+                #   * its chain has reached MAXINCR incrementals
+                #   * its recorded partition range no longer matches the range
+                #     implied by the current replica count  <-- the important one
+                # In the last case the backup-shard's ENTIRE volume is wiped first: a
+                # repartition invalidates every existing chain member, because
+                # the old members cover ranges that no longer exist.
+                REPARTITION=0
+                for i in $(seq 0 $((REPLICAS - 1))); do
+                  P="${KEEPER}-${i}"
+                  WANT_START=$((i * SHARD))
+                  MARK=$(kubectl exec -n "${NS}" "${P}" -c absctl -- \
+                    sh -c "cat /backup/${ASNS}/.partition 2>/dev/null || true" | tr -d '\r' | head -1)
+                  if [ -n "${MARK}" ] && [ "${MARK}" != "${WANT_START} ${BACKUP_SHARD} ${REPLICAS}" ]; then
+                    echo "  backup-shard ${i}: recorded range '${MARK}' != wanted '${WANT_START} ${BACKUP_SHARD} ${REPLICAS}' -> REPARTITION"
+                    REPARTITION=1
+                  fi
+                done
+
+                if [ "${REPARTITION}" -eq 1 ]; then
+                  echo "  Replica count changed. Wiping EVERY backup-shard volume for ${ASNS} and taking a full."
+                  echo "  (A repartition invalidates all existing chain members; mixing ranges would"
+                  echo "   silently produce both gaps and duplicates on restore.)"
+                  for i in $(seq 0 $((REPLICAS - 1))); do
+                    kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- \
+                      sh -c "rm -rf /backup/${ASNS}" || true
+                  done
+                fi
+
+                # Chain state is read from backup-shard 0; all backup-shards advance in
+                # lockstep because the directory is pre-created every run.
+                DIRS=$(kubectl exec -n "${NS}" "${KEEPER}-0" -c absctl -- \
+                  sh -c "ls -1 /backup/${ASNS} 2>/dev/null || true" \
+                  | tr -d '\r' | { grep -E '^(full|incr)-[0-9]{8}T[0-9]{6}Z$' || true; } | sort)
+                NEWEST_FULL=$(echo "${DIRS}" | { grep '^full-' || true; } | tail -1)
+                NEWEST_ANY=$(echo "${DIRS}" | tail -1)
+
+                if [ -z "${NEWEST_FULL}" ]; then
+                  KIND="full"; echo "  No full backup -> FULL"
+                else
+                  FULLSTAMP="${NEWEST_FULL#full-}"
+                  INCRS=$(echo "${DIRS}" | { grep '^incr-' || true; } \
+                    | awk -v f="${FULLSTAMP}" '{ s=$0; sub(/^incr-/,"",s); if (s > f) print }' | wc -l | tr -d ' ')
+                  echo "  Newest full=${NEWEST_FULL}, incrementals since=${INCRS}, limit=${MAXINCR}"
+                  if [ "${INCRS}" -ge "${MAXINCR}" ]; then
+                    KIND="full"; echo "  Chain limit reached -> FULL (and prune)"
+                  else
+                    KIND="incr"
+                  fi
+                fi
+
+                NEWDIR="${KIND}-${STAMP}"
+                MODAFTER=""
+                [ "${KIND}" = "incr" ] && MODAFTER=$(stamp_to_absctl "${NEWEST_ANY#*-}")
+
+                # --- LAUNCH every backup-shard, then WAIT for all of them ---------
+                # Launching is sequential; WAITING is not. Each backup-shard runs on
+                # its own pod against its own PVC and its own partition range,
+                # so total wall-clock is the slowest backup-shard, not the sum.
+                for i in $(seq 0 $((REPLICAS - 1))); do
+                  P="${KEEPER}-${i}"
+                  START=$((i * SHARD))
+                  kubectl exec -n "${NS}" "${P}" -c absctl -- \
+                    mkdir -p "/backup/${ASNS}/${NEWDIR}" >/dev/null 2>&1
+                  # Record the range this backup-shard owns. Restore READS this rather
+                  # than recomputing it from the current replica count.
+                  kubectl exec -n "${NS}" "${P}" -c absctl -- \
+                    sh -c "printf '%s %s %s\n' '${START}' '${BACKUP_SHARD}' '${REPLICAS}' > /backup/${ASNS}/.partition" >/dev/null 2>&1
+                  (
+                    if [ -n "${MODAFTER}" ]; then
+                      kubectl exec -n "${NS}" "${P}" -c absctl -- \
+                        absctl backup --host "${SEED}" --port 3000 \
+                          --namespace "${ASNS}" --directory "/backup/${ASNS}/${NEWDIR}" \
+                          --partition-list "${START}-${BACKUP_SHARD}" \
+                          --modified-after "${MODAFTER}" \
+                          --parallel "${PARALLEL}" \
+                          --socket-timeout "${SOCKET_TIMEOUT}" > "${WORK}/out.${i}" 2>&1
+                    else
+                      kubectl exec -n "${NS}" "${P}" -c absctl -- \
+                        absctl backup --host "${SEED}" --port 3000 \
+                          --namespace "${ASNS}" --directory "/backup/${ASNS}/${NEWDIR}" \
+                          --partition-list "${START}-${BACKUP_SHARD}" \
+                          --parallel "${PARALLEL}" \
+                          --socket-timeout "${SOCKET_TIMEOUT}" > "${WORK}/out.${i}" 2>&1
+                    fi
+                    echo "$?" > "${WORK}/rc.${i}"
+                  ) &
+                done
+
+                # ---- TIMING MARKERS: the two figures to compare across N ----
+                echo "TIMING ${ASNS} ${KIND} replicas=${REPLICAS} ALL_LAUNCHED epoch_ms=$(date -u +%s%3N)"
+                wait
+                echo "TIMING ${ASNS} ${KIND} replicas=${REPLICAS} ALL_FINISHED epoch_ms=$(date -u +%s%3N)"
+
+                # --- Collect results ---------------------------------------
+                FAILED=0; RECS_TOTAL=0; WROTE_TOTAL=0
+                for i in $(seq 0 $((REPLICAS - 1))); do
+                  RC=$(cat "${WORK}/rc.${i}" 2>/dev/null || echo 1)
+                  R=$(awk '/Records Read:/{print $3; exit}'  "${WORK}/out.${i}" 2>/dev/null)
+                  B=$(awk '/Bytes Written:/{print $3; exit}' "${WORK}/out.${i}" 2>/dev/null)
+                  D=$(awk '/Duration:/{print $2; exit}'      "${WORK}/out.${i}" 2>/dev/null)
+                  [ -z "${R}" ] && R=0
+                  [ -z "${B}" ] && B=0
+                  printf '  backup-shard %s (partitions %s-%s): rc=%s records=%s bytes=%s absctl_duration=%s\n' \
+                    "${i}" "$((i * SHARD))" "${BACKUP_SHARD}" "${RC}" "${R}" "${B}" "${D:-?}"
+                  if [ "${RC}" != "0" ]; then
+                    echo "  ---- backup-shard ${i} output ----"; cat "${WORK}/out.${i}" || true
+                    FAILED=1
+                  fi
+                  RECS_TOTAL=$((RECS_TOTAL + R))
+                  WROTE_TOTAL=$((WROTE_TOTAL + B))
+                done
+                if [ "${FAILED}" -ne 0 ]; then
+                  echo "ERROR: at least one backup-shard failed for namespace ${ASNS}."
+                  exit 1
+                fi
+                echo "  ${ASNS} ${KIND}: ${RECS_TOTAL} records, ${WROTE_TOTAL} bytes across ${REPLICAS} backup-shard(s)"
+
+                # --- Flush the page cache on EVERY backup-shard -------------------
+                # A CSI snapshot captures the block device and bypasses the OS
+                # page cache. Without this the snapshot can capture .asb files
+                # as ZERO LENGTH: a restore point that looks healthy, exports
+                # almost nothing and restores no data at all.
+                for i in $(seq 0 $((REPLICAS - 1))); do
+                  kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- sync
+                done
+                sleep 3
+
+                # --- Verify each backup-shard landed on its device ----------------
+                for i in $(seq 0 $((REPLICAS - 1))); do
+                  P="${KEEPER}-${i}"
+                  W=$(awk '/Bytes Written:/{print $3; exit}' "${WORK}/out.${i}" 2>/dev/null); [ -z "${W}" ] && W=0
+                  ON=$(kubectl exec -n "${NS}" "${P}" -c absctl -- \
+                    sh -c "find /backup/${ASNS}/${NEWDIR} -type f -name '*.asb' -exec cat {} + 2>/dev/null | wc -c" \
+                    | tr -d '\r ')
+                  [ -z "${ON}" ] && ON=0
+                  if [ "${W}" -gt 0 ] && [ "${ON}" -eq 0 ]; then
+                    echo "ERROR: backup-shard ${i} wrote ${W} bytes but its device holds 0 — sync did not take effect."
+                    exit 1
+                  fi
+                done
+                if [ "${KIND}" = "full" ] && [ "${RECS_TOTAL}" -eq 0 ]; then
+                  echo "ERROR: a FULL backup of ${ASNS} captured 0 records across all backup-shards."
+                  exit 1
+                fi
+
+                # --- Prune superseded members on every backup-shard ---------------
+                if [ "${KIND}" = "full" ]; then
+                  for D in ${DIRS}; do
+                    [ "${D}" = "${NEWDIR}" ] && continue
+                    for i in $(seq 0 $((REPLICAS - 1))); do
+                      kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- \
+                        rm -rf "/backup/${ASNS}/${D}" >/dev/null 2>&1 || true
+                    done
+                    echo "  pruned superseded ${D} on all backup-shards"
+                  done
+                  for i in $(seq 0 $((REPLICAS - 1))); do
+                    kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- sync
+                  done
+                fi
+
+                SUMMARY="${SUMMARY}${ASNS}:${KIND}:${RECS_TOTAL}recs:${REPLICAS}backup-shards "
+              done
+
+              rm -rf "${WORK}"
+              echo "========================================================"
+              echo "Chain state per backup-shard:"
+              for i in $(seq 0 $((REPLICAS - 1))); do
+                echo "  ${KEEPER}-${i}:"
+                kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- \
+                  sh -c 'for d in /backup/*/; do case "$d" in *lost+found*) continue;; esac; echo "    $d range=$(cat ${d}.partition 2>/dev/null) [$(ls -1 $d 2>/dev/null | tr "\n" " ")]"; done' || true
+              done
+              echo "Summary: ${SUMMARY}"
+              echo "Keeper PVCs are synced and ready for the Kasten snapshot."
+
+              TOTAL_KIB=0
+              kando output keeper     "${KEEPER}"
+              kando output namespace  "${NS}"
+              kando output cluster    "${CR}"
+              kando output namespaces "${NAMESPACES}"
+              kando output dumpKiB    "${TOTAL_KIB}"
+              kando output summary    "${SUMMARY}"
+
+  # =========================================================================
+  # restorePosthook — runs AFTER Kasten restores the keeper PVC and metadata.
+  #
+  # absctl restore is ADDITIVE: it writes records from the dump into the target
+  # namespace but never removes records that exist in the target and are absent
+  # from the dump (--replace/--unique/--no-generation all govern per-record
+  # overwrite only; there is no truncate option). Restoring into a namespace that
+  # still holds data would therefore leave stale records behind, including ones
+  # that were deliberately deleted. So: TRUNCATE, then restore.
+  # =========================================================================
+  restorePosthook:
+    phases:
+      - func: KubeTask
+        name: absctlRestore
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.4
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              set -f
+
+              KEEPER="{{ .Object.metadata.name }}"
+              NS="{{ .Object.metadata.namespace }}"
+              POD="${KEEPER}-0"
+
+              echo "Keeper StatefulSet=${KEEPER} pod=${POD} namespace=${NS}"
+
+              # --- How many backup-shards does this keeper have? ------------------
+              REPLICAS=$(kubectl get statefulset "${KEEPER}" -n "${NS}" \
+                -o jsonpath='{.spec.replicas}' | tr -d '\r ')
+              case "${REPLICAS}" in ''|*[!0-9]*) REPLICAS=1 ;; esac
+              echo "Keeper replicas: ${REPLICAS}"
+
+              # --- Wait for every restored keeper pod ----------------------
+              # Each pod has to be rescheduled and remount its restored PVC.
+              for i in $(seq 0 $((REPLICAS - 1))); do
+                P="${KEEPER}-${i}"
+                echo "Waiting for keeper pod ${P} (timeout 10m)..."
+                ELAPSED=0
+                while [ "${ELAPSED}" -lt 600 ]; do
+                  RDY=$(kubectl get pod "${P}" -n "${NS}" \
+                    -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+                  [ "${RDY}" = "true" ] && break
+                  sleep 10; ELAPSED=$((ELAPSED + 10))
+                done
+                if [ "${RDY}" != "true" ]; then
+                  echo "ERROR: restored keeper pod ${P} not ready after 10m."
+                  kubectl get pods -n "${NS}" -l app=aerospike-backup-keeper || true
+                  exit 1
+                fi
+              done
+              echo "All ${REPLICAS} keeper pod(s) ready."
+
+              # --- What is in the restored dump? --------------------------
+              NAMESPACES=$(kubectl exec -n "${NS}" "${KEEPER}-0" -c absctl -- \
+                sh -c 'ls -1 /backup 2>/dev/null | grep -v "^lost+found$" || true' \
+                | tr -d '\r' | tr '\n' ' ')
+              if [ -z "${NAMESPACES// /}" ]; then
+                echo "ERROR: the restored keeper PVC contains no namespace dumps under /backup."
+                exit 1
+              fi
+              echo "Namespaces present in the dump: ${NAMESPACES}"
+
+              # --- PRE-FLIGHT: validate coverage and chains before the DB ---
+              # Two independent checks, both BEFORE anything is truncated,
+              # because the restore truncates each namespace before repopulating
+              # it: a problem found mid-loop would leave namespaces EMPTY.
+              #
+              #  1. PARTITION COVERAGE. Every backup-shard records the range it owns in
+              #     /backup/<ns>/.partition. Those ranges are READ, never
+              #     recomputed, and must tile 0..4095 exactly once. This is what
+              #     catches a restore point taken under a different replica count
+              #     being restored into the current keeper — which would
+              #     otherwise silently lose whole partition ranges.
+              #  2. No zero-length .asb files, the signature of a backup taken
+              #     without a page-cache sync.
+              CHAINS=""
+              for ASNS in ${NAMESPACES}; do
+                echo "  --- ${ASNS} ---"
+                COVER=""
+                for i in $(seq 0 $((REPLICAS - 1))); do
+                  MARK=$(kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- \
+                    sh -c "cat /backup/${ASNS}/.partition 2>/dev/null || true" | tr -d '\r' | head -1)
+                  if [ -z "${MARK}" ]; then
+                    echo "ERROR: backup-shard ${i} has no /backup/${ASNS}/.partition marker."
+                    echo "       Cannot establish which partition range it holds; refusing to restore."
+                    exit 1
+                  fi
+                  MS=$(echo "${MARK}" | awk '{print $1}')
+                  MC=$(echo "${MARK}" | awk '{print $2}')
+                  MR=$(echo "${MARK}" | awk '{print $3}')
+                  echo "    backup-shard ${i}: range ${MS}-${MC} (taken with replicas=${MR})"
+                  if [ "${MR}" != "${REPLICAS}" ]; then
+                    echo "ERROR: backup-shard ${i} was backed up with replicas=${MR} but this keeper has ${REPLICAS}."
+                    echo "       The partition layout differs, so this restore point cannot be replayed"
+                    echo "       into this keeper. Scale the keeper StatefulSet to ${MR} replicas and retry."
+                    exit 1
+                  fi
+                  COVER="${COVER}${MS} ${MC}\n"
+                done
+                # Ranges must tile 0..4095 exactly once, with no gap or overlap.
+                TILED=$(printf "${COVER}" | sort -n | awk '
+                  BEGIN { expect = 0; ok = 1 }
+                  { if ($1 != expect) ok = 0; expect = $1 + $2 }
+                  END { if (ok && expect == 4096) print "ok"; else print "bad " expect }')
+                if [ "${TILED}" != "ok" ]; then
+                  echo "ERROR: the backup-shard partition ranges do not tile 0..4095 exactly once (${TILED})."
+                  echo "       Restoring would silently lose or duplicate partition ranges. Aborting."
+                  exit 1
+                fi
+                echo "    coverage: 0..4095 tiled exactly once by ${REPLICAS} backup-shard(s) — OK"
+
+                # Chain resolution, from backup-shard 0 (all backup-shards move in lockstep).
+                DIRS=$(kubectl exec -n "${NS}" "${KEEPER}-0" -c absctl -- \
+                  sh -c "ls -1 /backup/${ASNS} 2>/dev/null || true" \
+                  | tr -d '\r' | { grep -E '^(full|incr)-[0-9]{8}T[0-9]{6}Z$' || true; } | sort)
+                NEWEST_FULL=$(echo "${DIRS}" | { grep '^full-' || true; } | tail -1)
+                if [ -z "${NEWEST_FULL}" ]; then
+                  echo "ERROR: namespace ${ASNS} has no full backup on backup-shard 0 — nothing restorable."
+                  exit 1
+                fi
+                FULLSTAMP="${NEWEST_FULL#full-}"
+                CHAIN="${NEWEST_FULL}"
+                for D in $(echo "${DIRS}" | { grep '^incr-' || true; }); do
+                  DS="${D#incr-}"
+                  [ "${DS}" \> "${FULLSTAMP}" ] && CHAIN="${CHAIN},${D}"
+                done
+                echo "    chain: ${CHAIN}"
+
+                for i in $(seq 0 $((REPLICAS - 1))); do
+                  for D in $(echo "${CHAIN}" | tr ',' ' '); do
+                    BAD=$(kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- \
+                      sh -c "n=0; for f in /backup/${ASNS}/${D}/*.asb; do [ -e \"\$f\" ] || continue; [ -s \"\$f\" ] || n=\$((n+1)); done; echo \$n" \
+                      | tr -d '\r ')
+                    if [ "${BAD}" != "0" ]; then
+                      echo "ERROR: backup-shard ${i} ${ASNS}/${D} has ${BAD} zero-length .asb file(s)."
+                      echo "       Backup taken without a page-cache sync. ABORTING BEFORE ANY TRUNCATE."
+                      exit 1
+                    fi
+                  done
+                done
+                CHAINS="${CHAINS}${ASNS}=${CHAIN} "
+              done
+              echo "Pre-flight validation passed."
+
+              # --- Wait for the Aerospike cluster -------------------------
+              echo "Waiting for a ready Aerospike server pod (timeout 10m)..."
+              SRV_POD=""
+              ELAPSED=0
+              while [ "${ELAPSED}" -lt 600 ]; do
+                SRV_POD=$(kubectl get pods -n "${NS}" -l app=aerospike-cluster \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+                  2>/dev/null | awk '$2=="true"{print $1; exit}')
+                [ -n "${SRV_POD}" ] && break
+                sleep 10; ELAPSED=$((ELAPSED + 10))
+              done
+              if [ -z "${SRV_POD}" ]; then
+                echo "ERROR: no ready Aerospike server pod after 10m. The AerospikeCluster must be"
+                echo "       running before restorePosthook executes — see the DR procedure in README.md."
+                exit 1
+              fi
+              CR=$(kubectl get pod "${SRV_POD}" -n "${NS}" \
+                -o jsonpath='{.metadata.labels.aerospike\.com/cr}')
+              SEED="${CR}.${NS}.svc.cluster.local"
+              echo "Aerospike server pod=${SRV_POD} cluster=${CR} seed=${SEED}:3000"
+
+              ELAPSED=0
+              while [ "${ELAPSED}" -lt 300 ]; do
+                INTEG=$(kubectl exec -n "${NS}" "${SRV_POD}" -c aerospike-server -- \
+                  asinfo -v statistics 2>/dev/null | tr ';' '\n' \
+                  | grep '^cluster_integrity=' | cut -d= -f2 | tr -d '\r' || true)
+                [ "${INTEG}" = "true" ] && break
+                sleep 10; ELAPSED=$((ELAPSED + 10))
+              done
+              echo "cluster_integrity=${INTEG:-unknown}"
+
+              # --- Truncate, then replay each chain member across backup-shards ---
+              WORK=$(mktemp -d)
+              for ENTRY in ${CHAINS}; do
+                ASNS="${ENTRY%%=*}"
+                CHAIN="${ENTRY#*=}"
+                echo "========================================================"
+                echo "Namespace ${ASNS}, chain ${CHAIN}"
+
+                BEFORE=$(kubectl exec -n "${NS}" "${SRV_POD}" -c aerospike-server -- \
+                  asinfo -v "namespace/${ASNS}" 2>/dev/null | tr ';' '\n' \
+                  | grep '^objects=' | cut -d= -f2 | tr -d '\r' || echo "n/a")
+                echo "objects before truncate: ${BEFORE}"
+
+                echo "Truncating ${ASNS} (removes records absent from the backup)..."
+                OUT=$(kubectl exec -n "${NS}" "${SRV_POD}" -c aerospike-server -- \
+                  asinfo -v "truncate-namespace:namespace=${ASNS}" | tr -d '\r')
+                echo "asinfo response: ${OUT}"
+                case "${OUT}" in ok|OK|ok*) : ;; *) echo "ERROR: truncate failed: ${OUT}"; exit 1 ;; esac
+                sleep 5
+
+                # Chain members OLDEST FIRST so the newest version of a record
+                # wins. Within one member all backup-shards run in PARALLEL: their
+                # partition ranges are disjoint, so they never touch the same
+                # record.
+                for D in $(echo "${CHAIN}" | tr ',' ' '); do
+                  echo "  --- replaying ${D} across ${REPLICAS} backup-shard(s) ---"
+                  ANY=0
+                  for i in $(seq 0 $((REPLICAS - 1))); do
+                    HAS=$(kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- \
+                      sh -c "ls -1 /backup/${ASNS}/${D}/*.asb 2>/dev/null | wc -l" | tr -d '\r ')
+                    if [ -z "${HAS}" ] || [ "${HAS}" -eq 0 ]; then
+                      echo "    backup-shard ${i}: empty (no changed records) — skipping"
+                      continue
+                    fi
+                    ANY=1
+                    (
+                      kubectl exec -n "${NS}" "${KEEPER}-${i}" -c absctl -- \
+                        absctl restore --host "${SEED}" --port 3000 \
+                          --namespace "${ASNS}" \
+                          --directory "/backup/${ASNS}/${D}" \
+                          --parallel 4 > "${WORK}/r.${i}" 2>&1
+                      echo "$?" > "${WORK}/rrc.${i}"
+                    ) &
+                  done
+                  echo "  TIMING ${ASNS} ${D} ALL_LAUNCHED epoch_ms=$(date -u +%s%3N)"
+                  wait
+                  echo "  TIMING ${ASNS} ${D} ALL_FINISHED epoch_ms=$(date -u +%s%3N)"
+                  if [ "${ANY}" -eq 1 ]; then
+                    for i in $(seq 0 $((REPLICAS - 1))); do
+                      [ -f "${WORK}/rrc.${i}" ] || continue
+                      RC=$(cat "${WORK}/rrc.${i}")
+                      INS=$(awk '/Inserted Records:/{print $3; exit}' "${WORK}/r.${i}" 2>/dev/null)
+                      echo "    backup-shard ${i}: rc=${RC} inserted=${INS:-?}"
+                      if [ "${RC}" != "0" ]; then
+                        echo "    ---- backup-shard ${i} output ----"; cat "${WORK}/r.${i}" || true
+                        echo "ERROR: backup-shard ${i} failed restoring ${ASNS}/${D}"
+                        exit 1
+                      fi
+                      rm -f "${WORK}/rrc.${i}"
+                    done
+                  fi
+                done
+
+                AFTER=$(kubectl exec -n "${NS}" "${SRV_POD}" -c aerospike-server -- \
+                  asinfo -v "namespace/${ASNS}" 2>/dev/null | tr ';' '\n' \
+                  | grep '^objects=' | cut -d= -f2 | tr -d '\r' || echo "n/a")
+                echo "OK: ${ASNS} restored — objects after restore: ${AFTER}"
+              done
+              rm -rf "${WORK}"
+
+              echo "--------------------------------------------------------"
+              echo "All namespaces truncated and restored."
+
+  # =========================================================================
+  # delete — nothing external to remove.
+  # =========================================================================
+  delete:
+    inputArtifactNames:
+      - aerospikeBackup
+    phases:
+      - func: KubeTask
+        name: absctlDelete
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.4
+          command:
+            - bash
+            - -c
+            - |
+              echo "Kasten deleted the keeper PVC snapshot for this restore point."
+              echo "  keeper     = {{ .ArtifactsIn.aerospikeBackup.KeyValue.keeper }}"
+              echo "  namespace  = {{ .ArtifactsIn.aerospikeBackup.KeyValue.namespace }}"
+              echo "  cluster    = {{ .ArtifactsIn.aerospikeBackup.KeyValue.cluster }}"
+              echo "  namespaces = {{ .ArtifactsIn.aerospikeBackup.KeyValue.namespaces }}"
+              echo "  dump KiB   = {{ .ArtifactsIn.aerospikeBackup.KeyValue.dumpKiB }}"
+              echo ""
+              echo "The .asb dump lives on the keeper PVC and is overwritten by the next"
+              echo "backup. Recoverable history is governed entirely by Kasten snapshot"
+              echo "and export retention. Nothing external to delete."
