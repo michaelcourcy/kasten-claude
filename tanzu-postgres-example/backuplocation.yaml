@@ -1,0 +1,40 @@
+# pgBackRest repository definition pointing at the in-namespace MinIO keeper.
+#
+# The secret must be named exactly as below and must carry the keys `accessKeyId`
+# and `secretAccessKey` — those key names are fixed by the operator and are not
+# configurable. minio-keeper.yaml creates that secret.
+apiVersion: sql.tanzu.vmware.com/v1
+kind: PostgresBackupLocation
+metadata:
+  name: pg-ha-backuplocation
+  namespace: tanzu-postgres
+spec:
+  storage:
+    s3:
+      bucket: tanzu-pg-backup
+      bucketPath: /pg-ha
+      # MinIO ignores the region, but the field has a documented default of
+      # us-east-1 and pgBackRest signs requests with it, so set it explicitly.
+      region: us-east-1
+      # Host and port, no scheme. TLS is selected by enableSSL, not by the URL.
+      endpoint: pg-ha-minio.tanzu-postgres.svc.cluster.local:9000
+      # MinIO serves path-style URLs; virtual-host style would resolve to
+      # tanzu-pg-backup.pg-ha-minio... which does not exist in cluster DNS.
+      forcePathStyle: true
+      # Plain HTTP is acceptable here only because the traffic never leaves the
+      # namespace. Kasten encrypts the data once it leaves the cluster.
+      enableSSL: false
+      secret:
+        name: pg-ha-minio-creds
+  # Retention applies to the *live* MinIO repository, not to Kasten restore points.
+  # Keep enough full backups that the previous one still exists when Kasten takes
+  # its next snapshot — see "Sizing retention" in README.md.
+  retentionPolicy:
+    fullRetention:
+      type: count
+      number: 4
+    diffRetention:
+      number: 8
+  # Hourly file-presence check that the repository is still restorable.
+  backupIntegrityValidation:
+    enabled: true

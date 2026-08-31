@@ -1,0 +1,270 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: tanzu-postgres-blueprint
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    outputArtifacts:
+      tanzuBackup:
+        keyValue:
+          backupName: "{{ .Phases.triggerPostgresBackup.Output.backupName }}"
+          namespace: "{{ .Phases.triggerPostgresBackup.Output.namespace }}"
+          instance: "{{ .Phases.triggerPostgresBackup.Output.instance }}"
+          stanzaName: "{{ .Phases.triggerPostgresBackup.Output.stanzaName }}"
+          restoreLabel: "{{ .Phases.triggerPostgresBackup.Output.restoreLabel }}"
+    phases:
+      - func: KubeTask
+        name: triggerPostgresBackup
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.4
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              KEEPER="{{ .Object.metadata.name }}"
+              NS="{{ .Object.metadata.namespace }}"
+              INSTANCE="${KEEPER%-minio}"
+              BACKUP_NAME="${INSTANCE}-kasten-$(date +%Y%m%d%H%M%S)"
+
+              echo "Instance=${INSTANCE} namespace=${NS} backup=${BACKUP_NAME}"
+
+              if ! kubectl get postgres.sql.tanzu.vmware.com "${INSTANCE}" -n "${NS}" >/dev/null 2>&1; then
+                echo "ERROR: no Postgres instance '${INSTANCE}' in namespace ${NS}."
+                echo "The MinIO Deployment must be named <instance-name>-minio."
+                exit 1
+              fi
+
+              STATE=$(kubectl get postgres.sql.tanzu.vmware.com "${INSTANCE}" -n "${NS}" \
+                -o jsonpath='{.status.currentState}' 2>/dev/null || echo "")
+              echo "Instance state: ${STATE:-<empty>}"
+              if [ "${STATE}" != "Running" ]; then
+                echo "ERROR: instance is not Running — refusing to take a backup."
+                exit 1
+              fi
+
+              # ---------------------------------------------------------------
+              # 1. Trigger a full pgBackRest backup into the MinIO repository.
+              # ---------------------------------------------------------------
+              # The 4.5 documentation places the backup type in two different
+              # places: `spec.type` on the "Backing Up and Restoring" page, and
+              # `spec.sourceInstance.type` in the CRD reference. Sending both does
+              # not work — kubectl validates fields strictly and the API server
+              # rejects the whole object with
+              #   strict decoding error: unknown field "spec.type"
+              # rather than pruning the surplus one. So read the installed CRD
+              # schema and emit the field the operator actually declares.
+              SPEC_TYPE=$(kubectl get crd postgresbackups.sql.tanzu.vmware.com \
+                -o jsonpath='{.spec.versions[?(@.name=="v1")].schema.openAPIV3Schema.properties.spec.properties.type.type}' \
+                2>/dev/null || echo "")
+
+              if [ "${SPEC_TYPE}" = "string" ]; then
+                echo "CRD declares spec.type — using the top-level form."
+                TYPE_BLOCK=$'  type: full\n  sourceInstance:\n    name: '"${INSTANCE}"
+              else
+                echo "CRD does not declare spec.type — nesting type under sourceInstance."
+                TYPE_BLOCK=$'  sourceInstance:\n    name: '"${INSTANCE}"$'\n    type: full'
+              fi
+
+              kubectl create -n "${NS}" -f - <<EOF
+              apiVersion: sql.tanzu.vmware.com/v1
+              kind: PostgresBackup
+              metadata:
+                name: ${BACKUP_NAME}
+                namespace: ${NS}
+              spec:
+              ${TYPE_BLOCK}
+              EOF
+
+              # ---------------------------------------------------------------
+              # 2. Wait for the backup to finish.
+              # ---------------------------------------------------------------
+              echo "Waiting for backup to complete (timeout 30m)..."
+              ELAPSED=0
+              PHASE=""
+              while [ ${ELAPSED} -lt 1800 ]; do
+                PHASE=$(kubectl get postgresbackup "${BACKUP_NAME}" -n "${NS}" \
+                  -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                echo "  [${ELAPSED}s] phase: ${PHASE:-<empty>}"
+                case "${PHASE}" in
+                  Succeeded)
+                    echo "Backup succeeded."
+                    break
+                    ;;
+                  Failed)
+                    echo "ERROR: backup failed."
+                    kubectl get postgresbackup "${BACKUP_NAME}" -n "${NS}" -o yaml | tail -40
+                    exit 1
+                    ;;
+                esac
+                sleep 10
+                ELAPSED=$((ELAPSED + 10))
+              done
+
+              if [ "${PHASE}" != "Succeeded" ]; then
+                echo "ERROR: timed out after ${ELAPSED}s waiting for the backup."
+                kubectl get postgresbackup "${BACKUP_NAME}" -n "${NS}" -o yaml | tail -40
+                exit 1
+              fi
+
+              STANZA=$(kubectl get postgresbackup "${BACKUP_NAME}" -n "${NS}" \
+                -o jsonpath='{.status.stanzaName}' 2>/dev/null || echo "")
+              LABEL=$(kubectl get postgresbackup "${BACKUP_NAME}" -n "${NS}" \
+                -o jsonpath='{.status.restoreLabel}' 2>/dev/null || echo "")
+              echo "stanzaName=${STANZA} restoreLabel=${LABEL}"
+
+              # ---------------------------------------------------------------
+              # 3. Flush the stop-LSN WAL segment into MinIO.
+              # ---------------------------------------------------------------
+              # The backup reaches Succeeded once the base backup files are in
+              # MinIO, but pg_backup_stop() also writes a WAL record at the stop
+              # LSN — the position recovery must reach for the base backup to be
+              # consistent. That record sits in the currently-open, partly-filled
+              # segment, and PostgreSQL only archives *complete* segments, so on a
+              # quiet instance it can stay on local disk indefinitely.
+              #
+              # Kasten freezes the MinIO PVC the moment this phase returns, so a
+              # segment that has not been archived by then never appears in the
+              # restore point. Switching the segment hands it to the archiver now,
+              # and we then wait for the archiver to confirm the upload rather
+              # than sleeping a fixed interval.
+              PRIMARY=$(kubectl get pods -n "${NS}" \
+                -l "postgres-instance=${INSTANCE},type=data,role=primary" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+              if [ -z "${PRIMARY}" ]; then
+                echo "ERROR: could not find the primary pod for instance ${INSTANCE}."
+                echo "Expected labels: postgres-instance=${INSTANCE},type=data,role=primary"
+                kubectl get pods -n "${NS}" --show-labels | head -20
+                exit 1
+              fi
+              echo "Primary pod: ${PRIMARY}"
+
+              # `kubectl exec` enters the container as its default OS user, and
+              # psql with no -U authenticates as that user. The Tanzu image maps it
+              # to a superuser, so a bare psql works there — but it fails with
+              # 'role "root" does not exist' on images that exec in as root. Probe
+              # once and reuse whichever form connects.
+              PSQL_USER=""
+              if ! kubectl exec -n "${NS}" "${PRIMARY}" -c pg-container -- \
+                   psql -At -q -c "SELECT 1;" >/dev/null 2>&1; then
+                echo "Bare psql did not connect; falling back to -U postgres."
+                PSQL_USER="-U postgres"
+              fi
+
+              psql_q() {
+                kubectl exec -n "${NS}" "${PRIMARY}" -c pg-container -- \
+                  psql ${PSQL_USER} -At -q "$@"
+              }
+
+              SEG=$(psql_q -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
+              echo "Switching WAL; segment to archive: ${SEG}"
+              psql_q -c "SELECT pg_switch_wal();" >/dev/null
+
+              echo "Waiting for the archiver to ship ${SEG} (timeout 5m)..."
+              ELAPSED=0
+              ARCHIVED="no"
+              while [ ${ELAPSED} -lt 300 ]; do
+                LAST=$(psql_q -c "SELECT coalesce(last_archived_wal,'') FROM pg_stat_archiver;" || echo "")
+                FAILED=$(psql_q -c "SELECT coalesce(last_failed_wal,'') FROM pg_stat_archiver;" || echo "")
+
+                # WAL file names are fixed-width zero-padded hex, so a lexical
+                # comparison is a valid ordering test.
+                if [ -n "${LAST}" ] && [[ "${LAST}" > "${SEG}" || "${LAST}" == "${SEG}" ]]; then
+                  echo "  archiver reached ${LAST} — MinIO now holds the stop-LSN WAL."
+                  ARCHIVED="yes"
+                  break
+                fi
+
+                if [ -n "${FAILED}" ] && [[ "${FAILED}" == "${SEG}" ]]; then
+                  echo "ERROR: the archiver failed on ${SEG}. pgBackRest cannot write to MinIO."
+                  psql_q -c "SELECT * FROM pg_stat_archiver;" || true
+                  exit 1
+                fi
+
+                echo "  [${ELAPSED}s] last_archived_wal=${LAST:-<none>}"
+                sleep 5
+                ELAPSED=$((ELAPSED + 5))
+              done
+
+              if [ "${ARCHIVED}" != "yes" ]; then
+                echo "ERROR: ${SEG} was not archived within ${ELAPSED}s."
+                echo "The snapshot would contain a base backup with no consistent recovery point."
+                psql_q -c "SELECT * FROM pg_stat_archiver;" || true
+                exit 1
+              fi
+
+              echo "MinIO PVC is ready for the Kasten snapshot."
+
+              kando output backupName "${BACKUP_NAME}"
+              kando output namespace "${NS}"
+              kando output instance "${INSTANCE}"
+              kando output stanzaName "${STANZA}"
+              kando output restoreLabel "${LABEL}"
+
+  delete:
+    inputArtifactNames:
+      - tanzuBackup
+    phases:
+      - func: KubeTask
+        name: expirePostgresBackup
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.4
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              BACKUP_NAME="{{ .ArtifactsIn.tanzuBackup.KeyValue.backupName }}"
+              NS="{{ .ArtifactsIn.tanzuBackup.KeyValue.namespace }}"
+
+              echo "Expiring backup ${BACKUP_NAME} in namespace ${NS}..."
+
+              if ! kubectl get namespace "${NS}" >/dev/null 2>&1; then
+                echo "Namespace ${NS} no longer exists — nothing to do."
+                exit 0
+              fi
+
+              if ! kubectl get postgresbackup "${BACKUP_NAME}" -n "${NS}" >/dev/null 2>&1; then
+                echo "PostgresBackup ${BACKUP_NAME} does not exist — nothing to do."
+                exit 0
+              fi
+
+              # Setting expire makes the operator run `pgbackrest expire`, which
+              # removes the backup from the live MinIO repository. Deleting the CR
+              # on its own would leave the data behind and the bucket would grow
+              # without limit.
+              kubectl patch postgresbackup "${BACKUP_NAME}" -n "${NS}" \
+                --type merge -p '{"spec":{"expire":true}}'
+
+              echo "Waiting for the expire job to finish (timeout 10m)..."
+              ELAPSED=0
+              while [ ${ELAPSED} -lt 600 ]; do
+                if ! kubectl get postgresbackup "${BACKUP_NAME}" -n "${NS}" >/dev/null 2>&1; then
+                  echo "Backup removed by the operator."
+                  exit 0
+                fi
+                PHASE=$(kubectl get postgresbackup "${BACKUP_NAME}" -n "${NS}" \
+                  -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                echo "  [${ELAPSED}s] phase: ${PHASE:-<empty>}"
+                if [ "${PHASE}" = "Failed" ]; then
+                  echo "WARNING: expire reported Failed; deleting the CR anyway."
+                  break
+                fi
+                sleep 10
+                ELAPSED=$((ELAPSED + 10))
+              done
+
+              # Remove the CR whether or not the operator already did. Restore-point
+              # deletion must not be blocked by a stuck expire job.
+              kubectl delete postgresbackup "${BACKUP_NAME}" -n "${NS}" --ignore-not-found
+              echo "Done."

@@ -1,0 +1,26 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: tanzu-postgres-blueprint-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: tanzu-postgres-blueprint
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: tanzu-postgres-minio
+          operator: In
+          values:
+            - "true"
+      # Leave the door open for a more specific blueprint on an individual
+      # keeper: an explicit annotation on the Deployment wins over this binding.
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

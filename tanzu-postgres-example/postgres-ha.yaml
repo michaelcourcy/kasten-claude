@@ -1,0 +1,42 @@
+# High-availability Tanzu for Postgres instance.
+#
+# highAvailability.enabled with readReplicas: 1 produces four pods:
+#   pg-ha-monitor-0   Patroni coordination
+#   pg-ha-0           Leader (primary, read/write)
+#   pg-ha-1           Sync Standby (synchronous replica)
+#   pg-ha-2           Replica (asynchronous, from readReplicas: 1)
+#
+# Attaching backupLocation makes the operator initialise a pgBackRest stanza in
+# MinIO and start archiving WAL continuously. It also triggers one immediate full
+# backup; add the annotation below to suppress that.
+apiVersion: sql.tanzu.vmware.com/v1
+kind: Postgres
+metadata:
+  name: pg-ha
+  namespace: tanzu-postgres
+  # annotations:
+  #   sql.tanzu.vmware.com/skip-initial-backup: "true"
+spec:
+  storageClassName: ebs-sc
+  storageSize: 2G
+  walStorageSize: 2G
+  serviceType: ClusterIP
+  # Pull secret for the Broadcom registry — see README.md, "Prerequisites".
+  imagePullSecret:
+    name: regsecret
+  pgConfig:
+    dbname: kasten_test
+    username: pgadmin
+  postgresVersion:
+    # Check what your operator actually ships: kubectl get postgresversions
+    name: postgres-17.5
+  highAvailability:
+    enabled: true
+    readReplicas: 1
+    podDisruptionBudget:
+      enabled: true
+  backupLocation:
+    name: pg-ha-backuplocation
+  persistentVolumeClaimPolicy: delete
+  seccompProfile:
+    type: RuntimeDefault
