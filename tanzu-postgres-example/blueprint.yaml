@@ -51,26 +51,13 @@ actions:
               # ---------------------------------------------------------------
               # 1. Trigger a full pgBackRest backup into the MinIO repository.
               # ---------------------------------------------------------------
-              # The 4.5 documentation places the backup type in two different
-              # places: `spec.type` on the "Backing Up and Restoring" page, and
-              # `spec.sourceInstance.type` in the CRD reference. Sending both does
-              # not work — kubectl validates fields strictly and the API server
-              # rejects the whole object with
-              #   strict decoding error: unknown field "spec.type"
-              # rather than pruning the surplus one. So read the installed CRD
-              # schema and emit the field the operator actually declares.
-              SPEC_TYPE=$(kubectl get crd postgresbackups.sql.tanzu.vmware.com \
-                -o jsonpath='{.spec.versions[?(@.name=="v1")].schema.openAPIV3Schema.properties.spec.properties.type.type}' \
-                2>/dev/null || echo "")
-
-              if [ "${SPEC_TYPE}" = "string" ]; then
-                echo "CRD declares spec.type — using the top-level form."
-                TYPE_BLOCK=$'  type: full\n  sourceInstance:\n    name: '"${INSTANCE}"
-              else
-                echo "CRD does not declare spec.type — nesting type under sourceInstance."
-                TYPE_BLOCK=$'  sourceInstance:\n    name: '"${INSTANCE}"$'\n    type: full'
-              fi
-
+              # `type` is a top-level spec field, and sourceInstance carries only
+              # `name`. This was read off the 4.5.0 CRD itself, because the
+              # published CRD reference nests `type` under sourceInstance and is
+              # wrong: kubectl validates fields strictly, so the extra field makes
+              # the API server reject the whole object with
+              #   strict decoding error: unknown field "..."
+              # `type` also accepts `differential` and `incremental`.
               kubectl create -n "${NS}" -f - <<EOF
               apiVersion: sql.tanzu.vmware.com/v1
               kind: PostgresBackup
@@ -78,7 +65,9 @@ actions:
                 name: ${BACKUP_NAME}
                 namespace: ${NS}
               spec:
-              ${TYPE_BLOCK}
+                type: full
+                sourceInstance:
+                  name: ${INSTANCE}
               EOF
 
               # ---------------------------------------------------------------
@@ -119,37 +108,43 @@ actions:
               echo "stanzaName=${STANZA} restoreLabel=${LABEL}"
 
               # ---------------------------------------------------------------
-              # 3. Flush the stop-LSN WAL segment into MinIO.
+              # 3. Archive the open WAL segment, to improve the RPO.
               # ---------------------------------------------------------------
-              # The backup reaches Succeeded once the base backup files are in
-              # MinIO, but pg_backup_stop() also writes a WAL record at the stop
-              # LSN — the position recovery must reach for the base backup to be
-              # consistent. That record sits in the currently-open, partly-filled
-              # segment, and PostgreSQL only archives *complete* segments, so on a
-              # quiet instance it can stay on local disk indefinitely.
+              # This is NOT needed to make the base backup restorable. pgBackRest
+              # runs with archive-check=y (the default, and the operator does not
+              # override it), so the backup only reports Succeeded once the WAL
+              # required to make it consistent is already in the repository.
               #
-              # Kasten freezes the MinIO PVC the moment this phase returns, so a
-              # segment that has not been archived by then never appears in the
-              # restore point. Switching the segment hands it to the archiver now,
-              # and we then wait for the archiver to confirm the upload rather
-              # than sleeping a fixed interval.
+              # What this step buys is recency. Transactions committed *after*
+              # the base backup finished sit in the currently-open segment on the
+              # primary's disk, and PostgreSQL archives only *complete* segments.
+              # Kasten freezes the MinIO PVC seconds later, so without a switch
+              # those commits are absent from the restore point and cannot be
+              # recovered from it. Switching seals the segment and hands it to the
+              # archiver now.
+              #
+              # The primary is needed only for this SQL call — the backup itself
+              # is entirely the operator's job, and runs wherever it chooses.
+              # pg_switch_wal() must run on the primary; a standby refuses it
+              # with "recovery is in progress".
               PRIMARY=$(kubectl get pods -n "${NS}" \
-                -l "postgres-instance=${INSTANCE},type=data,role=primary" \
+                -l "postgres-instance=${INSTANCE},type=instance,role=primary" \
                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 
               if [ -z "${PRIMARY}" ]; then
                 echo "ERROR: could not find the primary pod for instance ${INSTANCE}."
-                echo "Expected labels: postgres-instance=${INSTANCE},type=data,role=primary"
+                echo "Expected labels: postgres-instance=${INSTANCE},type=instance,role=primary"
                 kubectl get pods -n "${NS}" --show-labels | head -20
                 exit 1
               fi
               echo "Primary pod: ${PRIMARY}"
 
               # `kubectl exec` enters the container as its default OS user, and
-              # psql with no -U authenticates as that user. The Tanzu image maps it
-              # to a superuser, so a bare psql works there — but it fails with
-              # 'role "root" does not exist' on images that exec in as root. Probe
-              # once and reuse whichever form connects.
+              # psql with no -U authenticates as that user. On the 4.5.0 instance
+              # image that user is `postgres`, a superuser, so a bare psql works
+              # and this probe takes the first branch. The fallback exists because
+              # the same call fails with 'role "root" does not exist' on images
+              # that exec in as root. Probe once, reuse whichever form connects.
               PSQL_USER=""
               if ! kubectl exec -n "${NS}" "${PRIMARY}" -c pg-container -- \
                    psql -At -q -c "SELECT 1;" >/dev/null 2>&1; then
@@ -162,42 +157,102 @@ actions:
                   psql ${PSQL_USER} -At -q "$@"
               }
 
-              SEG=$(psql_q -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
-              echo "Switching WAL; segment to archive: ${SEG}"
+              # A switch only seals a segment if the current one has been written
+              # to. On an idle instance right after a backup the segment can be
+              # empty, in which case pg_switch_wal() does nothing and there is
+              # nothing to wait for. Compare the segment before and after to tell
+              # the two cases apart.
+              BEFORE=$(psql_q -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
               psql_q -c "SELECT pg_switch_wal();" >/dev/null
+              AFTER=$(psql_q -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
 
-              echo "Waiting for the archiver to ship ${SEG} (timeout 5m)..."
-              ELAPSED=0
-              ARCHIVED="no"
-              while [ ${ELAPSED} -lt 300 ]; do
-                LAST=$(psql_q -c "SELECT coalesce(last_archived_wal,'') FROM pg_stat_archiver;" || echo "")
-                FAILED=$(psql_q -c "SELECT coalesce(last_failed_wal,'') FROM pg_stat_archiver;" || echo "")
+              if [ "${BEFORE}" = "${AFTER}" ]; then
+                echo "Segment ${BEFORE} was empty; no switch occurred and nothing is pending."
+              else
+                echo "Sealed ${BEFORE}; waiting for it to reach the repository (timeout 5m)..."
 
-                # WAL file names are fixed-width zero-padded hex, so a lexical
-                # comparison is a valid ordering test.
-                if [ -n "${LAST}" ] && [[ "${LAST}" > "${SEG}" || "${LAST}" == "${SEG}" ]]; then
-                  echo "  archiver reached ${LAST} — MinIO now holds the stop-LSN WAL."
-                  ARCHIVED="yes"
-                  break
-                fi
+                # Ask pgBackRest what is actually in MinIO. Do NOT use
+                # pg_stat_archiver.last_archived_wal for this: with
+                # archive-async=y and process-max=2 the segments are pushed in
+                # parallel, so that column holds whichever archive_command
+                # returned last, not the highest segment. It is not a monotonic
+                # high-water mark, and it can also hold a ".backup" label or a
+                # ".history" file, so comparing it with >= gives wrong answers.
+                # The repository max is monotonic and is the thing we care about.
+                repo_max() {
+                  kubectl exec -n "${NS}" "${PRIMARY}" -c pg-container -- bash -c \
+                    'pgbackrest info --stanza=${BACKUP_STANZA_NAME} --output=json 2>/dev/null | jq -r "[.[0].archive[].max] | max"' \
+                    2>/dev/null || echo ""
+                }
 
-                if [ -n "${FAILED}" ] && [[ "${FAILED}" == "${SEG}" ]]; then
-                  echo "ERROR: the archiver failed on ${SEG}. pgBackRest cannot write to MinIO."
+                ELAPSED=0
+                ARCHIVED="no"
+                while [ ${ELAPSED} -lt 300 ]; do
+                  MAX=$(repo_max)
+                  # Segment names are fixed-width zero-padded hex, so a lexical
+                  # comparison is a valid ordering test between two of them.
+                  if [ -n "${MAX}" ] && [ "${MAX}" != "null" ] \
+                     && [[ "${MAX}" > "${BEFORE}" || "${MAX}" == "${BEFORE}" ]]; then
+                    echo "  repository holds up to ${MAX} — ${BEFORE} is in MinIO."
+                    ARCHIVED="yes"
+                    break
+                  fi
+                  echo "  [${ELAPSED}s] repository max=${MAX:-<none>}"
+                  sleep 5
+                  ELAPSED=$((ELAPSED + 5))
+                done
+
+                if [ "${ARCHIVED}" != "yes" ]; then
+                  # Deliberately not fatal. archive-check already guaranteed the
+                  # base backup is restorable, so failing here would throw away a
+                  # usable restore point. What is lost is only the ability to
+                  # recover to a moment after the base backup finished.
+                  echo "WARNING: ${BEFORE} did not reach the repository within ${ELAPSED}s."
+                  echo "WARNING: the restore point is still restorable to the base backup,"
+                  echo "WARNING: but transactions committed after it may not be recoverable."
+                  echo "WARNING: check WAL archiving — pg_stat_archiver below:"
                   psql_q -c "SELECT * FROM pg_stat_archiver;" || true
-                  exit 1
                 fi
+              fi
 
-                echo "  [${ELAPSED}s] last_archived_wal=${LAST:-<none>}"
-                sleep 5
-                ELAPSED=$((ELAPSED + 5))
-              done
+              # ---------------------------------------------------------------
+              # 4. Flush the keeper's page cache to the block device.
+              # ---------------------------------------------------------------
+              # A CSI snapshot captures the block device and bypasses the OS
+              # page cache, and Kasten does not fsfreeze the filesystem. An
+              # object MinIO has acknowledged but not yet flushed is captured as
+              # a 0-byte file — the repository then looks complete but the
+              # restore fails. The same root cause is documented in
+              # cockroachdb-example, elasticsearch-eck-minio-example and
+              # couchbase-operator-example.
+              #
+              # This is the last thing the prehook does, so nothing can dirty
+              # the cache again before the snapshot is taken.
+              #
+              # The keeper pod is found through the Deployment's own selector
+              # rather than a hardcoded label, so renaming the keeper's labels
+              # cannot silently skip the flush.
+              #
+              # Built with jq, not `kubectl -o go-template`: Kanister renders
+              # this script as a Go template before running it, so any
+              # double-curly-brace expression here is consumed by Kanister and
+              # never reaches kubectl. A go-template selector fails with
+              # "can't evaluate field spec in type param.TemplateParams".
+              # jq is safe because its interpolation syntax is \(...).
+              SEL=$(kubectl get deployment "${KEEPER}" -n "${NS}" -o json \
+                | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
+              KEEPER_POD=$(kubectl get pods -n "${NS}" -l "${SEL}" \
+                --field-selector=status.phase=Running \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 
-              if [ "${ARCHIVED}" != "yes" ]; then
-                echo "ERROR: ${SEG} was not archived within ${ELAPSED}s."
-                echo "The snapshot would contain a base backup with no consistent recovery point."
-                psql_q -c "SELECT * FROM pg_stat_archiver;" || true
+              if [ -z "${KEEPER_POD}" ]; then
+                echo "ERROR: no running keeper pod for deployment ${KEEPER} (selector ${SEL})."
                 exit 1
               fi
+
+              echo "Syncing keeper filesystem (${KEEPER_POD})..."
+              kubectl exec -n "${NS}" "${KEEPER_POD}" -- sync
+              echo "Keeper filesystem synced."
 
               echo "MinIO PVC is ready for the Kasten snapshot."
 

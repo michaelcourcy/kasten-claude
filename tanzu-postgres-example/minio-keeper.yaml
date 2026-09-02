@@ -18,6 +18,41 @@ stringData:
   accessKeyId: minioadmin
   secretAccessKey: minioadmin123
 ---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pg-ha-minio-selfsigned
+  namespace: tanzu-postgres
+spec:
+  selfSigned: {}
+---
+# MinIO must serve HTTPS. pgBackRest has no plaintext mode for an S3 repository,
+# and PostgresBackupLocation's `enableSSL: false` does NOT mean "use HTTP" — the
+# operator turns it into pgBackRest's `repo1-storage-verify-tls=n`, which only
+# skips certificate verification. A plaintext MinIO therefore fails the stanza
+# creation with "TLS error [1:167772427] wrong version number".
+#
+# Because verification is skipped, a self-signed certificate is enough and no CA
+# bundle has to be distributed. cert-manager is already a prerequisite of the
+# operator, so issuing one costs nothing.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pg-ha-minio-tls
+  namespace: tanzu-postgres
+spec:
+  secretName: pg-ha-minio-tls
+  issuerRef:
+    name: pg-ha-minio-selfsigned
+    kind: Issuer
+  commonName: pg-ha-minio.tanzu-postgres.svc.cluster.local
+  dnsNames:
+    - pg-ha-minio
+    - pg-ha-minio.tanzu-postgres
+    - pg-ha-minio.tanzu-postgres.svc
+    - pg-ha-minio.tanzu-postgres.svc.cluster.local
+    - localhost
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -60,6 +95,8 @@ spec:
           args:
             - server
             - /data
+            - --certs-dir
+            - /certs
             - --console-address
             - ":9001"
           env:
@@ -81,16 +118,32 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: certs
+              mountPath: /certs
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /minio/health/ready
               port: 9000
+              # MinIO now serves TLS on 9000, so the probe must use HTTPS.
+              # Kubernetes does not verify the certificate for probes.
+              scheme: HTTPS
             initialDelaySeconds: 10
             periodSeconds: 5
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: pg-ha-minio
+        - name: certs
+          secret:
+            secretName: pg-ha-minio-tls
+            # MinIO expects public.crt / private.key; cert-manager writes
+            # tls.crt / tls.key, so rename them on the way in.
+            items:
+              - key: tls.crt
+                path: public.crt
+              - key: tls.key
+                path: private.key
 ---
 apiVersion: v1
 kind: Service

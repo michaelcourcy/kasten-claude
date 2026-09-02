@@ -17,8 +17,14 @@ metadata:
   # annotations:
   #   sql.tanzu.vmware.com/skip-initial-backup: "true"
 spec:
+  # Set BOTH storage classes explicitly. They are independent fields, and each
+  # one falls back to the cluster's *default* StorageClass when omitted — not to
+  # the other. On a cluster with no default class, omitting walStorageClassName
+  # leaves the WAL PVC with an empty class, so it never binds and the instance
+  # stays Unavailable with an unschedulable pod.
   storageClassName: ebs-sc
   storageSize: 2G
+  walStorageClassName: ebs-sc
   walStorageSize: 2G
   serviceType: ClusterIP
   # Pull secret for the Broadcom registry — see README.md, "Prerequisites".
@@ -29,7 +35,7 @@ spec:
     username: pgadmin
   postgresVersion:
     # Check what your operator actually ships: kubectl get postgresversions
-    name: postgres-17.5
+    name: postgres-18.4
   highAvailability:
     enabled: true
     readReplicas: 1

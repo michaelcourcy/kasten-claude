@@ -21,8 +21,16 @@ spec:
       # MinIO serves path-style URLs; virtual-host style would resolve to
       # tanzu-pg-backup.pg-ha-minio... which does not exist in cluster DNS.
       forcePathStyle: true
-      # Plain HTTP is acceptable here only because the traffic never leaves the
-      # namespace. Kasten encrypts the data once it leaves the cluster.
+      # CAREFUL — this does NOT mean "use plain HTTP". The operator turns it into
+      # pgBackRest's `repo1-storage-verify-tls=n`, which keeps TLS and only skips
+      # certificate verification. pgBackRest has no plaintext mode for an S3
+      # repository, so MinIO must serve HTTPS either way; a plaintext keeper fails
+      # stanza creation with "TLS error [1:167772427] wrong version number".
+      #
+      # Keeping it false lets the keeper use the self-signed certificate that
+      # minio-keeper.yaml issues through cert-manager, with no CA bundle to
+      # distribute. To verify the certificate instead, set this to true and put
+      # the issuing CA in `caBundle` below.
       enableSSL: false
       secret:
         name: pg-ha-minio-creds
