@@ -1,0 +1,88 @@
+# Kasten policy for the DataStage engine volumes.
+#
+# It protects the CP4D instance namespace (`cpd`) but with an include filter, because `cpd` holds
+# the whole CP4D control plane — 30+ PVCs, Postgres, CouchDB, OpenSearch, Redis, RabbitMQ. Backing
+# all of that up is platform DR (cpdbr's job, and a different conversation). This policy captures
+# only what DataStage's engine owns.
+#
+# Three things to know before editing the filter:
+#
+# 1. The two PVCs that matter carry NO USABLE LABEL on DataStage 5.2.2 — verified on the cluster.
+#    Only ds-temp and ds-migration are labelled (icpdsupport/addOnId: datastage), and those two
+#    are scratch space. So the filter selects on blueprint-ai/datastage-engine=true, a label the
+#    operator applies by hand — see Prerequisites in README.md. backupPrehook reads the SAME
+#    label to decide what to flush, so the snapshotted set and the flushed set stay identical.
+# 2. THREE things must carry that label, and only the first two are obvious:
+#      - datastage-ibm-datastage-ds-storage-pvc
+#      - <instance>-ibm-datastage-px-storage-pvc, one per PXRuntime instance (`ds-px-default` is
+#        the one the install creates; a namespace can have several instances)
+#      - USER VOLUMES (volumes-<name>-pvc) — extra PVCs an administrator mounted into the runtime
+#        so flows can read and write ordinary files. They hold customer data and the install does
+#        not create them. `cpdctl dsjob list-volumes` reports the ones DataStage uses; do not
+#        blanket-label every volumes-*-pvc, because other CP4D services create those too.
+# 3. The DataStage and PXRuntime custom resources are included for reference — they record the
+#    instance topology and sizing. The documented restore procedure restores VOLUMES only; see
+#    README.md. Restoring the CRs over a live install is not part of it.
+#
+# The profile MUST be a Location profile (S3/GCS/Azure Blob), not Infra — only a Location profile
+# is recorded in the RestorePointContent in a Kanister-compatible form, which is what allows
+# restorePosthook to run at all.
+#   kubectl get profile <name> -n kasten-io -o jsonpath='{.spec.type}'   # must print: Location
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: Policy
+metadata:
+  name: datastage-engine-backup
+  namespace: kasten-io
+spec:
+  comment: >-
+    DataStage engine volumes (/ds-storage, /px-storage) in the cpd namespace. Design assets
+    (flows, jobs, connections) are covered by the cp4d-example project-export policy, not here.
+  frequency: "@onDemand"
+  actions:
+    - action: backup
+      backupParameters:
+        profile:
+          name: <your-location-profile>
+          namespace: kasten-io
+        filters:
+          includeResources:
+            # Every PVC the operator labelled: engine volumes, one px-storage per PXRuntime
+            # instance, and any DataStage user volume. See note 2 above.
+            - resource: persistentvolumeclaims
+              matchLabels:
+                blueprint-ai/datastage-engine: "true"
+            # The DataStage workloads. NOT optional — see the warning in README.md:
+            # a filter that admits PVCs but no workloads makes Kasten drop a PVC that is
+            # mounted by several workloads (ds-storage), and it also means the
+            # BlueprintBinding matches nothing, so the hooks never run and the backup
+            # still reports Complete.
+            - group: apps
+              resource: deployments
+              matchLabels:
+                app.kubernetes.io/name: datastage
+            - group: apps
+              resource: deployments
+              matchLabels:
+                app.kubernetes.io/component: px-runtime
+            - group: apps
+              resource: statefulsets
+              matchLabels:
+                app.kubernetes.io/component: px-compute
+            # The ds-config ConfigMap. IBM's own backup-validation-meta requires it to be in
+            # the backup, and its restore plan puts it back in the restore-pre-operators phase.
+            # 3 keys (pxDefaultInstanceID, startup-env.sh, import_license.sh) — free to capture.
+            - resource: configmaps
+              matchLabels:
+                app.kubernetes.io/component: ds-config
+                app.kubernetes.io/name: datastage
+            # The custom resources, for reference: they record the instance topology.
+            - group: ds.cpd.ibm.com
+              resource: datastages
+            - group: ds.cpd.ibm.com
+              resource: pxruntimes
+  selector:
+    matchExpressions:
+      - key: k10.kasten.io/appNamespace
+        operator: In
+        values:
+          - cpd

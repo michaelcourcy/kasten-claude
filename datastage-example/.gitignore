@@ -1,0 +1,10 @@
+# Both markdown notes alongside README.md are tracked deliberately:
+#   install-note.md     — what the DataStage install creates; the backup scope follows from it
+#   minimal-tutorial.md — what DataStage stores and where; the same
+# Each carries a warning at the top saying it is a record of what was validated against, and
+# that IBM's documentation is the authority for installing and learning the product.
+
+# cpdctl binary and its config (the config holds a CP4D password / API key)
+bin/
+.cpdctl.config.json
+*.zip

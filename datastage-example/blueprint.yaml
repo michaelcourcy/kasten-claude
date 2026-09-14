@@ -1,0 +1,188 @@
+# DataStage engine-state protection — pattern 2 (quiesce), in the light form IBM itself specifies.
+#
+# Scope: the DataStage ENGINE volumes in the CP4D instance namespace — /ds-storage (custom
+# libraries, ODBC/JDBC configuration, compiled artifacts, run history, Data Set descriptors) and
+# /px-storage (Data Set and File Set data, engine and workload-manager configuration, files flows
+# write to file-system paths). The DataStage DESIGN assets — flows, jobs, connections, parameter
+# sets — are CP4D project assets and are protected by cp4d-example, not by this blueprint. See
+# README.md.
+#
+# Why there is no quiesce phase: IBM's own online-backup hooks for DataStage
+# (configmap datastage-maint-aux-ckpt-cm, shipped by the install) are EMPTY — pre-hooks,
+# post-hooks and checkpoint hooks all `exec-rules: []`. The only thing IBM requires is a
+# precheck that the DataStage and PXRuntime custom resources report dsStatus == Completed,
+# with on-error: Fail. Maintenance mode (spec.ignoreForMaintenance) is used by the OFFLINE
+# path only, and it does not stop pods — verified on 5.2.2: it pauses the operator so that
+# something else can scale the workloads down. That "something else" is needed at RESTORE
+# time, not at backup time, which is why it appears in restorePosthook below and as a manual
+# pre-restore step in the README.
+#
+# Bind with the BlueprintBinding in blueprintbinding.yaml (the single Deployment
+# app.kubernetes.io/name=datastage, app.kubernetes.io/component=runtime).
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: datastage-engine-bp
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    phases:
+      # IBM's precheck, then the filesystem flush. The flush is deliberately the LAST thing the
+      # prehook does: anything performed afterwards would dirty the page cache again, and a CSI
+      # snapshot captures the volume, not the cache.
+      - func: KubeTask
+        name: precheckAndFlush
+        args:
+          namespace: kasten-io          # cluster-wide Kasten SA: read CRs and exec into cpd pods
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+
+              # ---- 1. Health precheck (IBM: on-error Fail) --------------------------------
+              # A CR that is mid-reconcile may be rewriting the very directories that are about
+              # to be snapshotted, and a restore of that state is not something IBM supports.
+              fail=0
+              ds_status=$(kubectl get datastage datastage -n "${NS}" -o jsonpath='{.status.dsStatus}' 2>/dev/null || true)
+              echo "DataStage/datastage dsStatus=${ds_status:-<none>}"
+              [ "${ds_status}" = "Completed" ] || { echo "ERROR: DataStage CR is not Completed"; fail=1; }
+
+              for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+                px_status=$(kubectl get pxruntime "${px}" -n "${NS}" -o jsonpath='{.status.dsStatus}')
+                echo "PXRuntime/${px} dsStatus=${px_status:-<none>}"
+                [ "${px_status}" = "Completed" ] || { echo "ERROR: PXRuntime ${px} is not Completed"; fail=1; }
+              done
+
+              if [ "${fail}" -ne 0 ]; then
+                echo "BACKUP PREHOOK FAILED: DataStage is not in a steady state. Nothing was snapshotted."
+                exit 1
+              fi
+
+              # ---- 2. Work out which PVCs are in the backup -------------------------------
+              # The set to flush must be the set Kasten snapshots, or a volume gets captured with
+              # unflushed data. Two sources, unioned:
+              #
+              #  a) THE LABEL, which is authoritative. The policy selects PVCs by
+              #     blueprint-ai/datastage-engine=true (a prerequisite the README tells the
+              #     operator to apply, because the engine PVCs carry no usable label of their own
+              #     on 5.2.2). Reading the same label here means the flushed set and the
+              #     snapshotted set cannot drift apart. It also picks up USER VOLUMES —
+              #     the extra PVCs an administrator mounts into the runtime so flows can read and
+              #     write ordinary files (`cpdctl dsjob list-volumes`, named volumes-<name>-pvc).
+              #     Those hold customer data and do NOT match the engine naming pattern below.
+              #
+              #  b) THE NAME PATTERN, as a safety net: if the label was forgotten the core engine
+              #     volumes still get flushed. A second PXRuntime instance brings its own
+              #     <instance>-ibm-datastage-px-storage-pvc, which this catches without any
+              #     per-instance configuration.
+              mapfile -t LABELLED_PVCS < <(kubectl get pvc -n "${NS}" \
+                -l blueprint-ai/datastage-engine=true -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^$' || true)
+              echo "PVCs carrying blueprint-ai/datastage-engine=true: ${LABELLED_PVCS[*]:-<none>}"
+              if [ "${#LABELLED_PVCS[@]}" -eq 0 ]; then
+                echo "WARNING: no PVC carries the label. The policy selects on it, so this backup"
+                echo "         probably captures NO volume at all. See Prerequisites in README.md."
+              fi
+
+              # jq needs the labelled names as a JSON array to test membership.
+              LABEL_JSON=$(printf '%s\n' "${LABELLED_PVCS[@]:-}" | jq -R . | jq -sc 'map(select(. != ""))')
+
+              # ---- 3. Find every running pod that mounts one of them ----------------------
+              mapfile -t PODS < <(kubectl get pods -n "${NS}" -o json | jq -r --argjson labelled "${LABEL_JSON}" '
+                .items[]
+                | select(any(.spec.volumes[]?;
+                    (.persistentVolumeClaim.claimName? // "") as $c
+                    | ($c | test("-(ds|px)-storage-pvc$")) or ($labelled | index($c) != null)))
+                | select(.status.phase == "Running")
+                | .metadata.name')
+
+              [ "${#PODS[@]}" -gt 0 ] || { echo "ERROR: no running pod mounts a DataStage engine volume in ${NS}"; exit 1; }
+              echo "engine-volume writers: ${#PODS[@]} pod(s)"
+
+              # A labelled PVC that no running pod mounts will be snapshotted without ever being
+              # flushed. That is usually a user volume whose consumer was scaled down — harmless
+              # if nothing has written to it, silently truncating if something has. Warn, name it.
+              MOUNTED=$(kubectl get pods -n "${NS}" -o json \
+                | jq -r '.items[] | select(.status.phase=="Running") | .spec.volumes[]?.persistentVolumeClaim.claimName? // empty' | sort -u)
+              for pvc in "${LABELLED_PVCS[@]:-}"; do
+                [ -n "${pvc}" ] || continue
+                grep -qxF "${pvc}" <<<"${MOUNTED}" || \
+                  echo "WARNING: PVC ${pvc} is labelled for backup but no running pod mounts it; it cannot be flushed"
+              done
+
+              # ---- 4. Report jobs in flight (informational, not fatal) --------------------
+              # A job writing a Data Set while the snapshot is taken leaves that Data Set
+              # partially written in the restore point. The Data Set is intermediate ETL data —
+              # a re-run reproduces it — so this warns rather than fails. Change to an exit 1
+              # if your flows treat Data Sets as a system of record.
+              for pod in "${PODS[@]}"; do
+                running=$(kubectl exec -n "${NS}" "${pod}" -- \
+                            bash -c 'ls /px-storage/PXRuntime/runningJobs 2>/dev/null | wc -l' 2>/dev/null || echo "")
+                if [ -n "${running}" ] && [ "${running}" -gt 0 ] 2>/dev/null; then
+                  echo "WARNING: ${running} job run(s) in flight (seen from ${pod}); Data Sets they write may be captured half-finished"
+                  break
+                fi
+              done
+
+              # ---- 5. Flush — MUST BE LAST ------------------------------------------------
+              # Without this a file can appear in the snapshot with the right name and zero
+              # bytes: the writer's data is still in the page cache, which the snapshot of the
+              # volume does not see. The failure only shows up at restore time.
+              for pod in "${PODS[@]}"; do
+                kubectl exec -n "${NS}" "${pod}" -- sync
+                echo "synced ${pod}"
+              done
+              echo "DataStage engine volumes flushed; safe to snapshot."
+
+  restorePosthook:
+    phases:
+      # Kasten has just put the engine volumes back. The operator was parked in maintenance mode
+      # before the restore (a manual pre-restore step — see README), so nothing has been
+      # reconciling while the PVCs were replaced. Take it out of maintenance and wait for the
+      # engine to come back to Completed, so the restore action does not report success while
+      # DataStage is still assembling itself.
+      - func: KubeTask
+        name: leaveMaintenanceAndWait
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              TIMEOUT_SECS=1800          # IBM uses 1800s for the same transition in cpdbr
+
+              # Idempotent: patching a CR that is already out of maintenance is a no-op.
+              kubectl patch datastage datastage -n "${NS}" --type=merge \
+                -p '{"spec":{"ignoreForMaintenance":false}}'
+              for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+                kubectl patch pxruntime "${px}" -n "${NS}" --type=merge \
+                  -p '{"spec":{"ignoreForMaintenance":false}}'
+              done
+
+              # The operator restores the replica counts itself once it is reconciling again.
+              deadline=$(( $(date +%s) + TIMEOUT_SECS ))
+              while :; do
+                pending=""
+                s=$(kubectl get datastage datastage -n "${NS}" -o jsonpath='{.status.dsStatus}' 2>/dev/null || true)
+                [ "${s}" = "Completed" ] || pending="DataStage=${s:-<none>}"
+                for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+                  s=$(kubectl get pxruntime "${px}" -n "${NS}" -o jsonpath='{.status.dsStatus}')
+                  [ "${s}" = "Completed" ] || pending="${pending} ${px}=${s:-<none>}"
+                done
+                [ -z "${pending}" ] && break
+                if [ "$(date +%s)" -ge "${deadline}" ]; then
+                  echo "ERROR: DataStage did not return to Completed within ${TIMEOUT_SECS}s: ${pending}"
+                  exit 1
+                fi
+                echo "waiting for reconciliation: ${pending}"
+                sleep 20
+              done
+
+              echo "DataStage is out of maintenance and Completed."
+              echo "NEXT: recompile the flows of any affected project (cpdctl dsjob compile --project <name>)"
+              echo "      and run one job as a smoke test. See README.md, Restore."

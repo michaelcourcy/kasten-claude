@@ -1,0 +1,37 @@
+# Bind datastage-engine-bp to the single DataStage "runtime" Deployment.
+#
+# Why that one workload: the hooks act on the whole engine (they discover every pod mounting an
+# engine volume, and every PXRuntime CR in the namespace), so they must run EXACTLY ONCE per
+# backup. Eight Deployments carry app.kubernetes.io/name=datastage; adding
+# component=runtime narrows it to one — datastage-ibm-datastage-runtime — which is also a
+# /ds-storage writer, so it is never absent while the engine exists.
+#
+# The DoesNotExist clause on the annotation is the usual escape hatch: a workload that carries
+# kanister.kasten.io/blueprint keeps its own, more specific blueprint instead of this one.
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: datastage-engine-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: datastage-engine-bp
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+      - labels:
+          key: app.kubernetes.io/name
+          operator: In
+          values: [datastage]
+      - labels:
+          key: app.kubernetes.io/component
+          operator: In
+          values: [runtime]
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist
