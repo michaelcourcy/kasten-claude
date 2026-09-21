@@ -1,0 +1,18 @@
+apiVersion: postgresql.k8s.enterprisedb.io/v1
+kind: Cluster
+metadata:
+  name: edb-cluster
+  namespace: edb-test
+  annotations:
+    # Enables the EDB Kasten add-on: the operator elects a replica, decorates it
+    # and its PVC group, and publishes the pre/post backup hook commands.
+    k8s.enterprisedb.io/addons: '["kasten"]'
+spec:
+  instances: 2
+  imageName: quay.io/enterprisedb/postgresql:16.10
+  storage:
+    size: 1Gi
+    storageClass: managed-csi
+  walStorage:
+    size: 1Gi
+    storageClass: managed-csi

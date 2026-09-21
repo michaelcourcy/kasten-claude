@@ -1,0 +1,241 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  # The name is not free: the EDB Kasten add-on annotates the elected instance pod with
+  # kanister.kasten.io/blueprint: edb-hooks. Keeping this name means the annotation and the
+  # blueprint agree, whichever binding mechanism ends up driving the execution.
+  name: edb-hooks
+  namespace: kasten-io
+actions:
+
+  # ---------------------------------------------------------------------------------------
+  # backupPrehook — fence the instance the operator elected, then flush its filesystems.
+  # ---------------------------------------------------------------------------------------
+  backupPrehook:
+    phases:
+      - func: KubeTask
+        name: fenceElectedInstance
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NS="{{ .Object.metadata.namespace }}"
+              CLUSTER="{{ .Object.metadata.name }}"
+              EDB_CLUSTER="clusters.postgresql.k8s.enterprisedb.io"
+
+              # The operator publishes its election in two places. Read the annotation first
+              # (authoritative), fall back to the label the add-on puts on the pod.
+              POD=$(kubectl get "$EDB_CLUSTER" -n "$NS" "$CLUSTER" -o json \
+                | jq -r '.metadata.annotations["k8s.enterprisedb.io/backupInstance"] // empty')
+              if [ -z "$POD" ]; then
+                POD=$(kubectl get pods -n "$NS" \
+                  -l "k8s.enterprisedb.io/cluster=${CLUSTER},kasten-enterprisedb.io/hasHooks=true" \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              fi
+
+              if [ -z "$POD" ]; then
+                echo "ERROR: cluster ${NS}/${CLUSTER} has no elected backup instance."
+                echo "       The EDB Kasten add-on is not enabled on this cluster. Add:"
+                echo '         k8s.enterprisedb.io/addons: '"'"'["kasten"]'"'"''
+                echo "       Refusing to continue: without fencing the snapshot would be taken"
+                echo "       from a running instance and is not a cold backup."
+                exit 1
+              fi
+              echo "Elected backup instance: ${POD}"
+
+              POD_JSON=$(kubectl get pod -n "$NS" "$POD" -o json)
+              CONTAINER=$(echo "$POD_JSON" | jq -r '.metadata.annotations["kasten-enterprisedb.io/pre-backup-container"]')
+              mapfile -t PRE_CMD < <(echo "$POD_JSON" \
+                | jq -r '.metadata.annotations["kasten-enterprisedb.io/pre-backup-command"] | fromjson | .[]')
+              mapfile -t ERR_CMD < <(echo "$POD_JSON" \
+                | jq -r '.metadata.annotations["kasten-enterprisedb.io/pre-backup-on-error"] // "[]" | fromjson | .[]')
+
+              if [ -z "$CONTAINER" ] || [ "${#PRE_CMD[@]}" -eq 0 ]; then
+                echo "ERROR: pod ${POD} carries no kasten-enterprisedb.io pre-backup hook annotations."
+                exit 1
+              fi
+
+              # Already fenced by a previous attempt? Kasten may retry a phase, and the hook is
+              # not guaranteed to be idempotent, so skip straight to the verification.
+              FENCED=$(kubectl get "$EDB_CLUSTER" -n "$NS" "$CLUSTER" -o json \
+                | jq -r '.metadata.annotations["k8s.enterprisedb.io/fencedInstances"] // "[]"')
+              if echo "$FENCED" | jq -e --arg p "$POD" 'index($p) != null' >/dev/null; then
+                echo "Instance ${POD} is already fenced — skipping the pre-backup hook"
+              else
+                echo "Running pre-backup hook in ${POD}/${CONTAINER}: ${PRE_CMD[*]}"
+                if ! kubectl exec -n "$NS" "$POD" -c "$CONTAINER" -- "${PRE_CMD[@]}"; then
+                  echo "ERROR: pre-backup hook failed — running the operator's onError hook"
+                  if [ "${#ERR_CMD[@]}" -gt 0 ]; then
+                    kubectl exec -n "$NS" "$POD" -c "$CONTAINER" -- "${ERR_CMD[@]}" || true
+                  fi
+                  exit 1
+                fi
+              fi
+
+              # Do not take the hook's exit code as proof. Confirm the operator recorded the
+              # fence and that PostgreSQL really stopped, otherwise the snapshot would be hot.
+              for _ in $(seq 1 60); do
+                FENCED=$(kubectl get "$EDB_CLUSTER" -n "$NS" "$CLUSTER" -o json \
+                  | jq -r '.metadata.annotations["k8s.enterprisedb.io/fencedInstances"] // "[]"')
+                if echo "$FENCED" | jq -e --arg p "$POD" 'index($p) != null' >/dev/null; then
+                  break
+                fi
+                sleep 2
+              done
+              if ! echo "$FENCED" | jq -e --arg p "$POD" 'index($p) != null' >/dev/null; then
+                echo "ERROR: ${POD} is not listed in k8s.enterprisedb.io/fencedInstances (${FENCED})"
+                exit 1
+              fi
+
+              for _ in $(seq 1 60); do
+                if kubectl exec -n "$NS" "$POD" -c "$CONTAINER" -- \
+                     bash -c 'test ! -f "$PGDATA/postmaster.pid"' 2>/dev/null; then
+                  STOPPED=yes; break
+                fi
+                STOPPED=no; sleep 2
+              done
+              if [ "$STOPPED" != "yes" ]; then
+                echo "ERROR: PostgreSQL is still running in ${POD} (postmaster.pid present)."
+                exit 1
+              fi
+              # A cleanly stopped standby reports "shut down in recovery". Log it: it is the
+              # single best evidence that what Kasten is about to snapshot is a cold copy.
+              kubectl exec -n "$NS" "$POD" -c "$CONTAINER" -- \
+                bash -c 'pg_controldata "$PGDATA"' 2>/dev/null \
+                | grep -i "Database cluster state" || true
+
+              # Last thing before Kasten snapshots: flush the page cache. A CSI snapshot copies
+              # the block device, and Kasten does not fsfreeze, so anything PostgreSQL wrote on
+              # shutdown but the kernel has not written back would be missing from the snapshot.
+              # Both the PG_DATA and the PG_WAL volume are mounted in this pod, so one sync
+              # covers the whole elected PVC group.
+              echo "Flushing filesystems on ${POD}"
+              kubectl exec -n "$NS" "$POD" -c "$CONTAINER" -- sync
+              echo "Instance ${POD} fenced and flushed — ready for snapshot"
+
+  # ---------------------------------------------------------------------------------------
+  # backupPosthook — unfence, so the instance restarts and catches up with the primary.
+  # ---------------------------------------------------------------------------------------
+  backupPosthook:
+    phases:
+      - func: KubeTask
+        name: unfenceElectedInstance
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NS="{{ .Object.metadata.namespace }}"
+              CLUSTER="{{ .Object.metadata.name }}"
+              EDB_CLUSTER="clusters.postgresql.k8s.enterprisedb.io"
+
+              POD=$(kubectl get "$EDB_CLUSTER" -n "$NS" "$CLUSTER" -o json \
+                | jq -r '.metadata.annotations["k8s.enterprisedb.io/backupInstance"] // empty')
+              if [ -z "$POD" ]; then
+                POD=$(kubectl get pods -n "$NS" \
+                  -l "k8s.enterprisedb.io/cluster=${CLUSTER},kasten-enterprisedb.io/hasHooks=true" \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              fi
+              if [ -z "$POD" ]; then
+                echo "No elected backup instance found — nothing to unfence"
+                exit 0
+              fi
+
+              POD_JSON=$(kubectl get pod -n "$NS" "$POD" -o json)
+              CONTAINER=$(echo "$POD_JSON" | jq -r '.metadata.annotations["kasten-enterprisedb.io/post-backup-container"]')
+              mapfile -t POST_CMD < <(echo "$POD_JSON" \
+                | jq -r '.metadata.annotations["kasten-enterprisedb.io/post-backup-command"] | fromjson | .[]')
+
+              if [ -n "$CONTAINER" ] && [ "${#POST_CMD[@]}" -gt 0 ]; then
+                echo "Running post-backup hook in ${POD}/${CONTAINER}: ${POST_CMD[*]}"
+                kubectl exec -n "$NS" "$POD" -c "$CONTAINER" -- "${POST_CMD[@]}"
+              fi
+
+              # The operator's hook removes the instance from the fencing list, but it does so
+              # asynchronously: reading the annotation straight after the exec usually still
+              # shows the old value. Give it time before concluding anything.
+              for _ in $(seq 1 30); do
+                FENCED=$(kubectl get "$EDB_CLUSTER" -n "$NS" "$CLUSTER" -o json \
+                  | jq -r '.metadata.annotations["k8s.enterprisedb.io/fencedInstances"] // "[]"')
+                if ! echo "$FENCED" | jq -e --arg p "$POD" 'index($p) != null' >/dev/null; then
+                  echo "Instance ${POD} unfenced"
+                  exit 0
+                fi
+                sleep 2
+              done
+
+              # Still fenced a minute later: the instance would stay down for good, so take the
+              # fence off by hand. Remove only this instance from the list — rewriting the whole
+              # annotation away would also unfence instances somebody else fenced on purpose.
+              echo "WARNING: ${POD} still fenced (${FENCED}) — removing it from the fence list"
+              REMAINING=$(echo "$FENCED" | jq -c --arg p "$POD" 'map(select(. != $p))')
+              if [ "$REMAINING" = "[]" ]; then
+                kubectl annotate "$EDB_CLUSTER" -n "$NS" "$CLUSTER" \
+                  k8s.enterprisedb.io/fencedInstances- --overwrite
+              else
+                kubectl annotate "$EDB_CLUSTER" -n "$NS" "$CLUSTER" \
+                  "k8s.enterprisedb.io/fencedInstances=${REMAINING}" --overwrite
+              fi
+              echo "Instance ${POD} unfenced"
+
+  # ---------------------------------------------------------------------------------------
+  # restorePosthook — a restore point is taken while an instance is fenced, so the restored
+  # Cluster comes back carrying the fencing annotation and would never start.
+  # ---------------------------------------------------------------------------------------
+  restorePosthook:
+    phases:
+      - func: KubeTask
+        name: clearFencingAndWaitReady
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
+          command:
+            - bash
+            - -o
+            - errexit
+            - -o
+            - pipefail
+            - -c
+            - |
+              NS="{{ .Object.metadata.namespace }}"
+              CLUSTER="{{ .Object.metadata.name }}"
+              EDB_CLUSTER="clusters.postgresql.k8s.enterprisedb.io"
+
+              FENCED=$(kubectl get "$EDB_CLUSTER" -n "$NS" "$CLUSTER" -o json \
+                | jq -r '.metadata.annotations["k8s.enterprisedb.io/fencedInstances"] // empty')
+              if [ -n "$FENCED" ]; then
+                echo "Restored cluster is fenced (${FENCED}) — removing the annotation"
+                kubectl annotate "$EDB_CLUSTER" -n "$NS" "$CLUSTER" \
+                  k8s.enterprisedb.io/fencedInstances- --overwrite
+              else
+                echo "Restored cluster carries no fencing annotation"
+              fi
+
+              echo "Waiting for cluster ${NS}/${CLUSTER} to report a ready instance"
+              for _ in $(seq 1 120); do
+                READY=$(kubectl get "$EDB_CLUSTER" -n "$NS" "$CLUSTER" \
+                  -o jsonpath='{.status.readyInstances}' 2>/dev/null || echo 0)
+                PHASE=$(kubectl get "$EDB_CLUSTER" -n "$NS" "$CLUSTER" \
+                  -o jsonpath='{.status.phase}' 2>/dev/null || true)
+                echo "  readyInstances=${READY:-0} phase=${PHASE}"
+                if [ "${READY:-0}" -ge 1 ]; then
+                  echo "Cluster ${NS}/${CLUSTER} is serving again"
+                  exit 0
+                fi
+                sleep 5
+              done
+              echo "ERROR: cluster ${NS}/${CLUSTER} did not become ready in time"
+              exit 1

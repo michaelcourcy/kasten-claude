@@ -1,0 +1,29 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: Policy
+metadata:
+  name: edb-backup-policy
+  namespace: edb-test
+spec:
+  comment: "EDB cold backup - snapshot the elected instance's PVC group only"
+  frequency: "@onDemand"
+  actions:
+    - action: backup
+      backupParameters:
+        profile:
+          # A Location profile (not an Infra profile) is required so the restore point records
+          # a Kanister-compatible profile for the restorePosthook.
+          name: <LOCATION_PROFILE>
+          namespace: kasten-io
+        filters:
+          # The operator labels every pod and PVC it does not want backed up. Reading its label
+          # rather than naming instances keeps the snapshotted set equal to the fenced set: if
+          # the operator elects a different instance tomorrow, this filter follows it.
+          excludeResources:
+            - matchLabels:
+                kasten-enterprisedb.io/excluded: "true"
+  selector:
+    matchExpressions:
+      - key: k10.kasten.io/appNamespace
+        operator: In
+        values:
+          - edb-test

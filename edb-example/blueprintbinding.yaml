@@ -1,0 +1,21 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: edb-hooks-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: edb-hooks
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: postgresql.k8s.enterprisedb.io
+              resource: clusters
+      # Leave the door open for a cluster that needs a more specific blueprint: annotating it
+      # with kanister.kasten.io/blueprint takes it out of this binding instead of conflicting.
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist
