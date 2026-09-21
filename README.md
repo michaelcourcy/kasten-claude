@@ -2,6 +2,29 @@
 
 Generate Kasten blueprint with Claude Code 
 
+# Disclaimer — Ownership and Responsibility
+
+Kasten provides **Kanister**, a framework for application-aware data protection, and the
+integration of that framework into the product. Kasten is responsible for maintaining Kanister
+and its integration as part of the product.
+
+**Blueprints, however, are entirely owned by the customer.** A blueprint is custom logic written
+by (or on behalf of) the customer and executed against their own databases. Kasten cannot be held
+responsible for any data loss or corruption resulting from a blueprint that is incorrect,
+destructive, or that fails to properly quiesce or protect a database. Validating that a blueprint
+backs up and restores correctly — including the end-to-end testing described in `CLAUDE.md` — is
+the customer's responsibility before using it in production.
+
+The relationship is analogous to Microsoft providing the C# language and its surrounding
+framework: Microsoft maintains the language and runtime, but in no case is Microsoft responsible
+for the destructive behavior of a C# program written by one of its customers. The same boundary
+applies here between Kasten/Kanister (the framework) and the blueprints (the customer's program).
+
+Every blueprint directory in this repository is an **example**: each one encodes the operator
+version, CR layout, storage class, credentials, namespace topology, and consistency level of the
+deployment it was developed against, and is therefore a starting point to be adapted and
+re-validated — never a turnkey solution to be applied as-is.
+
 # Prompting 
 
 All the blueprint you'll find here were generated using promp with claude code. Read carrefully CLAUDE.md for 
