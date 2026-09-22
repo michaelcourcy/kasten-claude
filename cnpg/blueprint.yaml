@@ -10,7 +10,7 @@ actions:
         name: pauseWalReplay
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.4
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
           command:
             - bash
             - -o
@@ -45,7 +45,7 @@ actions:
         name: resumeWalReplay
         args:
           namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.4
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
           command:
             - bash
             - -o
@@ -73,35 +73,6 @@ actions:
               PAUSED=$(kubectl exec -n "$NAMESPACE" "$REPLICA" -- \
                 psql -U postgres -At -c "SELECT pg_is_wal_replay_paused();")
               echo "WAL replay paused after resume: $PAUSED"
-
-  restorePrehook:
-    # NOTE: not yet triggered by Kasten <= 8.5.x — see README for manual steps
-    phases:
-      - func: KubeTask
-        name: stopCluster
-        args:
-          namespace: kasten-io
-          image: michaelcourcy/kasten-tools:8.5.4
-          command:
-            - bash
-            - -o
-            - errexit
-            - -o
-            - pipefail
-            - -c
-            - |
-              NAMESPACE="{{ .Object.metadata.namespace }}"
-              CLUSTER="{{ .Object.metadata.name }}"
-
-              echo "Deleting CNPG Cluster CR — operator will stop all pods and remove PVCs"
-              kubectl delete cluster.postgresql.cnpg.io "$CLUSTER" \
-                -n "$NAMESPACE" --ignore-not-found
-
-              echo "Waiting for all CNPG pods to terminate"
-              kubectl wait pods -n "$NAMESPACE" \
-                -l "cnpg.io/cluster=$CLUSTER" \
-                --for=delete --timeout=5m || true
-              echo "All CNPG pods terminated"
 
   restorePosthook:
     phases:

@@ -7,12 +7,19 @@ Backup and restore for [CloudNativePG](https://cloudnative-pg.io/) PostgreSQL cl
 
 | Component | Version |
 |---|---|
-| Kubernetes | `1.32` (EKS), `1.33` (AKS) |
-| Kasten | `8.5.4`, `8.5.7` |
-| CNPG Helm chart | `cloudnative-pg 0.28.0` |
-| CNPG operator | `1.29.0` |
+| Kubernetes | `1.31` |
+| OpenShift | `4.18.6` |
+| Kasten | `9.0.5` |
+| CNPG Helm chart | `cloudnative-pg 0.28.3` |
+| CNPG operator | `1.29.1` |
 | PostgreSQL | `18.3` |
-| pgvector | `0.8.2` (tested — see [PostgreSQL extensions](#postgresql-extensions)) |
+| Storage | Azure Disk CSI (`managed-csi`) |
+| Tool image | `ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5` ([Dockerfile](../images/kasten-tools/Dockerfile)) |
+
+The blueprint was first developed on EKS `1.32` with Kasten `8.5.4` and CNPG `1.29.0`, then
+re-validated end-to-end on the OpenShift cluster above. Nothing in `blueprint.yaml` is
+platform-specific — only the **operator installation** needs an OpenShift adjustment, described
+in [Prerequisites](#install-the-cnpg-operator).
 
 ## Pattern
 
@@ -31,7 +38,7 @@ The quiesced replica's PVC snapshot is the sole source of truth for restore.
 
 ### Restore
 
-1. `restorePrehook` deletes the CNPG Cluster CR. The operator stops all pods and
+1. Manually delete the CNPG Cluster CR before restore. The operator stops all pods and
    garbage-collects PVCs (CNPG owns PVC lifecycle).
 2. Kasten restores the replica PVC from the quiesced snapshot, with its original CNPG labels.
 3. Kasten recreates the Cluster CR from the backup.
@@ -40,32 +47,17 @@ The quiesced replica's PVC snapshot is the sole source of truth for restore.
 5. A fresh replica is created via streaming replication.
 6. `restorePosthook` waits for the cluster condition `Ready`.
 
-## PostgreSQL extensions
-
-This blueprint works with **any PostgreSQL extension** (pgvector, PostGIS, TimescaleDB, etc.)
-without modification. Extension data — columns, indexes (HNSW, IVFFlat, GiST, …), and catalog
-entries — lives entirely in PostgreSQL's data files on the PVC. The WAL-replay-pause strategy
-captures all of it at the storage level, so there is nothing extension-specific to handle during
-backup or restore.
-
-pgvector was explicitly tested end-to-end: vector embeddings, HNSW indexes, and cosine similarity
-queries all survived a full destroy-and-restore cycle. See the
-[pgvector test workload](#deploy-a-pgvector-test-workload-optional) section below for a
-ready-to-use example.
-
 ## Blueprint actions
 
 | Action | What it does |
 |---|---|
 | `backupPrehook` | Finds a replica pod, pauses WAL replay (`pg_wal_replay_pause()`) |
 | `backupPosthook` | Resumes WAL replay on the same replica (`pg_wal_replay_resume()`) |
-| `restorePrehook` | Deletes the Cluster CR so the operator stops all pods and PVCs before Kasten restores (**not yet triggered in Kasten ≤ 8.5.x — see warning below**) |
 | `restorePosthook` | Waits for the cluster condition `Ready` (operator handles primary promotion automatically) |
 
-## ⚠️ restorePrehook — manual workaround (Kasten ≤ 8.5.x)
+## Manual pre-restore preparation
 
-`restorePrehook` is **not yet triggered** by Kasten in versions ≤ 8.5.x. Until the fix ships,
-perform these steps **manually before triggering a Kasten restore**:
+Perform these steps manually before triggering a Kasten restore:
 
 ```bash
 # Delete the Cluster CR — operator will terminate all pods and remove PVCs
@@ -88,7 +80,7 @@ apiVersion: config.kio.kasten.io/v1alpha1
 kind: Policy
 metadata:
   name: cnpg-backup-policy
-  namespace: cnpg-test
+  namespace: kasten-io
 spec:
   comment: "CNPG backup - quiesced replica PVC only, primary excluded"
   frequency: "@onDemand"
@@ -114,9 +106,16 @@ This ensures Kasten snapshots only the quiesced replica PVC.
 When triggering a RestoreAction, Kasten will restore the replica PVC only — the CNPG operator
 then auto-promotes it to primary.
 
-## Prerequisites
+Check the filter did what you expect: after a backup there must be exactly **one** VolumeSnapshot,
+and its source must be the replica PVC.
 
-- `michaelcourcy/kasten-tools:8.5.4` image available (adds `kubectl` to `gcr.io/kasten-images/kanister-tools:8.5.4`), built from the shared [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile).
+```bash
+kubectl get volumesnapshot -n cnpg-test
+# NAME                            READYTOUSE   SOURCEPVC      ...
+# k10-csi-snap-4bc2xvswcwlbjqr4   true         pg-cluster-2   ...
+```
+
+## Prerequisites
 
 ### Install the CNPG operator
 
@@ -126,9 +125,71 @@ helm repo update cnpg
 helm install cnpg cnpg/cloudnative-pg \
   --namespace cnpg-system \
   --create-namespace \
-  --version 0.28.0 \
+  --version 0.28.3 \
   --wait --timeout 3m
 ```
+
+#### On OpenShift: the operator pod needs one extra value
+
+The command above **fails on OpenShift**. The Helm chart sets a fixed UID and GID on the operator
+container:
+
+```yaml
+containerSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+```
+
+OpenShift gives every namespace its own range of allowed UIDs (written in the
+`openshift.io/sa.scc.uid-range` annotation on the namespace) and the `restricted-v2` Security
+Context Constraint only admits pods whose UID falls inside that range. `10001` is not in the range,
+so the pod is never created and `helm install --wait` ends on a timeout:
+
+```
+Error: INSTALLATION FAILED: context deadline exceeded
+```
+
+The real reason is only visible in the ReplicaSet events, not in the Helm output:
+
+```bash
+kubectl get events -n cnpg-system --sort-by=.lastTimestamp
+```
+
+```
+Error creating: pods "cnpg-cloudnative-pg-..." is forbidden: unable to validate against any
+security context constraint: [... provider restricted-v2: .containers[0].runAsUser:
+Invalid value: 10001: must be in the ranges: [1001120000, 1001129999] ...]
+```
+
+The fix is to remove the two fields and let OpenShift assign the UID and GID itself. The operator
+is a Go binary that does not care which UID it runs under:
+
+```bash
+cat > cnpg-openshift-values.yaml <<'EOF'
+# OpenShift: let the restricted-v2 SCC assign the UID and GID from the namespace range.
+# The chart defaults (runAsUser/runAsGroup 10001) are outside that range and the pod is rejected.
+containerSecurityContext:
+  runAsUser: null
+  runAsGroup: null
+EOF
+
+helm install cnpg cnpg/cloudnative-pg \
+  --namespace cnpg-system \
+  --create-namespace \
+  --version 0.28.3 \
+  -f cnpg-openshift-values.yaml \
+  --wait --timeout 5m
+```
+
+Do **not** work around this by granting the `anyuid` SCC to the operator service account. That
+raises the privileges of the operator for no benefit, while the values override keeps it under
+`restricted-v2`.
+
+> **The PostgreSQL cluster pods need nothing.** Only the operator Deployment is affected. The CNPG
+> operator detects that it is running on OpenShift (the `SecurityContextConstraints` API is
+> present) and leaves `runAsUser` and `runAsGroup` unset on the instance pods it creates, so
+> `restricted-v2` assigns them a valid UID. The `Cluster` manifest below is the same on OpenShift
+> as anywhere else.
 
 ### Deploy the blueprint and binding
 
@@ -136,6 +197,11 @@ helm install cnpg cnpg/cloudnative-pg \
 kubectl apply -f blueprint.yaml
 kubectl apply -f blueprintbinding.yaml
 ```
+
+Both hooks run in the shared `kasten-tools` image (`kanister-tools` plus `kubectl` and `jq`),
+built from [../images/kasten-tools/Dockerfile](../images/kasten-tools/Dockerfile). The tag must
+match the Kasten version installed on the cluster — here `9.0.5`. Detect yours with
+`helm ls -n kasten-io`, and if it differs, update the two `image:` lines in `blueprint.yaml`.
 
 ## Deploy the test workload
 
@@ -152,15 +218,15 @@ spec:
   instances: 2
   storage:
     size: 1Gi
-    storageClass: ebs-sc
+    storageClass: managed-csi
 EOF
 ```
 
-> **Storage class**: `ebs-sc` is the AWS EBS CSI storage class used in our test environment.
-> Replace it with a storage class that supports CSI snapshots on your cluster
-> (e.g. `managed-csi` on AKS, `standard-rwo` on GKE, your custom class on bare-metal, etc.).
+> **Storage class**: `managed-csi` is the Azure Disk CSI storage class used in our test
+> environment. Replace it with a storage class that supports CSI snapshots on your cluster
+> (for example, `ebs-sc` on AWS, `standard-rwo` on GKE, your custom class on bare-metal, and so on).
 > The class must have a matching `VolumeSnapshotClass` registered with Kasten.
-> Do **not** use legacy in-tree classes (e.g. `gp2` on AWS) — they do not support CSI snapshots.
+> Do **not** use legacy in-tree classes (for example, `gp2` on AWS) — they do not support CSI snapshots.
 
 Wait for the cluster to be ready:
 
@@ -196,9 +262,40 @@ kubectl exec -n cnpg-test pg-cluster-1 -- \
   psql -U postgres -d kasten_test -c "SELECT * FROM employees ORDER BY id;"
 ```
 
-Run the policy and corrupt some data :
+## Run a backup
 
-```bash 
+Trigger the on-demand policy with a `RunAction` and wait for it to complete:
+
+```bash
+kubectl create -f - <<EOF
+apiVersion: actions.kio.kasten.io/v1alpha1
+kind: RunAction
+metadata:
+  generateName: run-cnpg-
+  namespace: kasten-io
+spec:
+  subject:
+    kind: Policy
+    name: cnpg-backup-policy
+    namespace: kasten-io
+EOF
+
+kubectl get backupaction -n cnpg-test
+```
+
+Confirm in the Kanister log that both hooks ran:
+
+```bash
+kubectl logs -n kasten-io -l component=kanister --tail=2000 | grep -E 'WAL replay'
+# Pausing WAL replay on replica pg-cluster-2
+# WAL replay paused: t
+# Resuming WAL replay on replica pg-cluster-2
+# WAL replay paused after resume: f
+```
+
+## Corrupt the data
+
+```bash
 
 kubectl exec -n cnpg-test pg-cluster-1 -- \
   psql -U postgres -d kasten_test -c "DELETE FROM employees WHERE department = 'Engineering';"
@@ -208,11 +305,17 @@ kubectl exec -n cnpg-test pg-cluster-1 -- \
 
 ```
 
-then create a restore action from the last restore point 
+## Restore
+
+Delete the `Cluster` CR first — the operator then terminates the pods and garbage-collects the
+PVCs, so Kasten restores into an empty namespace:
 
 ```bash
-# delete the cnpg cluster 
+# delete the cnpg cluster
 kubectl delete clusters.postgresql.cnpg.io pg-cluster -n cnpg-test
+
+# both pods and both PVCs must be gone before restoring
+kubectl get pods,pvc -n cnpg-test
 
 RESTORE_POINT=$(kubectl get restorepoint -n cnpg-test \
   -o jsonpath='{.items[-1].metadata.name}')
@@ -233,10 +336,33 @@ spec:
 EOF
 ```
 
-> No `profile` is needed in the `RestoreAction` — Kasten extracts the location profile from
-> the `RestorePointContent` automatically.
+> **`profile` on Kasten 9.x and on 8.x.** On Kasten `9.0.5` no `profile` is needed in the
+> `RestoreAction`: Kasten extracts the location profile from the `RestorePointContent` on its own,
+> which is how the restore above was validated. On Kasten `8.x` that extraction is unreliable and
+> the restore fails **after the volumes have been restored**, with the `restorePosthook` never
+> running. On `8.x`, name the profile explicitly:
+>
+> ```yaml
+>   profile:
+>     name: <LOCATION_PROFILE>
+>     namespace: kasten-io
+> ```
 
+Wait for the restore to finish, then confirm the posthook ran:
 
+```bash
+kubectl get restoreaction -n cnpg-test
+kubectl logs -n kasten-io -l component=kanister --tail=2000 | grep -E 'restorePosthook|waitForClusterReady'
+```
+
+The CNPG operator promotes the restored replica PVC to primary, so the primary is now
+`pg-cluster-2` and a fresh replica `pg-cluster-3` is built by streaming replication:
+
+```bash
+kubectl get clusters.postgresql.cnpg.io -n cnpg-test
+# NAME         INSTANCES   READY   STATUS                      PRIMARY
+# pg-cluster   2           2       Cluster in healthy state    pg-cluster-2
+```
 
 ## Validate data after restore
 
@@ -252,101 +378,11 @@ kubectl exec -n cnpg-test "$PRIMARY" -- \
 # Expected: 5 rows — Alice, Bob, Carol, David, Eve
 ```
 
-## Deploy a pgvector test workload (optional)
-
-Use this instead of (or in addition to) the plain PostgreSQL workload above to validate
-backup/restore with vector embeddings.
-
-```bash
-kubectl create namespace cnpg-test
-
-cat <<EOF | kubectl apply -f -
-apiVersion: postgresql.cnpg.io/v1
-kind: Cluster
-metadata:
-  name: pg-cluster
-  namespace: cnpg-test
-spec:
-  instances: 2
-  storage:
-    size: 2Gi
-    storageClass: ebs-sc
-  postgresql:
-    shared_preload_libraries:
-      - vector
-EOF
-```
-
-> **Storage class**: `ebs-sc` is the AWS EBS CSI storage class used in our test environment.
-> Replace it with a storage class that supports CSI snapshots on your cluster
-> (e.g. `managed-csi` on AKS, `standard-rwo` on GKE, your custom class on bare-metal, etc.).
-> The class must have a matching `VolumeSnapshotClass` registered with Kasten.
-> Do **not** use legacy in-tree classes (e.g. `gp2` on AWS) — they do not support CSI snapshots.
-
-Wait for the cluster to be ready:
-
-```bash
-kubectl wait cluster.postgresql.cnpg.io pg-cluster -n cnpg-test \
-  --for=condition=Ready --timeout=8m
-```
-
-### Create pgvector test data
-
-```bash
-kubectl exec -n cnpg-test pg-cluster-1 -- \
-  psql -U postgres -c "CREATE DATABASE vector_test;"
-
-kubectl exec -n cnpg-test pg-cluster-1 -- \
-  psql -U postgres -d vector_test -c "
-    CREATE EXTENSION IF NOT EXISTS vector;
-
-    CREATE TABLE documents (
-      id SERIAL PRIMARY KEY,
-      title TEXT NOT NULL,
-      content TEXT NOT NULL,
-      embedding vector(4) NOT NULL
-    );
-
-    INSERT INTO documents (title, content, embedding) VALUES
-      ('Kubernetes Basics',   'Pods are the smallest deployable units.',         '[0.12, 0.85, 0.33, 0.67]'),
-      ('Docker Overview',     'Containers package code and dependencies.',       '[0.15, 0.82, 0.29, 0.71]'),
-      ('PostgreSQL Indexing', 'B-tree indexes speed up equality queries.',       '[0.91, 0.10, 0.44, 0.22]'),
-      ('pgvector Search',     'HNSW indexes enable fast nearest neighbor search.','[0.88, 0.14, 0.50, 0.19]'),
-      ('Kasten Backup',       'Blueprints define application-aware backup hooks.','[0.55, 0.60, 0.72, 0.41]');
-
-    CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops);
-  "
-```
-
-### Validate pgvector data after restore
-
-```bash
-PRIMARY=$(kubectl get pods -n cnpg-test \
-  -l "cnpg.io/cluster=pg-cluster,cnpg.io/instanceRole=primary" \
-  -o jsonpath='{.items[0].metadata.name}')
-
-# All 5 rows should be present with original embeddings
-kubectl exec -n cnpg-test "$PRIMARY" -- \
-  psql -U postgres -d vector_test -c "SELECT id, title, embedding FROM documents ORDER BY id;"
-
-# Similarity search should return: Kubernetes Basics (1.0), Docker Overview (0.998), Kasten Backup (0.823)
-kubectl exec -n cnpg-test "$PRIMARY" -- \
-  psql -U postgres -d vector_test -c "
-    SELECT id, title, 1 - (embedding <=> '[0.12, 0.85, 0.33, 0.67]') AS cosine_similarity
-    FROM documents
-    ORDER BY embedding <=> '[0.12, 0.85, 0.33, 0.67]'
-    LIMIT 3;
-  "
-
-# HNSW index should be intact
-kubectl exec -n cnpg-test "$PRIMARY" -- \
-  psql -U postgres -d vector_test -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'documents';"
-```
-
 ## Destroy the test workload
 
 ```bash
 kubectl delete namespace cnpg-test
+kubectl delete policy cnpg-backup-policy -n kasten-io
 
 # Clean up restore point contents created by Kasten
 kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=cnpg-test
@@ -360,3 +396,9 @@ kubectl delete namespace cnpg-system
 kubectl delete blueprint cnpg-blueprint -n kasten-io
 kubectl delete blueprintbinding cnpg-blueprint-binding -n kasten-io
 ```
+
+---
+
+## Initial prompt
+
+> Create a blueprint to back up a CNPG instance.
