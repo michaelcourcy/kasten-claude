@@ -1,0 +1,43 @@
+# Create the consistency-test keyspace and tables ONCE, before starting the load.
+# See the `schema` mode in ct.py for why the load pods must not do it themselves.
+#   kubectl apply -f schema-job.yaml && kubectl wait -n cassandra-test --for=condition=complete job/ct-schema --timeout=300s
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ct-schema
+  namespace: cassandra-test
+  labels:
+    consistency-test: schema
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        consistency-test: schema
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: schema
+          image: docker.io/library/python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              pip install --quiet --no-cache-dir --target /tmp/pylib cassandra-driver==3.29.2
+              exec python -u /app/ct.py schema
+          env:
+            - {name: PYTHONPATH, value: /tmp/pylib}
+            - {name: HOME, value: /tmp}
+            - {name: CASSANDRA_HOST, value: demo-dc1-service}
+            - {name: CASSANDRA_DC, value: dc1}
+            - {name: CT_KEYSPACE, value: consistency_run3}   # a new keyspace for each run
+            - name: CASSANDRA_USER
+              valueFrom: {secretKeyRef: {name: demo-superuser, key: username}}
+            - name: CASSANDRA_PASSWORD
+              valueFrom: {secretKeyRef: {name: demo-superuser, key: password}}
+          volumeMounts:
+            - {name: script, mountPath: /app}
+      volumes:
+        - name: script
+          configMap: {name: ct-script}

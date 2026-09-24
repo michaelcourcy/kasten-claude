@@ -1,0 +1,38 @@
+# A 3-node Cassandra datacenter managed by cass-operator: one node per rack, one rack per
+# availability zone. cass-operator creates ONE StatefulSet PER RACK
+# (<clusterName>-<dcName>-<rack>-sts), so this produces three StatefulSets of one pod each.
+apiVersion: cassandra.datastax.com/v1beta1
+kind: CassandraDatacenter
+metadata:
+  name: dc1
+  namespace: cassandra-test
+spec:
+  clusterName: demo
+  serverType: cassandra
+  serviceAccount: cassandra      # OpenShift: bound to the nonroot-v2 SCC in openshift-scc.yaml
+  serverVersion: "5.0.5"
+  size: 3
+  racks:
+    - name: r1
+      nodeAffinityLabels: {topology.kubernetes.io/zone: francecentral-1}
+    - name: r2
+      nodeAffinityLabels: {topology.kubernetes.io/zone: francecentral-2}
+    - name: r3
+      nodeAffinityLabels: {topology.kubernetes.io/zone: francecentral-3}
+  storageConfig:
+    cassandraDataVolumeClaimSpec:
+      storageClassName: managed-csi
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 10Gi
+  resources:
+    requests: {cpu: "1", memory: 4Gi}
+    limits: {memory: 4Gi}
+  # Heap: 2 GB inside a 4 GiB container. 1 GB was too small under the heavy-write test in
+  # consistency-perf-test/: one node filled its old generation, spent seconds in each GC pause,
+  # dropped millions of mutations and could not finish `nodetool flush`.
+  config:
+    jvm-server-options:
+      initial_heap_size: 2G
+      max_heap_size: 2G

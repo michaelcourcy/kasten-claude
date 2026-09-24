@@ -1,0 +1,27 @@
+# Bind cassandra-cass-operator-bp to every CassandraDatacenter.
+#
+# Bind the CR, not the StatefulSets. The StatefulSets are owned by the CassandraDatacenter, and
+# Kasten runs only the topmost owner's blueprint. A binding on the CR is also what stops Kasten
+# from applying its built-in K8ssandra (Medusa) blueprint. See the header of blueprint.yaml.
+#
+# The DoesNotExist clause on the annotation is the usual escape hatch: a CassandraDatacenter that
+# carries kanister.kasten.io/blueprint keeps its own, more specific blueprint instead.
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: cassandra-cass-operator-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: cassandra-cass-operator-bp
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: cassandra.datastax.com
+              resource: cassandradatacenters
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

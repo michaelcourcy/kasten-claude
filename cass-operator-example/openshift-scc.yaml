@@ -1,0 +1,23 @@
+# OpenShift only. cass-operator runs Cassandra as UID 999 with fsGroup 999, which the default
+# restricted-v2 SCC rejects ("999 is not an allowed group"). nonroot-v2 accepts any non-root
+# UID and any fsGroup, and is narrower than anyuid (it still forbids UID 0).
+# The CassandraDatacenter names this ServiceAccount in spec.serviceAccount.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cassandra
+  namespace: cassandra-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cassandra-scc-nonroot-v2
+  namespace: cassandra-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:nonroot-v2
+subjects:
+  - kind: ServiceAccount
+    name: cassandra
+    namespace: cassandra-test

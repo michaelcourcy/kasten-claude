@@ -1,0 +1,57 @@
+# Consistency test load: N writer/reader pods in the Cassandra namespace.
+#
+# Every pod is one ledger writer (see ct.py). Scale `replicas` and MAX_INFLIGHT to change the
+# load. The pods carry the label consistency-test=load so that the restore can EXCLUDE them —
+# otherwise Kasten would restore this Deployment too, and new writers would start while the
+# restored cluster is still starting and being repaired. See README.md.
+#
+# Create the ConfigMap holding the script, then the schema (schema-job.yaml), first:
+#   kubectl create configmap ct-script -n cassandra-test --from-file=ct.py
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ct-load
+  namespace: cassandra-test
+  labels:
+    consistency-test: load
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      consistency-test: load
+  template:
+    metadata:
+      labels:
+        consistency-test: load
+    spec:
+      containers:
+        - name: load
+          image: docker.io/library/python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              pip install --quiet --no-cache-dir --target /tmp/pylib cassandra-driver==3.29.2
+              exec python -u /app/ct.py load
+          env:
+            - {name: PYTHONPATH, value: /tmp/pylib}
+            - {name: HOME, value: /tmp}
+            - {name: CASSANDRA_HOST, value: demo-dc1-service}
+            - {name: CASSANDRA_DC, value: dc1}
+            - {name: CT_KEYSPACE, value: consistency_run3}   # a new keyspace for each run
+            - {name: MAX_INFLIGHT, value: "64"}
+            - {name: READER_THREADS, value: "4"}
+            - {name: PAYLOAD_BYTES, value: "256"}   # 10 GiB volumes: keep disk growth under control
+            - name: CASSANDRA_USER
+              valueFrom: {secretKeyRef: {name: demo-superuser, key: username}}
+            - name: CASSANDRA_PASSWORD
+              valueFrom: {secretKeyRef: {name: demo-superuser, key: password}}
+          resources:
+            requests: {cpu: 500m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: script, mountPath: /app}
+      volumes:
+        - name: script
+          configMap: {name: ct-script}

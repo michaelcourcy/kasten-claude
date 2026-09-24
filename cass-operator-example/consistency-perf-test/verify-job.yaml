@@ -1,0 +1,53 @@
+# Verify the restored ledger against the watermark captured just before the backup.
+#
+# Create the watermark ConfigMap from the file saved at backup time first:
+#   kubectl create configmap ct-watermark -n cassandra-test --from-file=watermark.json
+# Then:
+#   kubectl apply -f verify-job.yaml && kubectl logs -n cassandra-test job/ct-verify -f
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ct-verify
+  namespace: cassandra-test
+  labels:
+    consistency-test: verify
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        consistency-test: verify
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: docker.io/library/python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              pip install --quiet --no-cache-dir --target /tmp/pylib cassandra-driver==3.29.2
+              exec python -u /app/ct.py verify
+          env:
+            - {name: PYTHONPATH, value: /tmp/pylib}
+            - {name: HOME, value: /tmp}
+            - {name: CASSANDRA_HOST, value: demo-dc1-service}
+            - {name: CASSANDRA_DC, value: dc1}
+            - {name: CT_KEYSPACE, value: consistency_run3}   # a new keyspace for each run
+            - {name: WATERMARK_FILE, value: /wm/watermark.json}
+            # ALL: every replica must answer, so a row present on only one replica after the
+            # restore cannot hide a problem. Run it after the restorePosthook repair.
+            - {name: VERIFY_CONSISTENCY, value: ALL}
+            - name: CASSANDRA_USER
+              valueFrom: {secretKeyRef: {name: demo-superuser, key: username}}
+            - name: CASSANDRA_PASSWORD
+              valueFrom: {secretKeyRef: {name: demo-superuser, key: password}}
+          volumeMounts:
+            - {name: script, mountPath: /app}
+            - {name: wm, mountPath: /wm}
+      volumes:
+        - name: script
+          configMap: {name: ct-script}
+        - name: wm
+          configMap: {name: ct-watermark}

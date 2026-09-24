@@ -1,0 +1,202 @@
+# Apache Cassandra managed by cass-operator — pattern 2 (quiesce).
+#
+# Kasten is the data mover: it snapshots the server-data PVC of every Cassandra node. This
+# blueprint only makes those snapshots cheap to recover from, and brings the ring back into
+# agreement after a restore.
+#
+# Why a flush and not a stronger quiesce: Cassandra is built to survive a crash on each node.
+# Every write goes to the commit log before it changes the in-memory table (the memtable), and a
+# node that starts from a crash-consistent volume replays that log. `nodetool flush` writes the
+# memtables out as SSTables (immutable data files), so the replay after a restore is short and
+# the data sits in files that Kopia can deduplicate from one backup to the next. It does NOT
+# stop traffic. `nodetool drain` would stop writes, but the node then refuses writes until the
+# pod restarts — an outage, not a quiesce.
+#
+# WHY THE BLUEPRINT IS BOUND TO THE CassandraDatacenter AND NOT TO THE StatefulSets
+# (both verified on Kasten 9.0.6):
+#
+# 1. Kasten ships a BUILT-IN blueprint (k10-k8ssandra-bp-<version>) that it applies to every
+#    CassandraDatacenter. Its `backup` action creates a MedusaBackupJob, so it assumes the
+#    K8ssandra operator and Medusa. With plain cass-operator that CRD does not exist and every
+#    backup fails with: no matches for kind "MedusaBackupJob" in version
+#    "medusa.k8ssandra.io/v1alpha1". A blueprint bound explicitly to the CR replaces the
+#    built-in one; since this blueprint has no `backup` action, Kasten snapshots the PVCs itself.
+#
+# 2. Kasten runs only the TOPMOST OWNER's blueprint. cass-operator's StatefulSets (one per rack)
+#    are owned by the CassandraDatacenter. When both carry a blueprint, Kasten logs "Multiple
+#    blueprints found in ownership chain. The topmost owner's blueprint will be used." and the
+#    StatefulSet blueprint never runs — the backup still reports Complete. So all the logic lives
+#    here, and runs once per datacenter.
+#
+#    Kasten finds this blueprint by starting from a WORKLOAD (a StatefulSet) and walking up to
+#    its owner. So the policy must KEEP the StatefulSets: without them no hook runs at all and
+#    nothing is flushed. The restore, on the other hand, must EXCLUDE them — see README.md.
+#
+# Because the CR carries no pod names, the flush and the repair run as a KubeTask in kasten-io
+# (Kasten's service account can list and exec into pods in any namespace), using the shared
+# kasten-tools image (kanister-tools + kubectl + jq).
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: cassandra-cass-operator-bp
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    phases:
+      # Refuse to back up a datacenter that is not Ready: one that is stopped, scaling,
+      # replacing a node or in a rolling restart. Its PVCs may be changing.
+      - func: WaitV2
+        name: datacenterReady
+        args:
+          timeout: 2m
+          conditions:
+            anyOf:
+              - condition: '{{ if and (eq .status.cassandraOperatorProgress "Ready") (not .spec.stopped) }}true{{ else }}false{{ end }}'
+                objectReference:
+                  apiVersion: v1beta1
+                  group: cassandra.datastax.com
+                  resource: cassandradatacenters
+                  name: "{{ .Object.metadata.name }}"
+                  namespace: "{{ .Object.metadata.namespace }}"
+
+      # Flush every node, then sync — the sync MUST be the last thing that happens. A CSI
+      # snapshot captures the block device, not the page cache: an SSTable that `nodetool flush`
+      # has written but the kernel has not yet put on disk would appear in the snapshot with its
+      # name and zero bytes, and nobody would notice until the restore.
+      - func: KubeTask
+        name: flushAndSync
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.6
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              DC="{{ .Object.metadata.name }}"
+              SEL="cassandra.datastax.com/datacenter=${DC}"
+
+              # ---- 1. The PVCs to flush are the PVCs Kasten will snapshot -----------------
+              # cass-operator labels every PVC it creates with the datacenter label. Reading
+              # the PVCs (not the pods) first means the flushed set is derived from what gets
+              # snapshotted, and a PVC that no running pod mounts is reported, not missed.
+              mapfile -t PVCS < <(kubectl get pvc -n "${NS}" -l "${SEL}" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+              if [ "${#PVCS[@]}" -eq 0 ]; then
+                echo "ERROR: no PVC carries ${SEL} in ${NS}; nothing would be snapshotted"
+                exit 1
+              fi
+              echo "datacenter ${DC}: ${#PVCS[@]} PVC(s): ${PVCS[*]}"
+
+              # Warn about PVCs in the namespace that are NOT this datacenter's. The policy
+              # captures the whole namespace, so they are snapshotted too, but this blueprint
+              # does not flush them.
+              kubectl get pvc -n "${NS}" -o json | jq -r --arg dc "${DC}" '
+                .items[] | select(.metadata.labels["cassandra.datastax.com/datacenter"] != $dc)
+                | "WARNING: PVC \(.metadata.name) is in the namespace but not in datacenter \($dc); it is snapshotted without a flush"'
+
+              # ---- 2. Running pods that mount them --------------------------------------
+              PVC_JSON=$(printf '%s\n' "${PVCS[@]}" | jq -R . | jq -sc .)
+              PODS_JSON=$(kubectl get pods -n "${NS}" -o json)
+              mapfile -t PODS < <(jq -r --argjson pvcs "${PVC_JSON}" '
+                .items[] | select(.status.phase == "Running")
+                | select(any(.spec.volumes[]?; (.persistentVolumeClaim.claimName? // "") as $c | $pvcs | index($c) != null))
+                | .metadata.name' <<<"${PODS_JSON}")
+              MOUNTED=$(jq -r '.items[] | select(.status.phase == "Running")
+                | .spec.volumes[]?.persistentVolumeClaim.claimName? // empty' <<<"${PODS_JSON}" | sort -u)
+              for pvc in "${PVCS[@]}"; do
+                if ! grep -qxF "${pvc}" <<<"${MOUNTED}"; then
+                  # A Cassandra node that is not running cannot be flushed. Fail rather than
+                  # produce a restore point where one node silently was not flushed.
+                  echo "ERROR: PVC ${pvc} is not mounted by any running pod; it cannot be flushed"
+                  exit 1
+                fi
+              done
+
+              # ---- 3. Flush and sync, all nodes in parallel -----------------------------
+              # In parallel so the nodes are flushed as close together in time as possible.
+              pids=()
+              for pod in "${PODS[@]}"; do
+                ( kubectl exec -n "${NS}" "${pod}" -c cassandra -- bash -c 'nodetool flush && sync' \
+                    && echo "${pod}: flushed and synced" ) &
+                pids+=($!)
+              done
+              rc=0
+              for pid in "${pids[@]}"; do wait "${pid}" || rc=1; done
+              if [ "${rc}" -ne 0 ]; then
+                echo "ERROR: flush failed on at least one node"
+                exit 1
+              fi
+              echo "datacenter ${DC}: ${#PODS[@]} node(s) flushed and synced; safe to snapshot"
+
+  restorePosthook:
+    phases:
+      # After a restore the operator starts the nodes one at a time. Wait until it reports the
+      # whole datacenter Ready before touching it.
+      #
+      # TIME BUDGET. Kasten stops a hook action after timeout.blueprintResourceHooks minutes
+      # (Helm value, default 20, shown in the k10-config ConfigMap as
+      # K10TimeoutBlueprintResourceHooks). That budget covers this wait AND the repair below.
+      # Measured with about 2 GB per node: about 4 min to Ready, 3 min of repair. The repair
+      # grows with data size — raise timeout.blueprintResourceHooks, or remove the repair
+      # phase and repair outside Kasten. See README.md, "Restore takes longer than 20 minutes".
+      - func: WaitV2
+        name: datacenterReady
+        args:
+          timeout: 15m
+          conditions:
+            anyOf:
+              - condition: '{{ if eq .status.cassandraOperatorProgress "Ready" }}true{{ else }}false{{ end }}'
+                objectReference:
+                  apiVersion: v1beta1
+                  group: cassandra.datastax.com
+                  resource: cassandradatacenters
+                  name: "{{ .Object.metadata.name }}"
+                  namespace: "{{ .Object.metadata.namespace }}"
+
+      # Every node has replayed its own commit log, but the nodes were not snapshotted at the
+      # same instant, so replicas can disagree about writes that arrived in the seconds between
+      # two snapshots. A repair makes them agree again.
+      #
+      # `nodetool repair --full -pr` on every node, one node after the other:
+      #  - `-pr` repairs only the token ranges each node is primary for, so running it on every
+      #    node repairs the ring exactly once in total;
+      #  - `--full` because incremental repair skips SSTables already marked as repaired, and
+      #    the restored SSTables may carry that mark from before the backup;
+      #  - one node at a time, which is the load Cassandra's own tooling assumes.
+      #
+      # Repair time grows with data size. For a large cluster you may prefer to remove this
+      # phase and let your scheduled repair (for example Reaper) do it — see README.md.
+      - func: KubeTask
+        name: repair
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.6
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              DC="{{ .Object.metadata.name }}"
+              mapfile -t PODS < <(kubectl get pods -n "${NS}" \
+                -l "cassandra.datastax.com/datacenter=${DC}" --field-selector=status.phase=Running \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+              [ "${#PODS[@]}" -gt 0 ] || { echo "ERROR: no running Cassandra pod in ${DC}"; exit 1; }
+
+              # Do not trust the operator's Ready alone: during testing the CR reported Ready
+              # while one node was not ready. Ask Cassandra whether every node in the ring is
+              # Up/Normal, because a repair with a replica down fails.
+              status=$(kubectl exec -n "${NS}" "${PODS[0]}" -c cassandra -- nodetool status)
+              echo "${status}"
+              if grep -E '^[UD][NLJM] ' <<<"${status}" | grep -vq '^UN '; then
+                echo "ERROR: not every node is Up/Normal; not repairing"
+                exit 1
+              fi
+
+              for pod in "${PODS[@]}"; do
+                echo "${pod}: nodetool repair --full -pr"
+                kubectl exec -n "${NS}" "${pod}" -c cassandra -- nodetool repair --full -pr
+              done
+              echo "datacenter ${DC}: repair complete on ${#PODS[@]} node(s)"

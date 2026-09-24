@@ -1,0 +1,46 @@
+# Step 6 (deduplication measurement) helper: run ct.py once, with the arguments in CT_ARGS.
+#   fill:    CT_ARGS="fill 200000"          ~50 MB of random rows (200,000 x 256 B)
+#   change:  CT_ARGS="change 1 200000"      rewrite 1% of them with new random payloads
+#   kubectl delete job ct-dedup -n cassandra-test --ignore-not-found
+#   sed 's/__ARGS__/fill 200000/' dedup-job.yaml | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ct-dedup
+  namespace: cassandra-test
+  labels:
+    consistency-test: dedup
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        consistency-test: dedup
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: dedup
+          image: docker.io/library/python:3.11-slim
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              pip install --quiet --no-cache-dir --target /tmp/pylib cassandra-driver==3.29.2
+              exec python -u /app/ct.py __ARGS__
+          env:
+            - {name: PYTHONPATH, value: /tmp/pylib}
+            - {name: HOME, value: /tmp}
+            - {name: CASSANDRA_HOST, value: demo-dc1-service}
+            - {name: CASSANDRA_DC, value: dc1}
+            - {name: CT_KEYSPACE, value: dedup}
+            - {name: PAYLOAD_BYTES, value: "256"}
+            - name: CASSANDRA_USER
+              valueFrom: {secretKeyRef: {name: demo-superuser, key: username}}
+            - name: CASSANDRA_PASSWORD
+              valueFrom: {secretKeyRef: {name: demo-superuser, key: password}}
+          volumeMounts:
+            - {name: script, mountPath: /app}
+      volumes:
+        - name: script
+          configMap: {name: ct-script}

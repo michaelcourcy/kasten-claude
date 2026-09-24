@@ -1,0 +1,43 @@
+# Kasten policy for the Cassandra namespace.
+#
+# It captures the whole namespace: the CassandraDatacenter CR, the StatefulSets the operator
+# created, the superuser Secret and every server-data PVC. The Secret matters — the password
+# hash stored in Cassandra's system_auth keyspace (on the PVCs) must match it after a restore.
+#
+# Do NOT exclude the StatefulSets here, even though they are useless at restore time (the
+# operator regenerates them from the CR, and the restore must exclude them — see README.md).
+# Kasten finds hook blueprints by starting from each WORKLOAD and walking up its owner chain to
+# the topmost owner, the CassandraDatacenter. Without a StatefulSet in the backup there is no
+# workload to start from: backupPrehook never runs, nothing is flushed, and the backup still
+# reports Complete. Verified on Kasten 9.0.6.
+#
+# The OLM ClusterServiceVersion copies are excluded: OLM puts a copy of every AllNamespaces
+# operator's CSV in each namespace. They belong to the operator namespace, not to this backup.
+#
+# The profile MUST be a Location profile (S3/GCS/Azure Blob), not Infra. Only a Location profile
+# is recorded in the RestorePointContent in a form Kanister can use, which is what allows
+# restorePosthook to run at all.
+#   kubectl get profile <name> -n kasten-io -o jsonpath='{.spec.type}'   # must print: Location
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: Policy
+metadata:
+  name: cassandra-test-backup
+  namespace: kasten-io
+spec:
+  frequency: "@onDemand"
+  actions:
+    - action: backup
+      backupParameters:
+        profile:
+          name: <your-location-profile>
+          namespace: kasten-io
+        filters:
+          excludeResources:
+            - group: operators.coreos.com
+              resource: clusterserviceversions
+  selector:
+    matchExpressions:
+      - key: k10.kasten.io/appNamespace
+        operator: In
+        values:
+          - cassandra-test
