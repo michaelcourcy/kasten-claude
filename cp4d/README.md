@@ -114,25 +114,42 @@ docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:1.8.24
 > mutable tag can leave stale layers cached on some nodes → `executable ... not found` errors.
 > Update the image reference in [blueprint.yaml](blueprint.yaml) and [restore.sh](restore.sh).
 
-### 2. CP4D credentials — a service-user API key in the `cpd` namespace
+### 2. CP4D credentials — the `cpadmin` API key in the `cpd` namespace
 
-Use a **dedicated CP4D service user** rather than the admin — a distinct identity you can audit and
-revoke independently, scoped to the projects you choose. The keeper authenticates headlessly with
-that user's **platform API key**, which is stored in a Secret **in `cpd`** — deliberately *outside*
+The keeper runs as the built-in administrator **`cpadmin`**. It authenticates headlessly with
+`cpadmin`'s **platform API key**, which is stored in a Secret **in `cpd`** — deliberately *outside*
 the backed-up namespace, so it is never captured in a restore point.
 
-> Note that "dedicated" is not the same as "low-privilege": granting `manage_project` below makes
-> this identity able to reach every project's data in the cluster — see the warning immediately
-> below before deciding.
+> **Why `cpadmin` and not a dedicated service user.** On Software Hub 5.2 with the Identity
+> Management Service (`iamIntegration: true`, the default on a new 5.2 install), CP4D does not store
+> passwords. A login identity must already exist in an identity provider: the Identity Management
+> default admin (`cpadmin`), LDAP, OpenShift OAuth, SAML or OIDC. `POST /usermgmt/v1/user` only
+> gives an existing identity access to the platform. We tested it: a user created that way with a
+> `password` field gets `authenticator: external`, and logging in with that password returns
+> `Unauthorized`. On our test cluster the only providers were `cpadmin` and the shared OpenShift
+> htpasswd list, so `cpadmin` is the only identity whose API key can be obtained by script.
+>
+> What this costs you:
+>
+> | Trade-off | Consequence |
+> |---|---|
+> | No separate identity | Backup activity cannot be audited or revoked apart from the administrator's. |
+> | Visible to project owners | `cpadmin` appears as an editor in every project's collaborator list. |
+> | Shared key | Whoever regenerates `cpadmin`'s API key (UI or API) breaks the backup until the Secret is updated. |
+>
+> If your cluster has LDAP or another provider where you can create a dedicated user, you can use
+> it instead: set `SVC_USER` to that user and get its API key **as that user** (for a federated
+> user, sign in to the web UI, then *Profile and settings → API key*). Every other step is the same.
 
-> 🚨 **THE SERVICE USER MUST HOLD `manage_project`, AND IT WILL BACK UP EVERY PROJECT IN THE
-> CLUSTER.** Both halves matter. Measured 2026-08-07 on CP4D 5.2.x:
+> 🚨 **THE KEEPER IDENTITY MUST HOLD `manage_project`, AND IT WILL BACK UP EVERY PROJECT IN THE
+> CLUSTER.** `cpadmin` does **not** have `manage_project` by default. Both halves matter. Measured
+> on CP4D 5.2.x (2026-08-07, re-checked 2026-10-15):
 >
 > | Capability | What grants it |
 > |---|---|
-> | **See** a project (`cpdctl project list`) | the **`manage_project`** permission — cluster-wide, no membership needed. Without it a user sees only its own projects, and *the Administrator role is no exemption*: `cpadmin` could not see another user's project until added as a collaborator. |
+> | **See** a project (`cpdctl project list`) | the **`manage_project`** permission — cluster-wide, no membership needed. Without it a user sees only its own projects, and *the Administrator role is no exemption*: `cpadmin` removed from a project no longer saw it, and saw it again as soon as it held `manage_project`. |
 > | **Export** a project (`asset export start`) | **editor-or-above membership on that specific project**. No platform permission substitutes — a role carrying `administrator` + `manage_project` + `monitor_project` still fails `SPACES0045E … missing required editor member role`. |
-> | **Add a member** to a project | `manage_project` **also grants this** — a holder that is a member of nothing added *itself* as editor (`HTTP 200`), where `cpadmin` was refused `403 "not a member of the project"`. |
+> | **Add a member** to a project | `manage_project` **also grants this** — a holder that is a member of nothing added *itself* as editor (`HTTP 200`), where `cpadmin` without it was refused `403 "not a member of the project"`. |
 >
 > These are two separate authorization systems: a **role** bundles *platform* permissions (what you
 > may do to the cluster), while **project membership** is a per-project entry governing access to
@@ -143,84 +160,119 @@ the backed-up namespace, so it is never captured in a restore point.
 > backup fails loudly (before any data moves) rather than quietly omitting that project.
 >
 > **The consequence you must accept:** the keeper backs up **every analytics project in the
-> cluster**, including ones created later, and grants itself editor on each to do so. Project owners
-> will see the service user appear in their collaborator list. `manage_project` therefore means *"can
-> reach the data of every project"* — a **higher** privilege than the Administrator role. Do not
-> describe this identity as least-privilege; its API key is a cluster-wide data-access credential, so
-> protect the Secret accordingly. If some projects must stay untouched, this blueprint is not
-> currently able to exclude them.
+> cluster**, including ones created later, and grants itself editor on each to do so. Its API key
+> is a cluster-wide data-access credential, so protect the Secret accordingly. If some projects must
+> stay untouched, this blueprint is not currently able to exclude them.
 
 **The keeper authenticates with the API key alone — never a password.**
 [cpdctl-login.sh](images/cp4d-backup/cpdctl-login.sh) runs
-`cpdctl config user set svc --username … --apikey …`, and the Secret holds only `url`, `username`
-and `apikey`. No CP4D password ever exists in the cluster.
+`cpdctl config user set svc --username … --apikey …`, and the Secret holds only `url`, `username`,
+`apikey` and `uid`. The `cpadmin` password is used once, on your workstation, to obtain the key; it
+is never stored in the backup namespace.
 
-A platform API key belongs to **one user**, and the API returns the key of whoever the bearer token
-belongs to. There is no admin endpoint to mint a key on another user's behalf: you must obtain the
-key **as the service user**. Getting this wrong is the common mistake — a token obtained with admin
-credentials yields the *admin's* key, and the blueprint then runs with far more privilege than
-intended.
+`manage_project` is not in any of the eight built-in roles, so the procedure creates a custom role
+(`Backup Reader`) for it. The permission catalog validates names strictly — `manage_projects`
+(plural) is rejected with *"Request body contains permissions that are not known to the platform"*;
+the accepted names are **`manage_project`** and **`monitor_project`**.
 
-**How you get that key depends on which identity provider backs the user** — but only for this
-one-time step. Once the key exists, the keeper behaves identically either way (verified against an
-OpenShift-federated user):
+### Procedure (run once, as `cpadmin`)
 
-| The service user is backed by | Get the API key |
-|---|---|
-| **LDAP**, or the **built-in admin** (`cpadmin`) | **Scriptable** — the two REST calls below. IAM can verify the password itself (its own store, or an LDAP bind), so `{username, password}` returns a token. |
-| **OpenShift OAuth, OIDC, or SAML** | **Through the web UI** — sign in as that user, then *Profile and settings → API key*, and skip to step 3 below with the value. Federated login is a browser redirect; the password never reaches CP4D, so there is no scriptable token call. |
-
-Either way the key itself is identical, never expires, and goes into the same Secret.
-
-### Scriptable path (LDAP or built-in admin)
-
-Two REST calls, both against the `cpd` route:
+All calls go to the `cpd` route. Nothing is typed by hand: the `cpadmin` credentials are read from
+the platform's own Secret.
 
 ```bash
 CPD_HOST=$(oc get route cpd -n cpd -o jsonpath='{.spec.host}')
+SVC_USER=$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_username}' | base64 -d)
+SVC_PW=$(oc  get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_password}' | base64 -d)
+echo "SVC_USER=${SVC_USER}"     # cpadmin
 
-# ---- the only two values you supply by hand ----
-SVC_USER='<service-user>'
-SVC_PW='<service-user-password>'
-
-# ...unless the user is the built-in admin (cpadmin), in which case read both from the
-# secret instead of typing them — uncomment these two lines and skip the two above:
-# SVC_USER=$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_username}' | base64 -d)
-# SVC_PW=$(oc  get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_password}' | base64 -d)
-
-# 1. Exchange the service user's username + password for a bearer token.
+# 1. Exchange username + password for a bearer token.
 #    Response: {"token":"<JWT>","message":"success","_messageCode_":"success"}
 TOKEN=$(curl -sSk -X POST "https://${CPD_HOST}/icp4d-api/v1/authorize" \
   -H 'Content-Type: application/json' \
   -d "{\"username\":\"${SVC_USER}\",\"password\":\"${SVC_PW}\"}" \
   | jq -r .token)
 
-# Fail loudly instead of carrying an empty token into step 2.
+# Fail loudly instead of carrying an empty token into the next steps.
 if [ -z "$TOKEN" ] || [ "$TOKEN" = null ]; then
-  echo "auth failed. Re-run the curl WITHOUT '| jq -r .token' to see the real error:"
-  echo "  401 'User unauthorized to invoke this endpoint' means either a wrong password"
-  echo "  OR the user is not authorized on the platform (Access control -> Add users)."
+  echo "auth failed. Re-run the curl WITHOUT '| jq -r .token' to see the real error."
   return 2>/dev/null || exit 1
 fi
 
-# 2. Read that user's platform API key using the token.
-#    Response: {"apiKey":"<40 chars>","expire_at":null,"message":"success","_messageCode_":"success"}
+# 2. Create the role carrying cluster-wide project visibility (once per cluster).
+#    Response: {"id":"<uuid>","message":"success"}.
+#    If the role already exists: 409 "This role already exists." — harmless, step 3 finds it.
+curl -sSk -X POST "https://${CPD_HOST}/usermgmt/v1/role" \
+  -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
+  -d '{"role_name":"Backup Reader","description":"Cluster-wide project visibility for the backup keeper",
+       "permissions":["manage_project","sign_in_only"]}'
+
+# 3. Retrieve the ROLE_ID by name. A custom role gets a generated UUID as its id
+#    (built-in roles have readable ids such as zen_administrator_role); the name is under .doc.
+ROLE_ID=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/roles" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  | jq -r '.rows[] | select(.doc.role_name=="Backup Reader") | .id')
+echo "ROLE_ID=${ROLE_ID}"     # for example 51d5f900-a966-4d82-9645-cbb2aa3c1d50
+
+# 4. Add the role to cpadmin. PUT REPLACES the whole role list, so read the current
+#    roles and append — sending only [ROLE_ID] would remove zen_administrator_role.
+NEW_ROLES=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/${SVC_USER}" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  | jq -c --arg r "$ROLE_ID" '(.user_roles + [$r]) | unique')
+echo "NEW_ROLES=${NEW_ROLES}" # must still contain zen_administrator_role
+
+# The body MUST repeat "username", even though it is already in the URL: without it
+# the call returns 400 "Parameter (body) failed schema validation" and changes nothing.
+curl -sSk -X PUT "https://${CPD_HOST}/usermgmt/v1/user/${SVC_USER}" \
+  -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"${SVC_USER}\",\"user_roles\":${NEW_ROLES}}"
+# Response: {"uid":"1000331001","_messageCode_":"success","message":"success"}
+
+# 5. Get an API key and the numeric uid.
+#    ⚠️ GET /usermgmt/v1/user/apiKey GENERATES A NEW KEY on every call and invalidates the
+#    previous one (verified: the old key then returns "Unauthorized"). Anything else that uses
+#    cpadmin's API key stops working. Run this step once, and update the Secret right after.
+#    The uid is needed by the keeper to add itself as a project member: CP4D rejects a member
+#    payload carrying only user_name ("Field state cannot be set to ACTIVE without specifying
+#    a member id"), and there is no cpdctl "whoami".
 APIKEY=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/apiKey" \
   -H "Authorization: Bearer ${TOKEN}" | jq -r .apiKey)
-
-# 3. Read the user's numeric uid. The keeper needs it to add itself as a project member:
-#    CP4D rejects a member payload carrying only user_name ("Field state cannot be set to
-#    ACTIVE without specifying a member id"), and there is no cpdctl "whoami".
 SVC_UID=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/${SVC_USER}" \
   -H "Authorization: Bearer ${TOKEN}" | jq -r .uid)
 
-# 4. Store url + username + apikey + uid for the keeper to read cross-namespace.
+# 6. Verify: the role is assigned and manage_project is now in the permissions.
+curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/${SVC_USER}" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  | jq -c '{user_roles, has_manage_project: (.permissions | index("manage_project") != null)}'
+# Expected: {"user_roles":["<ROLE_ID>","zen_administrator_role"],"has_manage_project":true}
+
+# 7. Store url + username + apikey + uid for the keeper to read cross-namespace.
+#    create --dry-run | apply makes this re-runnable (it replaces an existing Secret).
 kubectl create secret generic cp4d-backup-cpdctl-creds -n cpd \
   --from-literal=url="https://${CPD_HOST}" \
   --from-literal=username="${SVC_USER}" \
   --from-literal=apikey="${APIKEY}" \
-  --from-literal=uid="${SVC_UID}"
+  --from-literal=uid="${SVC_UID}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+unset SVC_PW TOKEN APIKEY
 ```
+
+> **Web UI alternative for steps 2–4.** On Software Hub 5.2, user management is **not** in the
+> *IBM Cloud Pak for Data* menu, even for `cpadmin`. It is in a separate console, the **IBM Software
+> Hub Administration Console**. Its menu contains *Access control*, *Identity providers*,
+> *Monitoring*, *Diagnostics* and so on. The old 4.x URL `/zen/#/userManagement` no longer exists
+> and redirects to the home page.
+>
+> 1. Sign in as `cpadmin`.
+> 2. Open the Administration Console. Either click the **Switch locations** icon in the toolbar and
+>    choose the administration console, or open this URL directly:
+>    `https://<CPD_HOST>/zen-admin/?deployment_target=icp4data#/usermgmt-ui`
+> 3. **Access control → Roles → New role**: name `Backup Reader`, permission *Manage projects*.
+> 4. **Access control → Users** → `cpadmin` → **Assign roles** → tick **Backup Reader** → save.
+>
+> We found this URL in the platform's own menu registry (`GET /zen-data/v1/extensions`, entry
+> `dap-admin-users`, which applies only to the `core` context). It was not taken from the IBM docs.
 
 Verify the Secret is usable before deploying anything else. This mirrors exactly what
 [cpdctl-login.sh](images/cp4d-backup/cpdctl-login.sh) does inside the keeper — it reads the same
@@ -233,36 +285,24 @@ three keys (`url`, `username`, `apikey`) and runs the same two `cpdctl config` c
 ./bin/cpdctl config profile set svc-check \
   --url "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.url}' | base64 -d)" --user svc
 ./bin/cpdctl config profile use svc-check
-./bin/cpdctl project list          # must list the projects to back up — and only those
+./bin/cpdctl project list          # must list EVERY project, including ones cpadmin is not a member of
 ```
 
-### Grant the service user `manage_project` — REQUIRED
-
-The blueprint does not work correctly without it: the keeper would enumerate only the projects it
-already belongs to and would silently back up a subset of the cluster.
-`manage_project` is not in any of the eight built-in roles, so you have to create a role for it.
-The permission catalog validates names strictly — `manage_projects` (plural) is rejected with
-*"Request body contains permissions that are not known to the platform"*; the accepted names are
-**`manage_project`** and **`monitor_project`**:
-
-```bash
-# 1. Create a role carrying cluster-wide project visibility.
-ROLE_ID=$(curl -sSk -X POST "https://${CPD_HOST}/usermgmt/v1/role" \
-  -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
-  -d '{"role_name":"Backup Reader","description":"Cluster-wide project visibility for the backup keeper",
-       "permissions":["manage_project","sign_in_only"]}' | jq -r '.id')
-
-# 2. Assign it when authorizing the service user (POST /usermgmt/v1/user takes user_roles).
-#    Updating an existing user's roles via PUT is schema-picky — set the role at creation time,
-#    or change it in the UI (Access control -> the user -> Roles).
-```
-
-Verified: a user holding `manage_project` and a member of **no** projects listed every project in
-the cluster, while the same user without it saw only its own.
+> **Validated** on the test cluster (Software Hub 5.2) on 2026-10-15:
+>
+> | Check | Result |
+> |---|---|
+> | Step 2 on a new role name | `200 {"id":"<uuid>"}` |
+> | Step 2 when the role exists | `409 "This role already exists."` |
+> | Step 4 with `{"username", "user_roles"}` | `200`; `cpadmin` then has `manage_project` |
+> | Step 4 without `username` in the body | `400 schema validation`; nothing changed |
+> | Step 4 with only `[ROLE_ID]` | `200`, and every other role was **removed** — `PUT` replaces the list |
+> | Project created, then `cpadmin` removed from its members | `cpadmin` (administrator, no `manage_project`) **did not** list it |
+> | Same project, after step 4 | `cpadmin` listed it, while still not a member |
 
 ### Coverage is handled by the blueprint
 
-You do **not** need to add the service user to each project by hand.
+You do **not** need to add `cpadmin` to each project by hand.
 [orchestrate.sh](images/cp4d-backup/orchestrate.sh) does it on every run: it enumerates all
 projects, lists the ones it is already an editor on, and enrols itself on the difference before
 launching any export pod. Validated end-to-end on 2026-08-07 — a keeper that was an editor on **0**
@@ -272,7 +312,7 @@ If you want to see the current state, or diagnose an enrolment failure, these ar
 script compares:
 
 ```bash
-SVC_USER=<service-user>
+SVC_USER=cpadmin
 
 # A. Every project in the cluster (this is what manage_project buys you)
 ./bin/cpdctl project list --output json \
@@ -291,21 +331,24 @@ comm -23 /tmp/visible.txt /tmp/exportable.txt
 > reports wrong differences rather than warning.
 
 If enrolment fails, the prehook aborts **before any data moves** with
-`BACKUP PREHOOK FAILED: could not become an editor on N project(s)`. The usual causes are the
-service user missing `manage_project`, or a wrong `uid` in the credential Secret.
+`BACKUP PREHOOK FAILED: could not become an editor on N project(s)`. The usual causes are
+`cpadmin` missing `manage_project` (step 4 not done, or undone by a later role change), or a wrong
+`uid` in the credential Secret.
 
-**Notes on the two calls**
+**Notes on the credentials**
 
 | | |
 |---|---|
 | **The API key does not expire** | `expire_at` comes back `null`. Unlike the bearer token, it is a long-lived credential — treat the Secret accordingly, and rotate it deliberately. |
-| **The bearer token is short-lived** | The JWT from step 1 carries a **12-hour** lifetime. It is only needed to fetch the key; the keeper never uses it — it authenticates with `--apikey`, which is why no password lives in the cluster. |
+| **The bearer token is short-lived** | The JWT from step 1 carries a **12-hour** lifetime. It is only needed for the setup calls; the keeper never uses it — it authenticates with `--apikey`, which is why no password lives in the cluster. |
 | **`-k` skips TLS verification** | The `cpd` route usually presents the cluster's ingress certificate. Drop `-k` and pass `--cacert <ca.crt>` if you have the CA — leaving `-k` in a scripted, repeatable procedure is a habit worth avoiding. |
-| **Regenerating the key breaks the Secret** | If the service user's API key is regenerated (CP4D UI → *Profile and settings → API key*, or the API), update the Secret — the keeper authenticates with whatever is stored, and a stale key fails at `cpdctl` login time, i.e. inside `backupPrehook`, failing the whole backup. |
+| **Regenerating the key breaks the Secret** | `GET /usermgmt/v1/user/apiKey` (step 5) and the UI (*Profile and settings → API key*) both **generate a new key and invalidate the old one**. Because the keeper shares `cpadmin`'s key, anyone who regenerates it — by re-running step 5, or for their own scripts — breaks the backup: the stale key fails at `cpdctl` login time, inside `backupPrehook`, failing the whole backup. Update the Secret every time. |
 | **Don't leave the key in your shell history** | The commands above keep it in a variable rather than on a command line. If you paste a key literally, clear it afterwards. |
 
 > **Endpoints verified** against CP4D 5.2.x on 2026-08-07: `POST /icp4d-api/v1/authorize` → `200`
-> with a `token`; `GET /usermgmt/v1/user/apiKey` → `200` with `apiKey` + `expire_at`.
+> with a `token`; `GET /usermgmt/v1/user/apiKey` → `200` with `apiKey` + `expire_at`. Re-verified on
+> 2026-10-15: after a second `GET`, the previous key returned `Unauthorized` on
+> `POST /icp4d-api/v1/authorize` (`{"username","api_key"}`) and the new one returned a token.
 
 ### 3. Namespace, keeper ServiceAccount, and scoped RBAC
 
@@ -533,7 +576,7 @@ export CPDCONFIG=$PWD/bin/.cpdctl.config.json
 
 > The config file holds the CP4D password — **never commit it**. `cp4d/.gitignore` covers both
 > `bin/` and `.cpdctl.config.json` anywhere in the tree. Admin credentials are fine for creating a
-> fixture; the *blueprint* authenticates with a service-user API key instead (Prerequisite 2).
+> fixture; the *blueprint* authenticates with the `cpadmin` API key instead (Prerequisite 2).
 
 ### 3. Create the project and its assets
 
@@ -697,6 +740,18 @@ kubectl delete ns john-cp4d-restore
 # credential secret + RBAC in cpd
 kubectl delete secret cp4d-backup-cpdctl-creds -n cpd
 kubectl delete role,rolebinding cp4d-backup-read-creds -n cpd
+
+# optional: take manage_project away from cpadmin again (removes the Backup Reader role;
+# same PUT rules as in Prerequisite 2 — the body must repeat "username")
+CPD_HOST=$(oc get route cpd -n cpd -o jsonpath='{.spec.host}')
+TOKEN=$(curl -sSk -X POST "https://${CPD_HOST}/icp4d-api/v1/authorize" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"cpadmin\",\"password\":\"$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_password}' | base64 -d)\"}" | jq -r .token)
+ROLE_ID=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/roles" -H "Authorization: Bearer ${TOKEN}" \
+  | jq -r '.rows[] | select(.doc.role_name=="Backup Reader") | .id')
+ROLES=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/cpadmin" -H "Authorization: Bearer ${TOKEN}" \
+  | jq -c --arg r "$ROLE_ID" '.user_roles - [$r]')
+curl -sSk -X PUT "https://${CPD_HOST}/usermgmt/v1/user/cpadmin" -H "Authorization: Bearer ${TOKEN}" \
+  -H 'Content-Type: application/json' -d "{\"username\":\"cpadmin\",\"user_roles\":${ROLES}}"
 
 # Kasten restore-point content for this app
 kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=cp4d-projects-backup
