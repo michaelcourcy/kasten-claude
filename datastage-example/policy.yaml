@@ -5,14 +5,14 @@
 # all of that up is platform DR (cpdbr's job, and a different conversation). This policy captures
 # only what DataStage's engine owns.
 #
-# Three things to know before editing the filter:
+# The filter has exactly two entries, and both are needed. Read this before adding a third:
 #
-# 1. The two PVCs that matter carry NO USABLE LABEL on DataStage 5.2.2 — verified on the cluster.
-#    Only ds-temp and ds-migration are labelled (icpdsupport/addOnId: datastage), and those two
-#    are scratch space. So the filter selects on blueprint-ai/datastage-engine=true, a label the
-#    operator applies by hand — see Prerequisites in README.md. backupPrehook reads the SAME
+# 1. The PVCs, selected by blueprint-ai/datastage-engine=true. The two PVCs that matter carry NO
+#    USABLE LABEL on DataStage 5.2.2 — verified on the cluster. Only ds-temp and ds-migration are
+#    labelled (icpdsupport/addOnId: datastage), and those two are scratch space. So the operator
+#    applies this label by hand — see Prerequisites in README.md. backupPrehook reads the SAME
 #    label to decide what to flush, so the snapshotted set and the flushed set stay identical.
-# 2. THREE things must carry that label, and only the first two are obvious:
+#    THREE kinds of PVC must carry it, and only the first two are obvious:
 #      - datastage-ibm-datastage-ds-storage-pvc
 #      - <instance>-ibm-datastage-px-storage-pvc, one per PXRuntime instance (`ds-px-default` is
 #        the one the install creates; a namespace can have several instances)
@@ -20,9 +20,27 @@
 #        so flows can read and write ordinary files. They hold customer data and the install does
 #        not create them. `cpdctl dsjob list-volumes` reports the ones DataStage uses; do not
 #        blanket-label every volumes-*-pvc, because other CP4D services create those too.
-# 3. The DataStage and PXRuntime custom resources are included for reference — they record the
-#    instance topology and sizing. The documented restore procedure restores VOLUMES only; see
-#    README.md. Restoring the CRs over a live install is not part of it.
+#
+# 2. The ONE Deployment the BlueprintBinding matches (name=datastage AND component=runtime — both
+#    labels sit in one matchLabels, so both must match). It is needed for two reasons:
+#      - if the bound workload is not in the backup, its hooks never run (no precheck, no flush),
+#        and the backup still reports Complete;
+#      - if the bound workload is filtered out, Kasten does not snapshot the PVC it mounts
+#        (ds-storage) — a Kasten defect, see "Three things about Kasten filters" in README.md.
+#
+#    Do NOT include the other DataStage workloads. Kasten snapshots every PVC that an included
+#    workload mounts, whether that PVC is labelled or not. Including all of them, as an earlier
+#    version of this policy did, added three unlabelled PVCs to every restore point: ds-temp,
+#    ds-migration and conn-home-pvc. conn-home-pvc is not DataStage's at all — it belongs to
+#    Common Core Services and is also mounted by the wdp-connect-* pods. The runtime Deployment
+#    mounts ds-storage only, so including it adds nothing beyond the labelled set.
+#
+# The restore no longer needs the other workloads in the restore point either: prepare-restore.sh
+# scales them down, using the selectors IBM's own datastage-maint-aux-br-cm lists for a restore.
+#
+# Nothing else is captured. The ds-config ConfigMap and the DataStage / PXRuntime custom resources
+# were captured "for reference" in an earlier version but were never restored, and restoring the
+# CRs over a live install could ask the operator to go back to an older version. See README.md.
 #
 # The profile MUST be a Location profile (S3/GCS/Azure Blob), not Infra — only a Location profile
 # is recorded in the RestorePointContent in a Kanister-compatible form, which is what allows
@@ -47,39 +65,16 @@ spec:
         filters:
           includeResources:
             # Every PVC the operator labelled: engine volumes, one px-storage per PXRuntime
-            # instance, and any DataStage user volume. See note 2 above.
+            # instance, and any DataStage user volume. See note 1 above.
             - resource: persistentvolumeclaims
               matchLabels:
                 blueprint-ai/datastage-engine: "true"
-            # The DataStage workloads. NOT optional — see the warning in README.md:
-            # a filter that admits PVCs but no workloads makes Kasten drop a PVC that is
-            # mounted by several workloads (ds-storage), and it also means the
-            # BlueprintBinding matches nothing, so the hooks never run and the backup
-            # still reports Complete.
+            # The bound workload, and only that one. See note 2 above.
             - group: apps
               resource: deployments
               matchLabels:
                 app.kubernetes.io/name: datastage
-            - group: apps
-              resource: deployments
-              matchLabels:
-                app.kubernetes.io/component: px-runtime
-            - group: apps
-              resource: statefulsets
-              matchLabels:
-                app.kubernetes.io/component: px-compute
-            # The ds-config ConfigMap. IBM's own backup-validation-meta requires it to be in
-            # the backup, and its restore plan puts it back in the restore-pre-operators phase.
-            # 3 keys (pxDefaultInstanceID, startup-env.sh, import_license.sh) — free to capture.
-            - resource: configmaps
-              matchLabels:
-                app.kubernetes.io/component: ds-config
-                app.kubernetes.io/name: datastage
-            # The custom resources, for reference: they record the instance topology.
-            - group: ds.cpd.ibm.com
-              resource: datastages
-            - group: ds.cpd.ibm.com
-              resource: pxruntimes
+                app.kubernetes.io/component: runtime
   selector:
     matchExpressions:
       - key: k10.kasten.io/appNamespace

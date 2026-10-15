@@ -12,6 +12,10 @@
 #
 # Exits non-zero and explains itself if the restore should not be launched. Safe to re-run.
 #
+# To abandon the restore after this script has run, take the operator out of maintenance:
+#   kubectl patch datastage datastage -n cpd --type=merge -p '{"spec":{"ignoreForMaintenance":false}}'
+#   (and the same on every PXRuntime CR). The operator then scales the workloads back up itself.
+#
 set -uo pipefail
 
 NS="${NS:-cpd}"
@@ -21,8 +25,14 @@ LABEL="blueprint-ai/datastage-engine=true"
 # IBM's own numbers. datastage-maint-aux-qu-cm gives enable-maint timeout 1800s for the
 # DataStage CR and 600s for PXRuntime; we use the larger for both.
 TIMEOUT_SECS=1800
+# How long to wait for the pods to release the PVCs after the scale-down. Measured: 30 s.
+RELEASE_TIMEOUT_SECS=600
 
-echo "1/5  parking the operator (ignoreForMaintenance=true) in namespace ${NS}"
+for tool in kubectl jq; do
+  command -v "${tool}" >/dev/null || { echo "ERROR: ${tool} is required on this workstation"; exit 1; }
+done
+
+echo "1/6  parking the operator (ignoreForMaintenance=true) in namespace ${NS}"
 kubectl patch datastage datastage -n "${NS}" --type=merge \
   -p '{"spec":{"ignoreForMaintenance":true}}' >/dev/null || exit 1
 for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{.items[*].metadata.name}'); do
@@ -33,7 +43,7 @@ done
 # The gate. IBM's enable-maint builtin polls this same field (params.statusFieldName: dsStatus),
 # so this is not a heuristic — it is the condition IBM itself waits for. There is no useful
 # fixed delay to recommend: on an idle engine this returns in seconds, mid-reconcile it does not.
-echo "2/5  waiting for dsStatus=InMaintenance (IBM's own gate, timeout ${TIMEOUT_SECS}s)"
+echo "2/6  waiting for dsStatus=InMaintenance (IBM's own gate, timeout ${TIMEOUT_SECS}s)"
 deadline=$(( $(date +%s) + TIMEOUT_SECS ))
 wait_status() {   # $1=kind  $2=name  $3=wanted value
   while :; do
@@ -52,7 +62,7 @@ done
 
 # Restoring underneath a running job is worse than snapshotting one: the job keeps writing to
 # volumes that are about to be replaced. backupPrehook only warns about this; here it matters more.
-echo "3/5  checking for job runs in flight"
+echo "3/6  checking for job runs in flight"
 POD=$(kubectl get pods -n "${NS}" -l app.kubernetes.io/component=px-runtime \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -n "${POD}" ]; then
@@ -69,7 +79,7 @@ fi
 
 # A RestoreAction whose filter matches no PVC SUCCEEDS and restores nothing. Same silent-success
 # trap the backup side has, so fail loudly here instead.
-echo "4/5  checking the PVC label the restore filter selects on"
+echo "4/6  checking the PVC label the restore filter selects on"
 PVCS=$(kubectl get pvc -n "${NS}" -l "${LABEL}" -o jsonpath='{.items[*].metadata.name}')
 if [ -z "${PVCS}" ]; then
   echo "       ERROR: no PVC in ${NS} carries ${LABEL}."
@@ -79,7 +89,7 @@ if [ -z "${PVCS}" ]; then
 fi
 for p in ${PVCS}; do echo "       ${p}"; done
 
-echo "5/5  restore point"
+echo "5/6  restore point"
 if [ -n "${RP}" ]; then
   if kubectl get restorepoint "${RP}" -n "${NS}" >/dev/null 2>&1; then
     echo "       ${RP} found"
@@ -91,20 +101,52 @@ else
   kubectl get restorepoint -n "${NS}" --no-headers 2>/dev/null | awk '{print "       "$1}'
 fi
 
+# Kasten can only replace a PVC once no pod mounts it, and it scales down only the workloads it
+# restores. The restore point contains a single workload (the runtime Deployment, see policy.yaml),
+# so everything else that mounts the engine PVCs must be stopped here. These three selectors are
+# IBM's: datastage-maint-aux-br-cm, aux-meta.managed-resources, the list cpdbr itself scales down
+# for a restore. The operator is parked (step 2), so nothing scales them back up behind our back;
+# when restorePosthook takes it out of maintenance, the operator restores the replica counts itself.
+echo "6/6  scaling down the DataStage workloads (IBM's br-cm managed-resources)"
+kubectl scale deployment  -n "${NS}" -l app.kubernetes.io/name=datastage        --replicas=0 >/dev/null || exit 1
+kubectl scale deployment  -n "${NS}" -l app.kubernetes.io/component=px-runtime  --replicas=0 >/dev/null || exit 1
+kubectl scale statefulset -n "${NS}" -l app.kubernetes.io/component=px-compute  --replicas=0 >/dev/null || exit 1
+
+# Wait until no pod mounts a labelled PVC. A pod that keeps one mounted — typically a user volume
+# also used by another service — would make the RestoreAction fail on "Failed to delete PVC".
+holders() {
+  kubectl get pods -n "${NS}" -o json | jq -r --arg pvcs "${PVCS}" '
+    ($pvcs | split(" ")) as $want
+    | .items[]
+    | select([.spec.volumes[]?.persistentVolumeClaim.claimName // empty] | any(. as $c | $want | index($c)))
+    | .metadata.name'
+}
+release_deadline=$(( $(date +%s) + RELEASE_TIMEOUT_SECS ))
+while :; do
+  h=$(holders)
+  if [ -z "${h}" ]; then echo "       no pod mounts the labelled PVCs"; break; fi
+  if [ "$(date +%s)" -gt "${release_deadline}" ]; then
+    echo "       ERROR: these pods still mount a labelled PVC after ${RELEASE_TIMEOUT_SECS}s:"
+    echo "${h}" | sed 's/^/         /'
+    echo "              Stop them (they are not DataStage workloads), then re-run this script."
+    exit 1
+  fi
+  sleep 5
+done
+
 cat <<'NOTE'
 
 READY — launch the RestoreAction now (Step 2).
 
-Two things that look like failures and are not:
+What to expect:
 
-  * Several minutes of PVC churn. ignoreForMaintenance deliberately does NOT stop pods, so
-    Kasten must scale the workloads down and wait for every mount holder to release before it
-    can delete the RWX PVCs. Measured on the reference environment: about 7 minutes from
-    RestoreAction start to all 11 engine pods recreated. You do not need to scale anything
-    down yourself — Kasten does it, because the restore includes the workloads.
+  * The volume restore itself is quick. Measured on the reference environment: about 1.5 minutes
+    from RestoreAction start until Kasten reaches ~92%.
 
-  * A plateau at ~94%. That is restorePosthook clearing maintenance and waiting for dsStatus to
-    return to Completed. The action withholds success on purpose while the engine reassembles.
+  * Then a long plateau at ~92%. That is restorePosthook taking the operator out of maintenance
+    and waiting for dsStatus to return to Completed while the operator scales every workload
+    back up. Measured: about 15 minutes. The action withholds success on purpose while the
+    engine reassembles. Do not scale anything up yourself.
 
 Verify afterwards with View data, not with the schema:
 

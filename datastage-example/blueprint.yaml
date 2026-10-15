@@ -34,7 +34,7 @@ actions:
         name: precheckAndFlush
         args:
           namespace: kasten-io          # cluster-wide Kasten SA: read CRs and exec into cpd pods
-          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.7
           command:
             - bash
             - -c
@@ -147,7 +147,7 @@ actions:
         name: leaveMaintenanceAndWait
         args:
           namespace: kasten-io
-          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.5
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.7
           command:
             - bash
             - -c

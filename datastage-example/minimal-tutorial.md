@@ -305,6 +305,67 @@ a **descriptor** on `/ds-storage`, and **partitioned data** on `/px-storage`.
 > directories were present for one flow and one job. So the volume is not a faithful mirror of the
 > project — it is a superset that only grows.
 
+### 4.5b What a Data Set descriptor actually contains
+
+`customers.ds` on `/ds-storage` is **3431 bytes and holds no rows at all**. It is closer to a
+database catalog entry than to a data file. Measured by byte offset:
+
+| Offset | Section | Content |
+|---|---|---|
+| 0 | header | `Torrent Orchestrate dataset descriptor`, IBM copyright, and the exact engine build string (`$Version: X86_64 Torrent 2_3 2025/09/18 … liborchx86_64.a`) |
+| 60 | `DESCRIPT` | the **schema**, as serialized C++ objects — `APT_SchemaFieldListRep`, `APT_BasicStringDescriptor<APT_String>`, the field names |
+| ~800 | APT config | the **node configuration as it was at write time**: `node1`/`node2`/`node3`, their `fastname`s (the actual pod hostnames), and each node's `resource disk` |
+| 2395 | `SEGMENT` | `APT_DMSegment` → one `APT_DMFilePartition` per partition, each carrying the node name, the fastname, and the **absolute path** of its data file |
+| 3357 | statistics | per partition: **3 records / 84 bytes**, then **2 records / 56 bytes** |
+
+The companion `customers.ds.schema` is the only part that really is just columns, and it is plain
+text (76 bytes):
+
+```
+record
+( cust_name: string[20];
+  country: string[2];
+  amount: string[6];
+)
+```
+
+Three things follow, and each one matters for backup:
+
+1. **The descriptor is 31× larger than the data it describes** — 3431 bytes of metadata for 111
+   bytes of rows. That ratio inverts on a real Data Set, because the descriptor scales with the
+   number of *partitions*, not the number of records.
+2. **Those statistics are what `describe-dataset` reports.** 3 + 2 = 5 rows, 84 + 56 = 140 bytes —
+   exactly the `DataSet Row Count: 5` / `DataSet Size: 140` it prints. Nothing re-validates them
+   against the filesystem, which is why they survive the data being deleted.
+3. **The recorded byte counts are logical, not on-disk.** 84 = 3 × 28 and 56 = 2 × 28 (the record
+   width is 20+2+6), while the files on disk are 58 and 53 bytes — the Data Set format compresses.
+   Visible in the raw bytes as run-length runs of the generator's fill characters.
+
+### 4.5c Why `customers.ds` is browsable in the UI and `customers.txt` is not
+
+Both are written by the same flow to the same volume set, yet only one appears under **Data sets**
+in the project. The difference is a single stage property:
+
+```
+customers_ds     op=PxDataSet          registerDataAsset=True   dataAssetName=customers.ds
+customers_txt    op=PxSequentialFile    registerDataAsset=False  dataAssetName=-
+```
+
+`registerDataAsset` is what creates the project asset, and therefore what decides UI visibility.
+`customers.txt` exists on `/px-storage/data/` and is fully protected by the backup, but nothing in
+CP4D points at it, so it cannot be browsed or previewed. Set the flag to `true` on that stage and it
+would register an asset too.
+
+**The preview is a live read, not a stored sample.** Viewing a Data Set needs all three of the
+descriptor on `/ds-storage`, the data files on `/px-storage`, and a **running** PXRuntime pod. The
+three menu entries are therefore three different levels of proof:
+
+| Menu entry | Reads | Survives losing `/px-storage`? |
+|---|---|---|
+| **View relationships** | CP4D metadata only | yes |
+| **View schema** | the descriptor | **yes — and reports the old row count as if nothing were wrong** |
+| **View data** | descriptor + data files + a live engine | **no — the only honest one** |
+
 ### 4.6 What an export actually contains — the two different exports
 
 Two different CLIs export the same project, and they do **not** produce the same thing. Measured on
