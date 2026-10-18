@@ -7,15 +7,23 @@
 # sets — are CP4D project assets and are protected by cp4d-example, not by this blueprint. See
 # README.md.
 #
-# Why there is no quiesce phase: IBM's own online-backup hooks for DataStage
-# (configmap datastage-maint-aux-ckpt-cm, shipped by the install) are EMPTY — pre-hooks,
-# post-hooks and checkpoint hooks all `exec-rules: []`. The only thing IBM requires is a
-# precheck that the DataStage and PXRuntime custom resources report dsStatus == Completed,
-# with on-error: Fail. Maintenance mode (spec.ignoreForMaintenance) is used by the OFFLINE
-# path only, and it does not stop pods — verified on 5.2.2: it pauses the operator so that
-# something else can scale the workloads down. That "something else" is needed at RESTORE
-# time, not at backup time, which is why it appears in restorePosthook below and as a manual
-# pre-restore step in the README.
+# What IBM's own online-backup hooks require (configmap datastage-maint-aux-ckpt-cm, shipped by
+# the install — this blueprint transcribes it):
+#   - a precheck that the DataStage CR and every PXRuntime CR labelled
+#     icpdsupport/addOnId=datastage report dsStatus == Completed, with on-error: Fail;
+#   - since 5.4: a BACKUP LOCK. The pre-hook creates /ds-storage/PXRuntime/Projects/.backup_lock
+#     from the `flows` pod, the post-hook removes it. On 5.2.2 both hooks were empty.
+#     While the file exists, and only if the flows pod runs with ENABLE_BACKUP_DETECT=true, the
+#     flows service rejects every write request to data_intg_flows with HTTP 409 ("Online Backup
+#     is in progress"). Read from the 5.4.7 flows code (OnlineBackupManager, BackupSyncFilter).
+#     The variable is not set on a default install, so there the lock changes nothing — it is
+#     taken anyway, because that is IBM's specification. A lock older than 4 hours is deleted by
+#     the flows service itself (checked every 30 minutes), so a backup that dies between the two
+#     hooks does not block flows forever.
+# Maintenance mode (spec.ignoreForMaintenance) is used by the OFFLINE path only, and it does not
+# stop pods — verified on 5.2.2: it pauses the operator so that something else can scale the
+# workloads down. That "something else" is needed at RESTORE time, not at backup time, which is
+# why it appears in restorePosthook below and as a manual pre-restore step in the README.
 #
 # Bind with the BlueprintBinding in blueprintbinding.yaml (the single Deployment
 # app.kubernetes.io/name=datastage, app.kubernetes.io/component=runtime).
@@ -50,7 +58,11 @@ actions:
               echo "DataStage/datastage dsStatus=${ds_status:-<none>}"
               [ "${ds_status}" = "Completed" ] || { echo "ERROR: DataStage CR is not Completed"; fail=1; }
 
-              for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+              # IBM's rule selects PXRuntime CRs by label, not by name (5.4: icpdsupport/addOnId=datastage).
+              PX_LIST=$(kubectl get pxruntime -n "${NS}" -l icpdsupport/addOnId=datastage \
+                          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+              [ -n "${PX_LIST}" ] || { echo "ERROR: no PXRuntime CR labelled icpdsupport/addOnId=datastage"; fail=1; }
+              for px in ${PX_LIST}; do
                 px_status=$(kubectl get pxruntime "${px}" -n "${NS}" -o jsonpath='{.status.dsStatus}')
                 echo "PXRuntime/${px} dsStatus=${px_status:-<none>}"
                 [ "${px_status}" = "Completed" ] || { echo "ERROR: PXRuntime ${px} is not Completed"; fail=1; }
@@ -126,7 +138,19 @@ actions:
                 fi
               done
 
-              # ---- 5. Flush — MUST BE LAST ------------------------------------------------
+              # ---- 5. Take IBM's backup lock (5.4 ckpt-cm pre-hook) ----------------------
+              # Exactly IBM's command, in the pod and container IBM names. The lock is a file on
+              # /ds-storage, so it must be written BEFORE the flush below — and the restore point
+              # will therefore contain it; restorePosthook removes it again.
+              FLOWS_POD=$(kubectl get pod -n "${NS}" \
+                -l app.kubernetes.io/name=datastage,app.kubernetes.io/component=flows \
+                --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              [ -n "${FLOWS_POD}" ] || { echo "ERROR: no running DataStage flows pod; cannot take the backup lock"; exit 1; }
+              kubectl exec -n "${NS}" "${FLOWS_POD}" -c flows -- \
+                bash -c 'mkdir -p /ds-storage/PXRuntime/Projects && touch /ds-storage/PXRuntime/Projects/.backup_lock'
+              echo "backup lock taken (${FLOWS_POD}); ENABLE_BACKUP_DETECT=$(kubectl exec -n "${NS}" "${FLOWS_POD}" -c flows -- printenv ENABLE_BACKUP_DETECT 2>/dev/null || echo '<unset: lock is advisory only>')"
+
+              # ---- 6. Flush — MUST BE LAST ------------------------------------------------
               # Without this a file can appear in the snapshot with the right name and zero
               # bytes: the writer's data is still in the page cache, which the snapshot of the
               # volume does not see. The failure only shows up at restore time.
@@ -135,6 +159,31 @@ actions:
                 echo "synced ${pod}"
               done
               echo "DataStage engine volumes flushed; safe to snapshot."
+
+  backupPosthook:
+    phases:
+      # IBM's 5.4 ckpt-cm post-hook: release the backup lock once the snapshots exist.
+      # Idempotent (rm -f), so a retry is harmless.
+      - func: KubeTask
+        name: releaseBackupLock
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.7
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              FLOWS_POD=$(kubectl get pod -n "${NS}" \
+                -l app.kubernetes.io/name=datastage,app.kubernetes.io/component=flows \
+                --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              if [ -z "${FLOWS_POD}" ]; then
+                echo "WARNING: no running flows pod; the backup lock stays until the flows service expires it (4 h)"
+                exit 0
+              fi
+              kubectl exec -n "${NS}" "${FLOWS_POD}" -c flows -- rm -f /ds-storage/PXRuntime/Projects/.backup_lock
+              echo "backup lock released (${FLOWS_POD})"
 
   restorePosthook:
     phases:
@@ -157,9 +206,11 @@ actions:
               TIMEOUT_SECS=1800          # IBM uses 1800s for the same transition in cpdbr
 
               # Idempotent: patching a CR that is already out of maintenance is a no-op.
+              PX_LIST=$(kubectl get pxruntime -n "${NS}" -l icpdsupport/addOnId=datastage \
+                          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
               kubectl patch datastage datastage -n "${NS}" --type=merge \
                 -p '{"spec":{"ignoreForMaintenance":false}}'
-              for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+              for px in ${PX_LIST}; do
                 kubectl patch pxruntime "${px}" -n "${NS}" --type=merge \
                   -p '{"spec":{"ignoreForMaintenance":false}}'
               done
@@ -170,7 +221,7 @@ actions:
                 pending=""
                 s=$(kubectl get datastage datastage -n "${NS}" -o jsonpath='{.status.dsStatus}' 2>/dev/null || true)
                 [ "${s}" = "Completed" ] || pending="DataStage=${s:-<none>}"
-                for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+                for px in ${PX_LIST}; do
                   s=$(kubectl get pxruntime "${px}" -n "${NS}" -o jsonpath='{.status.dsStatus}')
                   [ "${s}" = "Completed" ] || pending="${pending} ${px}=${s:-<none>}"
                 done
@@ -182,6 +233,19 @@ actions:
                 echo "waiting for reconciliation: ${pending}"
                 sleep 20
               done
+
+              # The snapshot was taken while IBM's backup lock existed (backupPrehook step 5), so
+              # the restored /ds-storage contains it. Remove it, or — on a cluster that runs flows
+              # with ENABLE_BACKUP_DETECT=true — flows stay read-only until the lock expires.
+              FLOWS_POD=$(kubectl get pod -n "${NS}" \
+                -l app.kubernetes.io/name=datastage,app.kubernetes.io/component=flows \
+                --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              if [ -n "${FLOWS_POD}" ]; then
+                kubectl exec -n "${NS}" "${FLOWS_POD}" -c flows -- rm -f /ds-storage/PXRuntime/Projects/.backup_lock
+                echo "restored backup lock removed (${FLOWS_POD})"
+              else
+                echo "WARNING: no running flows pod; remove /ds-storage/PXRuntime/Projects/.backup_lock by hand"
+              fi
 
               echo "DataStage is out of maintenance and Completed."
               echo "NEXT: recompile the flows of any affected project (cpdctl dsjob compile --project <name>)"

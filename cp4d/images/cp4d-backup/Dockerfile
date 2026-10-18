@@ -6,8 +6,13 @@
 # group-writable so a random UID in group 0 can write.
 FROM --platform=linux/amd64 debian:bookworm-slim
 
-ARG CPDCTL_VERSION=v1.8.244
-ARG KUBECTL_VERSION=v1.31.6
+ARG CPDCTL_VERSION=v1.10.34
+ARG KUBECTL_VERSION=v1.34.9
+
+# Image revision, bumped when the image changes without a cpdctl version change.
+# The published tag is <CPDCTL_VERSION without the leading v>-<IMAGE_REVISION>,
+# derived from these two ARGs by .github/workflows/cp4d-backup-image.yaml.
+ARG IMAGE_REVISION=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl jq unzip bash tar gzip \

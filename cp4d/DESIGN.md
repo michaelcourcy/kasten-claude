@@ -48,7 +48,7 @@ mirrors it), which `--output-file` collapses into a single synchronous call.
 
 ## 3. How it maps onto this project's blueprint patterns
 
-The governing rule in [CLAUDE.md](../CLAUDE.md) is **"Kasten is the data mover — blueprints only
+The governing rule in [AGENTS.md](../AGENTS.md) is **"Kasten is the data mover — blueprints only
 quiesce or dump-to-PVC, never move data themselves."** A `cpdctl` export produces a bundle on a
 volume, so the on-model design is **Pattern 4 — dump to a permanent keeper PVC**, combined with the
 **action-hook** mechanism:
@@ -96,7 +96,7 @@ run after restore.
 |---|---|
 | **Custom runtime images** | Export captures the environment *definition*, not the image in the internal registry → a notebook on a custom runtime may not be runnable after restore. Untested (§5). |
 | **External data behind connections** | Captured as a reference only — see §6. Separately protected. |
-| **Version skew** | Logical export/import is version-sensitive. V1 targets same-version DR (5.2 → 5.2); cross-version migration is a separate validation — see §7. |
+| **Version skew** | Logical export/import is version-sensitive. V1 targets same-version DR (validated 5.2 → 5.2 and 5.4 → 5.4). One cross-version pair is measured — a 5.2.2 bundle imported into 5.4.0 — but no other pair; see §7. |
 | **Git-based projects** | Validated only against the default COS-backed (`assetfiles`) flavour. For a git-based project the notebook *content* lives in a git repo, so the export captures the project definition, asset metadata, jobs, connections and the project→repo association, but not the notebook bytes. Check which flavour is in play — but see the caveat below: git-based does **not** mean "no backup needed". |
 
 Connection **credentials** were initially assumed to be redacted on export. They are not — see §6.
@@ -213,7 +213,7 @@ how to make that decision.
 ## 7. Why "latest `cpdctl`" is the right version policy
 
 Install the **newest stable `cpdctl`**, not a version matched to your CP4D release. `cpdctl`
-versioning (1.8.x) is **decoupled** from CP4D versioning (4.x / 5.x); the `cpdctl` README states:
+versioning (1.x — 1.8.244 when this was written, 1.10.34 in the 5.4 re-validation) is **decoupled** from CP4D versioning (4.x / 5.x); the `cpdctl` README states:
 
 > *"Always use most recent IBM cpdctl version available. It is backward compatible with all
 > supported Cloud Pak for Data releases."*
@@ -224,5 +224,11 @@ Two caveats worth keeping straight:
   could fall off.
 - **Client↔backend compatibility is not bundle↔bundle portability.** "Latest `cpdctl` handles all
   CP4D versions" means the *CLI can talk to* them. It does **not** promise that a bundle exported
-  against 5.2.x imports cleanly into 5.3.x — the bundle format is a property of the CP4D backend
-  that produced it, not of the CLI. That is the **version-skew** risk listed in §4.
+  against one release imports cleanly into another — the bundle format is a property of the CP4D
+  backend that produced it, not of the CLI. That is the **version-skew** risk listed in §4.
+
+  **One pair is measured (2026-10-16):** after upgrading the cluster from 5.2.2 to 5.4.0 Patch 7,
+  a project bundle exported by **5.2.2** (restored from a pre-upgrade Kasten restore point)
+  imported into **5.4.0** with `restore.sh` and came back with its notebook, job and file data
+  asset. That is the case that matters right after an upgrade, when every restore point still
+  holds bundles from the old release. It says nothing about other pairs, or about a downgrade.

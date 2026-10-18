@@ -26,7 +26,7 @@ WANT_NAME="${3:-}"
 
 CRED_NS="${CRED_NS:-cpd}"
 CRED_SECRET="${CRED_SECRET:-cp4d-backup-cpdctl-creds}"
-IMAGE="${IMAGE:-docker.io/michaelcourcy/cp4d-backup:1.8.244-3}"
+IMAGE="${IMAGE:-ghcr.io/kastenhq/blueprint-ai/cp4d-backup:1.10.34-1}"
 ENCRYPTION_KEY="${ENCRYPTION_KEY:-}"
 CPDCTL="${CPDCTL:-$(dirname "$0")/bin/cpdctl}"
 
@@ -36,7 +36,7 @@ CPD_USER=$(kubectl get secret -n "$CRED_NS" "$CRED_SECRET" -o jsonpath='{.data.u
 CPD_APIKEY=$(kubectl get secret -n "$CRED_NS" "$CRED_SECRET" -o jsonpath='{.data.apikey}'   | base64 -d)
 CPDTMP="$(mktemp -d)"; export CPDCONFIG="$CPDTMP/config.json"   # dir exists, file created by cpdctl
 trap 'rm -rf "$CPDTMP"' EXIT
-"$CPDCTL" config user set svc --username "$CPD_USER" --apikey "$CPD_APIKEY" >/dev/null
+printf '%s' "$CPD_APIKEY" | "$CPDCTL" config user set svc --username "$CPD_USER" --apikey-stdin >/dev/null
 "$CPDCTL" config profile set cp4d --url "$CPD_URL" --user svc >/dev/null
 "$CPDCTL" config profile use cp4d >/dev/null
 

@@ -326,6 +326,10 @@ What they say:
   `offline_support: true`, `online_support: true`, **`volume_snapshots_support: true`**,
   `restore_to_diff_namespace_support: false`.
 
+> **On 5.4.7 these ConfigMaps changed** — the online backup gained a backup lock, and the
+> `PXRuntime` rules gained a label selector. The list above is the 5.2.2 content. See
+> [§8](#8-upgrade-to-540-patch-7--what-changed-for-this-blueprint) and the README mapping table.
+
 ---
 
 ## 6. Post-install: give a user access to the service instance
@@ -356,3 +360,49 @@ kubectl get pvc -n cpd | grep -i -E "ds-|px-"
 
 The test project and its assets are separate — delete those with
 `cpdctl project delete --project-id <PID>`.
+
+---
+
+## 8. Upgrade to 5.4.0 Patch 7 — what changed for this blueprint
+
+A record of the 2026-10-15 upgrade of this cluster from 5.2.2 to **5.4.0 Patch 7**, which is what
+the blueprint was re-validated against. As for the install, **follow IBM's procedure, not this
+section**: IBM Software Hub 5.4.x docs → *Upgrading* → *Upgrading from Version 5.2*
+(<https://www.ibm.com/docs/en/software-hub/5.4.x>). A direct upgrade is supported from 5.2.1 and
+5.2.2 only, and 5.4.0 Patch 7 supports OpenShift 4.16 to 4.22.
+
+### 8.1 What we ran
+
+`cpd-cli` 14.4.0.7 (EE), with `VERSION=5.4.0`, `PATCH_ID=7`, `IMAGE_PULL_PREFIX=icr.io` and an
+image pull secret `ibm-entitlement-key` built from the entitlement key, in the order IBM gives:
+
+| Step | Command | Time here |
+|---|---|---|
+| Cluster-scoped resources for the new *Backup Restore Orchestration* service | `case-download --components=br_orchestration … --cluster_resources=true`, `oc new-project cpd-operators-br-svc`, `oc apply --server-side` | ~1 min |
+| Cluster-scoped resources for the instance | `case-download --components=${COMPONENTS} … --cluster_resources=true`, `oc apply --server-side` | ~6 min |
+| Image pull secrets | in `cpd-operators-br-svc`, `cpd-operators` and `cpd`, labelled `icpdsupport/addOnId=cpfs` | — |
+| License Service | `apply-cluster-components --licensing_ns=ibm-licensing` | ~20 min |
+| Platform | `install-components --components=cpd_platform --upgrade=true` | 53 min |
+| Services | `install-components --components=${COMPONENTS} --upgrade=true` | ~1 h, in two runs (see below) |
+
+`COMPONENTS=cpfs,cpd_platform,br_orchestration,ccs,datarefinery,ws,ws_runtimes,opencontent_opensearch,datastage_ent`.
+
+### 8.2 Three problems, and what fixed them
+
+| Problem | Cause | What worked |
+|---|---|---|
+| The platform upgrade failed during `--run_storage_tests=true` | IBM's own test script crashed (`IndexError` on `sys.argv[13]` in `sysbench.py`), and the RWX test pod was still mounting its volume when the tool read its logs (`HTTP 400 … ContainerCreating`). Not a storage problem | Deleted the three `ibm-storage-performance-*` Jobs and two PVCs it left in `cpd`, then reran without the flag. IBM documents the flag as recommended, not required |
+| `case-download` with `br_orchestration` in the list failed: `The --br_operator_ns argument is required` | IBM's page omits the flag for the instance step | Added `--br_operator_ns=cpd-operators-br-svc`. `install-components` rejects the same flag (`Invalid Arguments`), so it is **not** added there |
+| The services run marked `DataStage` `Failed` (`Dependency CCS failed to install`) and exited before upgrading Watson Studio | DataStage checked CCS while CCS was still reconciling | Waited for `ccs-cr` to reach `Completed`, then reran `install-components --components=ws,ws_runtimes,datastage_ent --upgrade=true`. DataStage had meanwhile recovered by itself |
+
+### 8.3 What the upgrade changed that matters here
+
+| | 5.2.2 | 5.4.7 |
+|---|---|---|
+| How the DataStage operator is installed | OLM, CSV `ibm-cpd-datastage-operator.v8.2.0` | **Helm**, chart `datastage-ent` 12.0.7, no CSV (true of every service on 5.4) |
+| Online backup hooks (`ckpt-cm`) | empty | `touch` / `rm` of `/ds-storage/PXRuntime/Projects/.backup_lock` in the `flows` pod — see [README → The backup lock](README.md#the-backup-lock--new-in-54) |
+| `PXRuntime` selection in every hook | any `PXRuntime` | `labels: icpdsupport/addOnId=datastage` |
+| Restore plan (`br-cm`, `ckpt-cm`) | ConfigMaps + CRs | adds `datastage-operator-resources` (the operator's Deployments, Services, RBAC) |
+| Engine PVCs, their names, mounts and our label | — | unchanged; the upgrade did not touch the data on them |
+| Python 24.1 notebook runtime (`ibm-cpd-ws-runtime-241-py`) | present | removed by the upgrade; only `251-py` remains |
+

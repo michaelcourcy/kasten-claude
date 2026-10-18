@@ -19,7 +19,9 @@ else
   KEY=$(kubectl get secret -n "$CRED_NS" "$CRED_SECRET" -o jsonpath='{.data.apikey}'   | base64 -d)
 fi
 
-cpdctl config user set svc --username "$USR" --apikey "$KEY" >/dev/null
+# Key on stdin, never on the command line: cpdctl >= 1.10 warns that --apikey is visible in the
+# process table.
+printf '%s' "$KEY" | cpdctl config user set svc --username "$USR" --apikey-stdin >/dev/null
 cpdctl config profile set cp4d --url "$URL" --user svc        >/dev/null
 cpdctl config profile use cp4d                                >/dev/null
 echo "cpdctl authenticated to $URL as $USR"

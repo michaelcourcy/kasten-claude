@@ -79,12 +79,13 @@ d.cards(
 
 d.split_dark(
     "Why there is no quiesce at backup time",
-    "IBM's online hooks\n", "are empty.",
+    "IBM's online hooks\n", "ask for a lock, nothing more.",
     [
         ("01", "THE CONFIGMAP SAYS SO EXPLICITLY",
-         "datastage-maint-aux-ckpt-cm declares pre-hooks, post-hooks and checkpoint "
-         "hooks as exec-rules: [] — all three empty. Its aux-meta.managed-resources is "
-         "empty too, so the online path scales nothing down."),
+         "datastage-maint-aux-ckpt-cm has no checkpoint hooks and scales nothing down. "
+         "Since 5.4 its pre- and post-hooks create and remove a backup lock file on "
+         "/ds-storage; on 5.2.2 they were empty. The lock blocks flow edits only when "
+         "flows runs with ENABLE_BACKUP_DETECT=true — unset on a default install."),
         ("02", "THE ONE REQUIREMENT IS A PRECHECK",
          "The DataStage and PXRuntime custom resources must report dsStatus == "
          "Completed, with on-error: Fail. So backupPrehook fails the backup before "
@@ -95,9 +96,9 @@ d.split_dark(
          "what IBM's specification asks for, and it would not make the backup safer."),
     ],
     left_body="One detail worth copying: the PXRuntime entry in that rule has no name "
-              "field, while the DataStage entry does. So it applies to every PXRuntime "
-              "CR in the namespace. The blueprint loops over kubectl get pxruntime "
-              "rather than assuming a single default instance.")
+              "field, only a label (icpdsupport/addOnId=datastage), while the DataStage "
+              "entry is named. So it applies to every labelled PXRuntime CR. The blueprint "
+              "loops over them rather than assuming a single default instance.")
 
 d.hero(
     "WITHOUT A SYNC,", "THE FILE IS ZERO BYTES",
@@ -162,23 +163,28 @@ d.table_slide(
          "dsStatus == Completed, or the backup fails before anything is captured. "
          "Discovers every running pod mounting a PVC in the backup, warns if the label "
          "matches nothing and names any labelled PVC no pod mounts, warns if a job run "
-         "is in flight, then runs sync in each pod — last."),
+         "is in flight, takes IBM's backup lock in the flows pod, then runs sync in "
+         "each pod — last."),
+        ("backupPosthook",
+         "Releases IBM's backup lock once the snapshots exist. Idempotent. If the "
+         "flows pod is gone it only warns: flows deletes a lock older than 4 hours."),
         ("restorePosthook",
          "Sets spec.ignoreForMaintenance: false on the DataStage CR and every PXRuntime "
          "CR, idempotently, then waits up to 1800 seconds for all of them to report "
          "dsStatus == Completed — so the restore does not report success while the "
-         "engine is still assembling itself. Prints the recompile reminder."),
+         "engine is still assembling itself. Removes the backup lock the restored "
+         "volume contains. Prints the recompile reminder."),
     ],
     col_widths=[2.6, 9.7],
-    row_heights=[0.5, 1.8, 1.5],
+    row_heights=[0.5, 1.6, 0.8, 1.4],
     body_size=10.5,
     cards=[
         ('file_list', "TESTED VERSIONS", [
             "Kubernetes 1.34.9 on OpenShift 4.21.30, Kasten 9.0.7, Cloud Pak for Data "
-            "5.2.2, DataStage 5.2.2 with operator ibm-cpd-datastage-operator.v8.2.0, "
-            "Common Core Services 11.2.0, cpdctl 1.10.3, cpd-cli 14.2.2. The ConfigMaps "
-            "are versioned — 5.2.2 here — and IBM can change them between releases, so "
-            "read them on your own cluster before adapting anything."]),
+            "5.4.0 Patch 7, DataStage 5.4.7 (Helm chart datastage-ent 12.0.7), Common "
+            "Core Services 13.0.6, cpdctl 1.10.34, cpd-cli 14.4.0. The ConfigMaps are "
+            "versioned, and IBM did change them between 5.2.2 and 5.4.7, so read them "
+            "on your own cluster before adapting anything."]),
         ('error_warning', "RESTORE PREREQUISITES", [
             "The same DataStage and CP4D version as the backup: compiled artifacts are "
             "engine-version specific, and a Data Set descriptor embeds the engine build "

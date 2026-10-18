@@ -59,16 +59,20 @@ unit of granularity = unit of multi-tenant restore**.
 
 ## Versions
 
-Detected on the cluster where this blueprint was developed and tested.
+Detected on the cluster where this blueprint was last tested (2026-10-16). It was first developed
+on OpenShift 4.18.6 / Kubernetes 1.31.6 / Kasten 8.5.12 / CP4D 5.2.x with `cpdctl` 1.8.244. The last
+revision validated on CP4D 5.2 is the git tag [`cp4d-5.2`](https://github.com/kastenhq/blueprint-ai/tree/cp4d-5.2).
 
 | Component | Version |
 |---|---|
-| Kubernetes | 1.31.6 |
-| OpenShift | 4.18.6 |
-| Kasten | 8.5.12 (Helm `k10-8.5.12`) |
-| Cloud Pak for Data / IBM Software Hub | 5.2.x (Watson Studio `ws` 11.2.0) |
-| cpdctl | 1.8.244 |
-| Keeper image | `docker.io/michaelcourcy/cp4d-backup:1.8.244-3` |
+| Kubernetes | 1.34.9 |
+| OpenShift | 4.21.30 |
+| Kasten | 9.0.7 (OLM operator `k10-kasten-operator-rhmp.v9.0.7`) |
+| Storage | ODF `ocs-storagecluster-ceph-rbd` |
+| Cloud Pak for Data / IBM Software Hub | 5.4.0 Patch 7 (`ibmcpd-cr` 5.10.7, Watson Studio `ws` 13.0.4, Common Core Services 13.0.6) |
+| cpdctl | 1.10.34 |
+| kubectl (in the keeper image) | 1.34.9 |
+| Keeper image | `ghcr.io/kastenhq/blueprint-ai/cp4d-backup:1.10.34-1` |
 
 Detect your Kasten version:
 
@@ -107,7 +111,7 @@ cpdctl config is rendered to a tmpfs path at runtime and never persisted.
 
 ```bash
 cd images/cp4d-backup
-docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:1.8.244-3 --push .
+docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:1.10.34-1 --push .
 ```
 
 > Use an **immutable tag** (or `imagePullPolicy: Always`, which the pod specs already set). A reused
@@ -166,7 +170,8 @@ the backed-up namespace, so it is never captured in a restore point.
 
 **The keeper authenticates with the API key alone — never a password.**
 [cpdctl-login.sh](images/cp4d-backup/cpdctl-login.sh) runs
-`cpdctl config user set svc --username … --apikey …`, and the Secret holds only `url`, `username`,
+`cpdctl config user set svc --username … --apikey-stdin` (the key is piped in, so it never
+appears on a command line or in the process table), and the Secret holds only `url`, `username`,
 `apikey` and `uid`. The `cpadmin` password is used once, on your workstation, to obtain the key; it
 is never stored in the backup namespace.
 
@@ -279,9 +284,9 @@ Verify the Secret is usable before deploying anything else. This mirrors exactly
 three keys (`url`, `username`, `apikey`) and runs the same two `cpdctl config` commands:
 
 ```bash
-./bin/cpdctl config user set svc \
-  --username "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.username}' | base64 -d)" \
-  --apikey   "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.apikey}'   | base64 -d)"
+kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.apikey}' | base64 -d \
+  | ./bin/cpdctl config user set svc --apikey-stdin \
+      --username "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.username}' | base64 -d)"
 ./bin/cpdctl config profile set svc-check \
   --url "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.url}' | base64 -d)" --user svc
 ./bin/cpdctl config profile use svc-check
@@ -340,7 +345,7 @@ If enrolment fails, the prehook aborts **before any data moves** with
 | | |
 |---|---|
 | **The API key does not expire** | `expire_at` comes back `null`. Unlike the bearer token, it is a long-lived credential — treat the Secret accordingly, and rotate it deliberately. |
-| **The bearer token is short-lived** | The JWT from step 1 carries a **12-hour** lifetime. It is only needed for the setup calls; the keeper never uses it — it authenticates with `--apikey`, which is why no password lives in the cluster. |
+| **The bearer token is short-lived** | The JWT from step 1 carries a **12-hour** lifetime. It is only needed for the setup calls; the keeper never uses it — it authenticates with the API key (`--apikey-stdin`), which is why no password lives in the cluster. |
 | **`-k` skips TLS verification** | The `cpd` route usually presents the cluster's ingress certificate. Drop `-k` and pass `--cacert <ca.crt>` if you have the CA — leaving `-k` in a scripted, repeatable procedure is a habit worth avoiding. |
 | **Regenerating the key breaks the Secret** | `GET /usermgmt/v1/user/apiKey` (step 5) and the UI (*Profile and settings → API key*) both **generate a new key and invalidate the old one**. Because the keeper shares `cpadmin`'s key, anyone who regenerates it — by re-running step 5, or for their own scripts — breaks the backup: the stale key fails at `cpdctl` login time, inside `backupPrehook`, failing the whole backup. Update the Secret every time. |
 | **Don't leave the key in your shell history** | The commands above keep it in a variable rather than on a command line. If you paste a key literally, clear it afterwards. |
@@ -398,10 +403,12 @@ roleRef: { kind: Role, name: cp4d-backup-keeper, apiGroup: rbac.authorization.k8
 EOF
 ```
 
-> **Storage class**: the blueprint defaults to `managed-csi` (the Azure OpenShift CSI class used
-> here). Replace it (in [blueprint.yaml](blueprint.yaml), `STORAGE_CLASS`) with a class that
-> supports **CSI snapshots** on your cluster (e.g. `ebs-sc` on AWS, `standard-rwo` on GKE) and has
-> a matching `VolumeSnapshotClass` registered with Kasten. Do **not** use legacy in-tree classes.
+> **Storage class**: the blueprint defaults to `ocs-storagecluster-ceph-rbd`, the ODF RBD class of
+> the cluster it was last tested on (it was first developed on Azure with `managed-csi`). Replace it
+> (in [blueprint.yaml](blueprint.yaml), `STORAGE_CLASS`) with a class that supports **CSI
+> snapshots** on your cluster (for example `managed-csi` on AKS, `ebs-sc` on AWS, `standard-rwo` on
+> GKE) and has a matching `VolumeSnapshotClass` registered with Kasten. Do **not** use legacy
+> in-tree classes.
 
 ### 4. A Location profile
 
@@ -544,7 +551,7 @@ OS/arch from [github.com/IBM/cpdctl/releases](https://github.com/IBM/cpdctl/rele
 ```bash
 mkdir -p bin && cd bin
 # with the GitHub CLI — asks for the latest stable tag rather than hardcoding one:
-TAG=$(gh release view --repo IBM/cpdctl --json tagName -q .tagName)     # e.g. v1.8.244
+TAG=$(gh release view --repo IBM/cpdctl --json tagName -q .tagName)     # e.g. v1.10.34
 gh release download "$TAG" --repo IBM/cpdctl --pattern 'cpdctl_darwin_arm64.tar.gz'
 tar xzf cpdctl_darwin_arm64.tar.gz && rm cpdctl_darwin_arm64.tar.gz
 xattr -d com.apple.quarantine cpdctl 2>/dev/null                        # macOS Gatekeeper
@@ -568,7 +575,8 @@ oc get secret platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_pas
 
 # keep the config file next to the binary and OUT of git (cp4d/bin/ is ignored)
 export CPDCONFIG=$PWD/bin/.cpdctl.config.json
-./bin/cpdctl config user set admin --username <admin-username> --password '<ADMIN_PASSWORD>'
+# --password-stdin keeps the password off the command line (cpdctl >= 1.10 warns about --password)
+printf '%s' '<ADMIN_PASSWORD>' | ./bin/cpdctl config user set admin --username <admin-username> --password-stdin
 ./bin/cpdctl config profile set cp4d --url https://<cpd-route-host> --user admin
 ./bin/cpdctl config profile use cp4d
 ./bin/cpdctl project list                       # verify connectivity
@@ -654,6 +662,21 @@ kubectl get restorepoint -n cp4d-projects-backup
 ./bin/cpdctl asset search --project-id <new-pid> --type-name data_asset --query '*:*'
 ```
 
+**Re-validated end-to-end on 2026-10-16 after upgrading CP4D from 5.2.2 to 5.4.0 Patch 7**
+(Kasten 9.0.7 / OpenShift 4.21.30, keeper image `1.10.34-1`, storage `ocs-storagecluster-ceph-rbd`).
+The blueprint itself needed no change for 5.4. The keeper image was rebuilt for a newer `cpdctl`
+and `kubectl`, and now passes the API key on stdin.
+
+| Check | Result |
+|---|---|
+| `cpadmin`'s *Backup Reader* role and API key after the upgrade | Both survived: `has_manage_project: true`, and the key in the Secret still authenticates |
+| `backupPrehook` through a `RunAction` | `Complete` in about 1 minute. 3 projects discovered, `cpadmin` already an editor on all 3, 3 export pods |
+| Snapshot scope | 3 PVCs, 3 CSI snapshots, one restore point |
+| Loss | The fixture project (notebook, job, file data asset, connection, connected data asset) **deleted** from CP4D |
+| Granular restore | A `RestoreAction` filtered to that one PVC restored only that PVC, into a new namespace |
+| `restore.sh` | Recreated the project under a new id: `importing 97 files … State: completed` |
+| Data check | The same five assets came back, and the file data asset `sample.csv` came back byte for byte |
+
 **Validated end-to-end on 2026-07-10** (Kasten 8.5.12 / CP4D 5.2.x): backup produced one PVC per
 project, all CSI-snapshotted into one restore point; a granular cross-namespace restore of a single
 PVC + `restore.sh` recreated the project with its notebook, job, file data asset, connected data
@@ -719,6 +742,58 @@ Document this per project so a restore is never silently incomplete. Bundle-leve
 
 ---
 
+## Projects containing DataStage flows
+
+If the CP4D installation has **DataStage** installed, this blueprint already protects the DataStage
+design assets, because they are ordinary project assets. Measured on CP4D 5.2.2 / DataStage 5.2.2
+(2026-09-09), a project exported with the same `cpdctl asset export start --assets-all-assets` this
+blueprint runs contained:
+
+| In the bundle | Notes |
+|---|---|
+| `data_intg_flow` | the flow itself |
+| `px_executables` | the **compiled** artifacts, as an attachment of the flow |
+| `job` | the runnable binding of flow + parameters + environment |
+| `data_intg_data_set` metadata **and** the Data Set *descriptor* files | the descriptor only — see below |
+| `data_intg_project_settings`, `environment` | project-level DataStage settings |
+| `data_asset` bytes | as for any project |
+
+Imported into a new, empty project, the flow came back reporting `Compiled: true` /
+`Need Compilation: false`, and **the restored job ran without being recompiled**. So no separate
+export path is needed for DataStage: `cpdctl dsjob export-project` produces a *smaller* bundle
+(DataStage components only) and is not required here.
+
+Three things a restore of such a project must account for:
+
+1. **Recompile if the flow says so.** Check with
+   `CPDCTL_ENABLE_DSJOB=true cpdctl dsjob list-flows --project <name> --with-compiled`. If
+   `Need Compilation` is `true`, run `cpdctl dsjob compile --project <name>` — with no `--name` it
+   compiles every flow in the project. Compiling is a real build step: it writes `OshScript.osh` and
+   a `lib/` directory onto the DataStage engine volume.
+2. **A Data Set is restored as a pointer, not a copy — which is correct for a recovery, and
+   dangerous when you clone.** A Data Set's *descriptor* travels in the bundle; its **data** lives
+   on the DataStage engine volume, which is shared by every project on that runtime instance. In a
+   real recovery the original is gone, or you are importing onto another cluster, so a descriptor
+   addressing engine storage is exactly right — the data files are simply absent until a job
+   rewrites them.
+
+   The hazard is **duplication**: a second copy of a project alongside the original on the *same*
+   runtime instance. Verified — the descriptor written into a freshly imported project is
+   **byte-identical** to the source project's, and reading the Data Set there returned the source's
+   rows **before any job had run**. Because a Data Set write deletes the existing data files before
+   rewriting them, running the imported job destroyed the source project's Data Set:
+   `view-dataset` on the **original** project then failed with `Sample data could not be read from
+   dataset …`. So: do not run the imported jobs while the original project still exists on the same
+   runtime instance.
+
+3. **Engine state is outside this blueprint.** Custom libraries (`user-lib`), ODBC/JDBC driver
+   configuration, Data Set data, files a flow writes to a file-system path, and user volumes live on
+   the DataStage engine PVCs and are in no project export. A flow that calls a custom routine will
+   restore fine and then fail at run time if the library is gone. See
+   [datastage-example](../datastage-example/), which protects exactly that and nothing else.
+
+---
+
 ## Remove everything
 
 The CP4D platform itself is out of scope here (installed and torn down independently). To create the
@@ -756,3 +831,11 @@ curl -sSk -X PUT "https://${CPD_HOST}/usermgmt/v1/user/cpadmin" -H "Authorizatio
 # Kasten restore-point content for this app
 kubectl delete restorepointcontent -l k10.kasten.io/appNamespace=cp4d-projects-backup
 ```
+
+---
+
+## Initial prompt
+
+> Can you make a blueprint for IBM Cloud Pak for Data to back up the analytics projects. cpdbr already
+> does a platform-level backup but it is all or nothing, and on a multi-tenant CP4D I want to be able
+> to restore a single project.

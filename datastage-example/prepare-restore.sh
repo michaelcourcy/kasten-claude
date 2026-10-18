@@ -35,7 +35,7 @@ done
 echo "1/6  parking the operator (ignoreForMaintenance=true) in namespace ${NS}"
 kubectl patch datastage datastage -n "${NS}" --type=merge \
   -p '{"spec":{"ignoreForMaintenance":true}}' >/dev/null || exit 1
-for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{.items[*].metadata.name}'); do
+for px in $(kubectl get pxruntime -n "${NS}" -l icpdsupport/addOnId=datastage -o jsonpath='{.items[*].metadata.name}'); do
   kubectl patch pxruntime "${px}" -n "${NS}" --type=merge \
     -p '{"spec":{"ignoreForMaintenance":true}}' >/dev/null || exit 1
 done
@@ -56,7 +56,7 @@ wait_status() {   # $1=kind  $2=name  $3=wanted value
   done
 }
 wait_status datastage datastage InMaintenance || exit 1
-for px in $(kubectl get pxruntime -n "${NS}" -o jsonpath='{.items[*].metadata.name}'); do
+for px in $(kubectl get pxruntime -n "${NS}" -l icpdsupport/addOnId=datastage -o jsonpath='{.items[*].metadata.name}'); do
   wait_status pxruntime "${px}" InMaintenance || exit 1
 done
 
@@ -145,8 +145,9 @@ What to expect:
 
   * Then a long plateau at ~92%. That is restorePosthook taking the operator out of maintenance
     and waiting for dsStatus to return to Completed while the operator scales every workload
-    back up. Measured: about 15 minutes. The action withholds success on purpose while the
-    engine reassembles. Do not scale anything up yourself.
+    back up. Measured: about 15 minutes on DataStage 5.2.2, about 27 minutes on 5.4.7. The
+    action withholds success on purpose while the engine reassembles. Do not scale anything up
+    yourself.
 
 Verify afterwards with View data, not with the schema:
 

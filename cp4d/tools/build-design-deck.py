@@ -187,7 +187,7 @@ txbox(s, In(1.1), In(3.6), In(9.6), In(1.3),
       size=16, color=INK2, line=1.25)
 hrule(s, In(1.1), In(5.05), In(6.2), RULE)
 txbox(s, In(1.1), In(5.25), In(11), In(0.9),
-      "Validated end-to-end · Kasten 8.5.12 · OpenShift 4.18.6 · CP4D 5.2.x · cpdctl 1.8.244\n"
+      "Validated end-to-end · Kasten 9.0.7 · OpenShift 4.21.30 · CP4D 5.4.0 · cpdctl 1.10.34\n"
       "Speaker notes on every slide carry the full text of the matching DESIGN.md section.",
       size=12, color=MUTED, line=1.3)
 s.notes_slide.notes_text_frame.text = INTRO
@@ -341,7 +341,7 @@ box(s, rx, Y0, rwid, In(2.5), "Deliberately deferred",
     "**Custom runtime images** — export captures the environment definition, not the image in "
     "the internal registry. Untested.\n"
     "**External data behind connections** — reference only (§6); separately protected.\n"
-    "**Version skew** — logical export/import is version-sensitive; V1 targets 5.2 → 5.2 (§7).\n"
+    "**Version skew** — logical export/import is version-sensitive; V1 targets same-version DR; 5.2.2 → 5.4.0 measured (§7).\n"
     "**Git-based projects** — validated only against COS-backed (`assetfiles`).",
     fill=PLANE, accent=WARN, body_size=12)
 box(s, M, Y0 + In(2.72), CW, In(0.72), None,
@@ -456,12 +456,12 @@ box(s, M, cy + In(1.26), CW, In(1.06), "What cpdctl does not protect",
 s = new_slide("Section 7", "Why “latest cpdctl” is the right version policy", SECTIONS[7])
 txbox(s, M, Y0, CW, In(0.3),
       "Install the **newest stable cpdctl**, not one matched to your CP4D release — `cpdctl` "
-      "versioning (1.8.x) is decoupled from CP4D versioning (4.x / 5.x).", size=13, color=INK2)
+      "versioning (1.x) is decoupled from CP4D versioning (4.x / 5.x).", size=13, color=INK2)
 # client -> backends
 gy = Y0 + In(0.56)
-box(s, M, gy, In(2.5), In(1.7), None, "latest stable\n**cpdctl**\n1.8.244", fill=BLUE,
+box(s, M, gy, In(2.5), In(1.7), None, "latest stable\n**cpdctl**\n1.10.34", fill=BLUE,
     line=None, body_color=WHITE, body_size=15)
-for i, (ver, ok) in enumerate([("CP4D 5.2.x", True), ("CP4D 5.3.x", True),
+for i, (ver, ok) in enumerate([("CP4D 5.2.x", True), ("CP4D 5.4.x", True),
                                ("any supported CP4D", True), ("long-EOL CP4D", False)]):
     yy = gy + i * In(0.44)
     arrow(s, M + In(2.6), yy + In(0.1), In(0.5), In(0.16),
@@ -481,19 +481,19 @@ txbox(s, M, py, CW, In(0.24),
       "CAVEAT 2 — CLIENT↔BACKEND COMPATIBILITY IS NOT BUNDLE↔BUNDLE PORTABILITY",
       size=10, bold=True, color=MUTED)
 py += In(0.34)
-chip(s, M, py, In(2.9), "bundle exported\nagainst CP4D 5.2.x", fill=PLANE, line=HAIR,
+chip(s, M, py, In(2.9), "bundle exported\nagainst CP4D 5.2.2", fill=PLANE, line=HAIR,
      color=INK2, size=11, h=In(0.62))
 arrow(s, M + In(3.0), py + In(0.22), In(0.6), In(0.18), fill=WARN)
-chip(s, M + In(3.7), py, In(2.9), "imported into\nCP4D 5.3.x", fill=PLANE, line=HAIR,
+chip(s, M + In(3.7), py, In(2.9), "imported into\nCP4D 5.4.0", fill=PLANE, line=HAIR,
      color=INK2, size=11, h=In(0.62))
-txbox(s, M + In(6.75), py + In(0.14), In(1.2), In(0.34), "not promised", size=13, bold=True,
-      color=CRIT)
+txbox(s, M + In(6.75), py + In(0.14), In(1.2), In(0.34), "measured: works", size=13, bold=True,
+      color=GOOD)
 box(s, M + In(8.2), py - In(0.06), CW - In(8.2), In(0.76), None,
-    "The bundle format is a property of the **CP4D backend that produced it**, not of the CLI.",
-    fill=SURF, accent=CRIT, body_size=12, pad=In(0.12))
+    "One pair measured after an upgrade. The bundle format is a property of the **CP4D backend that produced it**, so every other pair still needs its own test.",
+    fill=SURF, accent=WARN, body_size=12, pad=In(0.12))
 box(s, M, py + In(0.86), CW, In(0.78), None,
     "**So:** “latest cpdctl handles all CP4D versions” means the CLI can *talk to* them. "
-    "V1 targets same-version DR (5.2 → 5.2). Cross-version migration is a separate validation — "
+    "V1 targets same-version DR (validated 5.2 → 5.2 and 5.4 → 5.4). Any other version pair is a separate validation — "
     "it is the version-skew risk listed in §4.",
     fill=PLANE, line=HAIR, body_size=12.5, pad=In(0.13))
 
