@@ -211,13 +211,15 @@ helm ls -n kasten-io
 | Path | What |
 |---|---|
 | [install-note.md](install-note.md) | A record of the environment this blueprint was validated against: what the DataStage install creates (pods, PVCs, volume layout) and IBM's `cpdbr` maintenance ConfigMaps. **Not installation documentation — use [IBM's](https://www.ibm.com/docs/en/software-hub/5.4.x) for that** |
-| [minimal-tutorial.md](minimal-tutorial.md) | What DataStage is, every object it has and **which store each one lives in**, plus one minimal ETL job with its artifacts measured on disk. The evidence behind this blueprint's scope. **Not DataStage documentation — use [IBM's](https://www.ibm.com/docs/en/software-hub/5.4.x)** |
+| [minimal-tutorial.md](minimal-tutorial.md) | What DataStage is, every object it has and **which store each one lives in**, plus a small ETL job between two PostgreSQL tables with its artifacts — and the copies of its connection — measured on disk. The evidence behind this blueprint's scope. **Not DataStage documentation — use [IBM's](https://www.ibm.com/docs/en/software-hub/5.4.x)** |
 | [blueprint.yaml](blueprint.yaml) | The blueprint: `backupPrehook` (precheck + backup lock + flush), `backupPosthook` (release the lock), `restorePosthook` (leave maintenance, remove the restored lock) |
 | [blueprintbinding.yaml](blueprintbinding.yaml) | Binds it to the single DataStage `runtime` Deployment |
 | [policy.yaml](policy.yaml) | Kasten policy on the `cpd` namespace, filtered to the labelled PVCs and the bound `runtime` Deployment |
 | [prepare-restore.sh](prepare-restore.sh) | Restore Step 1: parks the operator and blocks until `dsStatus == InMaintenance`, checks for in-flight jobs, the PVC label and the restore point, then scales the DataStage workloads down and waits until no pod mounts a labelled PVC |
-| [fixture/make-flow.py](fixture/make-flow.py) | Generates the example DataStage flow (and documents the flow-JSON format) |
-| [fixture/customers-etl.json](fixture/customers-etl.json) | The generated flow |
+| [fixture/make-flow.py](fixture/make-flow.py) | Generates the example DataStage flow this README's Kasten test uses (and documents the flow-JSON format) |
+| [fixture/customers-etl.json](fixture/customers-etl.json) | The generated flow: self-contained, writes only to the engine volumes |
+| [fixture/customers-by-country.json](fixture/customers-by-country.json) | The tutorial's flow: PostgreSQL table → Aggregator → PostgreSQL table + Data Set, to show connections and what lies outside this backup |
+| [fixture/build-flow.py](fixture/build-flow.py) | How that flow was built, with IBM's watsonx.data integration Python SDK |
 
 ---
 
@@ -285,10 +287,25 @@ should change that warning to `exit 1` (the blueprint says where).
 >    **between** flows while the ultimate source and target are databases. A Sequential File stage
 >    writing to a path lands on `/px-storage/data` or a user volume no matter what the sources are.
 
-One case is genuinely mixed and was **not** measured: CP4D has project asset types for some library
-kinds (`function_library`, `custom_stage_library`, `ds_routine`), so a library added *as an asset*
-travels in the export, while one copied into `/ds-storage/user-lib` does not. Check which route your
-deployment uses before relying on either.
+A library created as a project asset travels with the project export and works after import
+(verified on 5.4.0 with a parallel function: the imported job ran without recompiling). Only files
+copied directly into `/ds-storage/user-lib` need this blueprint.
+
+### Why this blueprint does not use the export commands
+
+CP4D has two commands that export a project. We measured both on the example project
+(`customers-etl`, CP4D 5.2.2), and neither can do this blueprint's job:
+
+| Command | What it captured | Use |
+|---|---|---|
+| `cpdctl dsjob export-project` | DataStage components only (5.1 KB): the flow, the job, and the compiled `px_executables` with `--include-binaries`. **Not** the Data Set asset, the project settings or the runtime environment, even with `--include-data-assets`: it follows the dependency graph outward from the flows, and leaves out anything the flows do not reference | None. It is not a project backup |
+| `cpdctl asset export start --assets-all-assets` | The whole project (160 KB, 94 files): every asset's metadata, the bytes of uploaded files, the compiled binaries, the Data Set **descriptor**, and the connections — with their passwords in clear text unless you pass `--encryption-key` (seen again on 5.4.7, [tutorial §4.8](minimal-tutorial.md#48-what-the-datastage-backup-does-not-protect)) | The **project** half. [cp4d-example](../cp4d-example/) uses it |
+
+Neither export contains what exists only on the engine volumes: the Data Set **data** in
+`/px-storage/pds_files`, files a flow wrote to a path (`customers.txt`), and the instance-level
+configuration listed in [What has no second copy](#what-has-no-second-copy--why-this-backup-matters).
+That gap is why this blueprint snapshots the volumes instead of calling an export. The export
+protects the project; the snapshots protect the engine.
 
 Two further measurements worth knowing:
 
@@ -560,7 +577,7 @@ IBM's backup hooks were empty, the blueprint had no `backupPosthook` at all.
 |---|---|
 | Same DataStage / CP4D version as the backup | Compiled artifacts are engine-version specific. A Data Set descriptor embeds the engine build string (`$Version: X86_64 Torrent 2_3 2025/09/18 …`) |
 | DataStage installed and reconciled | Nothing restores into a DataStage that is not installed. The install recreates the empty volumes this restore then replaces |
-| The external sources behind your connections exist | A connection restores as a definition; the data behind it does not |
+| The external sources behind your connections exist | A connection restores as a definition; the data behind it does not. That data needs its own backup — for example [cnpg-example](../cnpg-example/) for a CloudNativePG database |
 | No copy of the same project running its jobs | See the Data Set warning above |
 
 ### Step 1 — prepare the engine (manual, required)
@@ -724,7 +741,7 @@ export CPDCTL_ENABLE_DSJOB=true
 |---|---|
 | **A — a project or a flow was lost.** Engine is healthy | This blueprint is not involved. Restore the project with [cp4d-example](../cp4d-example/), then recompile if `list-flows --with-compiled` says so |
 | **B — engine storage damaged, project assets intact** | Steps 1–4 above |
-| **C — rebuild from nothing** | 1. cluster + CP4D control plane + `ccs` (fresh install or `cpdbr`) → 2. **install DataStage at the same version** → 3. **engine state first**, Steps 1–3 above (prepare, restore, verify — recompiling comes at 5) → 4. **project assets second**, via cp4d-example → 5. recompile, re-run jobs to rebuild Data Sets → 6. verify connections against the external sources |
+| **C — rebuild from nothing** | 1. cluster + CP4D control plane + `ccs` (fresh install or `cpdbr`) → 2. **install DataStage at the same version** → 3. **engine state first**, Steps 1–3 above (prepare, restore, verify — recompiling comes at 5) → 4. **project assets second**, via cp4d-example → 5. recompile, re-run jobs to rebuild Data Sets → 6. verify connections against the external sources; if you edit one (a new hostname, say), **recompile again** — a job runs with the copy of the connection compiled onto `/ds-storage`, not with the project's connection ([tutorial §4.7](minimal-tutorial.md#47-the-job-runs-with-a-copy-of-the-connection-not-with-the-connection)) |
 
 Engine state must be restored **before** the project import: importing a project makes DataStage
 write into `/ds-storage/PXRuntime/Projects/<project-id>/`, and restoring the volume afterwards would

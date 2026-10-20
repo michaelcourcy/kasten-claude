@@ -3,24 +3,25 @@
 > ## ⚠️ This is not DataStage documentation — use IBM's
 >
 > **To learn or use DataStage, go to IBM's official documentation, not this file.**
-> IBM Software Hub 5.2.x docs: <https://www.ibm.com/docs/en/software-hub/5.2.x>
+> IBM Software Hub docs: <https://www.ibm.com/docs/en/software-hub/5.4.x>
 >
 > This is the crash course written *while developing this blueprint*, by someone learning the
 > product in order to protect it. It is deliberately partial: it covers what a backup designer
-> needs and skips most of DataStage. Anything here may be wrong, out of date, or true only of
-> version 5.2.2.
+> needs and skips most of DataStage. Anything here may be wrong, out of date, or true only of the
+> version a section says it was measured on (5.4.7 for §4, 5.2.2 for §5).
 >
 > ### So why keep the file?
 >
 > **Because designing a backup for DataStage is mostly a question of where each object is
 > stored**, and that question is not answered anywhere in one place. §2 lists every DataStage
-> object and the store it lives in; §4 builds one minimal ETL job and then **measures** where each
-> artifact landed. Those two sections are the evidence behind the scope decisions in
-> [README.md](README.md) — in particular why a Data Set needs two volumes and a project export to
-> be whole.
+> object and the store it lives in; §4 builds a small ETL job between two database tables and then
+> **measures** where each artifact landed, including the connection; §5 adds the measurements made
+> with the README's self-contained test flow. Those sections are the evidence behind the scope
+> decisions in [README.md](README.md) — in particular why a Data Set needs two volumes and a
+> project export to be whole.
 >
-> The dataset and the flow built in §4 are reproduced in [README.md](README.md) as the blueprint's
-> example data, so you do not need this file to run the example.
+> The README's Kasten test uses its own, simpler flow ([§4](#4-hands-on-an-etl-job-from-one-table-to-another)
+> explains why there are two), so you do not need this file to run the example.
 
 ---
 
@@ -66,7 +67,7 @@ assets, reachable through the CP4D project/asset APIs.*
 | **Parameter set** (+ value sets) | `parameter_set` | Named, reusable job parameters (for example one value set per environment) |
 | **Environment variables / `PROJDEF`** | parameter set | Project-wide parameter defaults — the `DSParams` of classic DataStage |
 | **Custom stages** | `data_intg_build_stage`, `data_intg_custom_stage`, `data_intg_wrapped_stage` | User-written stages |
-| **Libraries** | `custom_stage_library`, `function_library`, `data_intg_java_library`, `ds_xml_schema_library`, `ds_routine` | User code the flows call |
+| **Libraries** | `custom_stage_library`, `data_intg_parallel_function`, `data_intg_java_library`, `ds_xml_schema_library`, `ds_routine` | User code the flows call |
 | **Message handlers** | `ds_message_handler` | Rules that reclassify engine messages |
 | **Data quality assets** (Enterprise Plus) | `standardization_rule`, `ds_match_specification`, `data_quality_rule`, `data_quality_definition` | Standardization / matching / rules |
 | **Pipeline** (sequence job) | `orchestration_flow` | Orchestrates jobs — the modern DataStage *sequence* |
@@ -87,7 +88,7 @@ assets, reachable through the CP4D project/asset APIs.*
 | **Node** (DataStage sense) | A **parallel processing node** declared in the APT configuration file — *not* a Kubernetes node. On CP4D one node maps to one pod (`fastname "$pod"`), so `scaleConfig: small` gives 3 nodes: 1 conductor + 2 compute | `pds_files/node1`…`node65` are all pre-created by the install in one batch (verified: timestamps within one second), giving headroom to scale to 64 compute pods without creating directories at runtime. With `scaleConfig: small` only `node2` and `node3` ever hold data |
 | **Score** | The execution plan the conductor builds from the OSH script plus the APT configuration: how many processes run, on which nodes, with which partitioning, and which buffers sit between the stages. The relational-database word *query plan* is the closest analogy | Not persisted as a file. Set `APT_DUMP_SCORE=1` in the runtime environment and the engine prints it into `job.log` |
 | **APT** | The prefix the parallel engine uses for everything it inherited from Orchestrate, the Torrent Systems product IBM acquired: the `.apt` configuration-file format (`dynamic_config.apt`), the `APT_*` environment variables (`APT_CONFIG_FILE`, `APT_DUMP_SCORE`, `APT_PM_CONDUCTOR_HOSTNAME`), and the `APT_*` class names written into Data Set descriptors (`APT_DMFilePartition`, `APT_String`). It is usually expanded as *Advanced Parallel Technology*, but IBM's own documentation rarely bothers — treat it as a namespace marker, not a meaningful acronym | You will see `APT_` in job logs, in `.apt` config files, and inside the binary Data Set descriptor |
-| **Data Set** (`.ds`) / **File Set** | The parallel engine's own persistent file formats, written by the Data Set / File Set stage | **Three records, no copies.** An *asset* entry in the project store (so the UI can list it); a *descriptor* file on `/ds-storage` — schema, node config and the **absolute paths** of the data files, 3431 bytes for the fixture and not one row of data; the *rows* themselves once, on `/px-storage/pds_files/node*`. Snapshotting `/ds-storage` alone gives you a descriptor addressing files that are not in the restore point |
+| **Data Set** (`.ds`) / **File Set** | The parallel engine's own persistent file formats, written by the Data Set / File Set stage | **Three records, no copies.** An *asset* entry in the project store (so the UI can list it); a *descriptor* file on `/ds-storage` — schema, node config and the **absolute paths** of the data files, about 3.4 KB for the examples (§4.6, §5.1) and not one row of data; the *rows* themselves once, on `/px-storage/pds_files/node*`. Snapshotting `/ds-storage` alone gives you a descriptor addressing files that are not in the restore point |
 | **User volume** | An extra PVC mounted into the runtime so flows can read and write ordinary files | Cluster object. Any flow doing plain file I/O probably writes here |
 
 **The process tree of one run.** Three levels, and the split explains where the bytes end up:
@@ -125,12 +126,12 @@ protection stories:
 | 2 | **DataStage engine storage** — `/ds-storage` (global, RWX, 100 Gi) and `/px-storage` (per runtime instance, RWX, 10 Gi) | `/ds-storage`: per-project runtime area — compiled artifacts, job logs, run history, Data Set descriptors, custom libraries, ODBC config. `/px-storage`: parallel-engine configuration, the **resource disks** holding Data Set / File Set bytes (`pds_files/node*`), files written to file-system paths, live engine state | PVCs in the `cpd` namespace |
 | 3 | **External data sources** | The actual tables and files the flows read and write, through connections | Owned by whoever owns that database; outside CP4D |
 
-Measured contents of store 2 after one compile and one run: §4.5. Two more PVCs exist,
+Measured contents of store 2 after one compile and one run: §4.6. Two more PVCs exist,
 `ds-temp` (20 Gi) and `ds-migration` (5 Gi), used as working space by the assets and migration
 services.
 
 > Store 3 is the same boundary the `cp4d-example` blueprint documents: a connection travels as a
-> *definition*, the data behind it does not.
+> *definition*, the data behind it does not. §4.8 shows it on a real database.
 
 ---
 
@@ -158,154 +159,334 @@ ADMIN_P=$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o
 
 ---
 
-## 4. Hands-on: a minimal ETL job, without touching the UI
+## 4. Hands-on: an ETL job from one table to another
 
-Everything below was run against CP4D 5.2.2 / DataStage 5.2.2 on 2026-09-09 and is reproducible.
-The flow is deliberately built **from a JSON file through the CLI**, not drawn on the canvas, so the
-whole fixture can be recreated by a script. Drawing it in the canvas is worth doing once to
-understand the tool — but a UI walkthrough cannot be replayed by a test.
+This repository uses **two** example flows, each for one job:
 
-### 4.1 A project
+| Flow | Used by | Why this shape |
+|---|---|---|
+| `customers-by-country` — [fixture/customers-by-country.json](fixture/customers-by-country.json) | this section | It reads from a real database and writes back to it, so it shows **connections** and where the DataStage backup stops |
+| `customers-etl` — [fixture/customers-etl.json](fixture/customers-etl.json) | the README's Kasten test, and the measurements in [§5](#5-measurements-made-with-the-self-contained-test-flow) | Self-contained: a Row Generator source, writing only to the engine volumes the blueprint protects. A test of the blueprint should not depend on a database the blueprint does not protect |
 
-```bash
-./bin/cpdctl project create --name datastage-demo --type cpd --storage-type assetfiles
-# -> Location /v2/projects/<PID>
-PID=<PID>
+Everything in this section was run on 2026-10-20 against CP4D 5.4.0 Patch 7 / DataStage 5.4.7,
+with CloudNativePG 1.30.1 and PostgreSQL 18.6. The flow is imported **from a JSON file through the
+CLI**, not drawn on the canvas, so the whole example can be recreated by a script. Drawing a flow
+in the canvas is worth doing once to understand the tool, but a UI walkthrough cannot be replayed
+by a test.
+
+```
+ namespace datastage-demo-db                        namespace cpd — DataStage
+ ┌───────────────────────────┐                     ┌──────────────────────────────────────────────┐
+ │ PostgreSQL "customers-db" │                     │                                              │
+ │                           │  connection         │  customers ─▶ by_country ─▶ Copy_1 ─┬─▶ customers_by_country
+ │  customers  (6 rows)  ────┼────────────────────▶│  (read)       (Aggregator)          │   (write, truncate first)
+ │  customers_by_country ◀───┼─────────────────────┤                                     └─▶ customers_by_country.ds
+ │                           │                     │                                         (Data Set, engine volumes)
+ └───────────────────────────┘                     └──────────────────────────────────────────────┘
 ```
 
-That is the whole setup. The flow below generates its own rows, so the fixture needs no input file
-and stays far under the 5 KB the development loop wants.
+### 4.1 The database — outside DataStage
 
-> **Why no input file?** A DataStage flow cannot read a project `data_asset` directly. Measured:
-> the bytes of an uploaded file live in project storage at
-> `/<storage-id>/<data-asset-id>/<attachment-id>` and are reachable only through an **`assetfiles`
-> connection** — and addressing the asset by id through that connection is refused
-> (*"The specified data asset does not use the specified connection"*), because an asset whose bytes
-> were uploaded is not a *connected* data asset. A `PxSequentialFile` stage with
-> `file_location: "connection"` compiles but fails at run time, because the engine opens the path on
-> the local filesystem: `Unable to open /1d495273-…: No such file or directory`. Reading through a
-> connection requires a **connector node**, a shape the canvas emits and the stage palette does not
-> contain. So the fixture uses a Row Generator, and the project/engine split is demonstrated by the
-> Data Set instead — see §4.5.
+Any PostgreSQL that the DataStage pods can reach will do. This example uses
+[CloudNativePG](https://cloudnative-pg.io/) in its own namespace, because it is one manifest and the
+repository already has a blueprint for it.
 
-### 4.2 The flow
+Make sure the CloudNativePG operator is installed and watches the `datastage-demo-db` namespace.
 
-`fixture/customers-etl.json` is a four-node flow:
+```bash
+kubectl create namespace datastage-demo-db
+
+kubectl apply -f - <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: customers-db
+  namespace: datastage-demo-db
+spec:
+  instances: 1
+  storage:
+    size: 1Gi
+    storageClass: ocs-storagecluster-ceph-rbd
+  bootstrap:
+    initdb:
+      database: customers
+      owner: etl
+EOF
+kubectl wait --for=condition=Ready clusters.postgresql.cnpg.io/customers-db \
+  -n datastage-demo-db --timeout=300s
+```
+
+> **Storage class**: `ocs-storagecluster-ceph-rbd` is the OpenShift Data Foundation class of our test
+> cluster. Replace it with a storage class that supports CSI snapshots on your cluster (for example,
+> `managed-csi` on AKS, `standard-rwo` on GKE, `ebs-sc` on EKS, your custom class on bare metal).
+> This tutorial never snapshots the database, but the backup of it that §4.8 points to does.
+
+> **Write the resource name in full.** On a cluster with Kasten, `kubectl wait cluster/customers-db`
+> resolves `cluster` to Kasten's own `clusters.dist.kio.kasten.io` and answers *NotFound*.
+
+Create the source table with six rows, and the empty target table:
+
+```bash
+kubectl exec -n datastage-demo-db customers-db-1 -c postgres -- \
+  psql -U postgres -d customers -v ON_ERROR_STOP=1 -c "
+SET ROLE etl;
+CREATE TABLE customers (
+  id        integer      PRIMARY KEY,
+  cust_name varchar(20)  NOT NULL,
+  country   char(2)      NOT NULL,
+  amount    numeric(8,2) NOT NULL);
+INSERT INTO customers VALUES
+  (1,'Alice','FR',120.50), (2,'Bruno','FR',80.00), (3,'Chen','CN',200.00),
+  (4,'Dana','US',45.25),   (5,'Emeka','NG',310.00), (6,'Farah','US',99.75);
+CREATE TABLE customers_by_country (
+  country        char(2)       PRIMARY KEY,
+  customer_count integer       NOT NULL,
+  total_amount   numeric(10,2) NOT NULL);"
+```
+
+Check that the DataStage engine can reach the database. CP4D sets NetworkPolicies in its own
+namespace, so this is worth a second before you debug a connector:
+
+```bash
+POD=$(kubectl get pods -n cpd -o name | grep px-runtime | head -1)
+kubectl exec -n cpd ${POD#pod/} -c px-runtime -- timeout 5 \
+  bash -c 'echo > /dev/tcp/customers-db-rw.datastage-demo-db.svc/5432 && echo reachable'
+```
+
+### 4.2 A project and a connection
+
+```bash
+./bin/cpdctl project create --name datastage-pg-demo --type cpd --storage-type assetfiles
+PID=$(./bin/cpdctl project list --output json \
+  | jq -r '.resources[] | select(.entity.name=="datastage-pg-demo") | .metadata.guid')
+```
+
+A **connection** is the project asset that holds the endpoint and the credentials. The password
+comes from the Secret CloudNativePG generated, so it never appears on the command line or in git:
+
+```bash
+DB_PASS=$(kubectl get secret -n datastage-demo-db customers-db-app -o jsonpath='{.data.password}' | base64 -d)
+jq -n --arg p "$DB_PASS" '{host: "customers-db-rw.datastage-demo-db.svc", port: "5432",
+       database: "customers", username: "etl", password: $p, ssl: "false"}' > /tmp/conn.json
+./bin/cpdctl dsjob create-connection --project-id "$PID" --name customers-db \
+    --datasource-type PostgreSQL --property-file /tmp/conn.json
+rm /tmp/conn.json
+
+CONN_ID=$(./bin/cpdctl dsjob list-connections --project-id "$PID" --with-id \
+  | awk -F'|' '$1 ~ /^customers-db *$/ {gsub(/ /,"",$2); print $2}')
+```
+
+`create-connection` **tests the connection** before saving it (unless you pass `--no-test`), so a
+success here already proves the hostname, the port and the password.
+
+### 4.3 The flow
+
+| Stage | Type | What it does |
+|---|---|---|
+| `customers` | PostgreSQL connector | reads the table `public.customers` |
+| `by_country` | Aggregator | groups by `country`: `total_amount` = sum of `amount`, `customer_count` = number of rows |
+| `Copy_1` | Copy | sends the same rows to two targets |
+| `customers_by_country` | PostgreSQL connector | **truncates** the table, then inserts — running the job twice gives the same table |
+| `customers_by_country_ds` | Data Set | writes `customers_by_country.ds`, the parallel engine's own format |
+
+The Data Set target is there on purpose. The database rows are outside DataStage, so without it
+the run would leave almost nothing on the engine volumes, and §4.6 would have little to measure.
+
+The flow file refers to its connection **only by id** — no hostname, no password. It ships with two
+placeholders, which you replace with your own project and connection ids:
+
+```bash
+export CPDCTL_ENABLE_DSJOB=true
+sed -e "s/__PROJECT_ID__/$PID/" -e "s/__CONNECTION_ID__/$CONN_ID/" \
+    fixture/customers-by-country.json > /tmp/customers-by-country.json
+./bin/cpdctl dsjob create-flow --project-id "$PID" --name customers-by-country \
+    --pipeline-file /tmp/customers-by-country.json
+./bin/cpdctl dsjob compile --project-id "$PID" --name customers-by-country
+# customers-by-country compiled successfully in 2 seconds.
+```
+
+You do not need to read the flow file. It was produced with IBM's watsonx.data integration Python
+SDK by [fixture/build-flow.py](fixture/build-flow.py), which also explains how to change it.
+
+**Compile is a real build step**, not validation: it writes `OshScript.osh` plus a `lib/`
+directory on `/ds-storage` (§4.6) — and, as §4.7 shows, a copy of the connection. A flow that is
+imported but never compiled cannot run.
+
+### 4.4 The job and the run
+
+A *flow* is not runnable — a **job** is. The job binds a flow to parameters and a runtime
+environment:
+
+```bash
+./bin/cpdctl dsjob create-job --project-id "$PID" --flow customers-by-country --name customers-by-country-job
+./bin/cpdctl dsjob run        --project-id "$PID" --job customers-by-country-job --wait 300
+```
+
+The run log is the parallel engine's own log, and it is worth reading once (shortened):
+
+```
+<customers> CDICO0004I: Connection properties: {proxy=0, database=customers, password=(masked),
+            port=5432, host=customers-db-rw.datastage-demo-db.svc, ssl=0, username=(credentials)}.
+<customers,0> Output 0 produced 6 records.
+<customers,1> Output 0 produced 0 records.
+<APT_HashedGroup2Operator in by_country,0> Input 0 consumed 4 records.
+<APT_HashedGroup2Operator in by_country,0> Output 0 produced 3 records.
+<APT_HashedGroup2Operator in by_country,1> Input 0 consumed 2 records.
+<APT_HashedGroup2Operator in by_country,1> Output 0 produced 1 records.
+Current Job Status: Completed
+```
+
+The `,0` and `,1` suffixes are **partition numbers**: two compute pods, so two players per stage.
+The log shows how the rows moved:
+
+- The source read all 6 rows on partition 0; partition 1 read none. A table read is not split
+  across partitions unless you configure it.
+- The engine then **hash-partitioned the rows by `country`** for the Aggregator, so that all the
+  rows of one country reach the same player: partition 0 received 4 rows and produced 3 groups
+  (CN, FR, NG), partition 1 received the 2 US rows and produced 1 group.
+
+### 4.5 Verifying the output
+
+```bash
+kubectl exec -n datastage-demo-db customers-db-1 -c postgres -- \
+  psql -U postgres -d customers -c "SELECT * FROM customers_by_country ORDER BY country;"
+```
+
+```
+ country | customer_count | total_amount
+---------+----------------+--------------
+ CN      |              1 |       200.00
+ FR      |              2 |       200.50
+ NG      |              1 |       310.00
+ US      |              2 |       145.00
+```
+
+FR is 120.50 + 80.00, US is 45.25 + 99.75. Run the job a second time and the table still has 4
+rows, because the target truncates before it inserts. The Data Set holds the same 4 rows:
+
+```bash
+./bin/cpdctl dsjob view-dataset --project-id "$PID" --name customers_by_country.ds
+```
+
+### 4.6 Where everything landed — measured, not assumed
+
+After exactly one compile and one run of this flow, plus one `view-dataset`:
+
+| What | Where | Store ([§2.3](#23-the-persistence-map--where-the-bytes-are)) |
+|---|---|---|
+| The **connection** (host, user, password), the flow, the job, the Data Set **asset**, the project settings, the runtime environment | project asset store | 1 — CP4D metadata |
+| Compiled flow: `flows/<flow-id>/scripts/OshScript.osh`, `lib/`, `<flow-id>.zip` — **including a copy of the connection** (§4.7) | `/ds-storage/PXRuntime/Projects/<project-id>/` | 2 — `datastage-ibm-datastage-ds-storage-pvc` |
+| Compiled job and run history: `jobs/<job-id>/scripts/OshScript.osh`, `runs/<run-id>/job.log`, … — the OSH holds the same connection copy, the log records host and port | same | 2 |
+| Data Set **descriptor**: `customers_by_country.ds` (3460 bytes), `customers_by_country.ds.schema` (80 bytes) | same | 2 |
+| Data Set **preview**: `sample_data/ds_data_<uuid>.txt` (338 bytes) — the rows `view-dataset` displayed, **left behind on the volume** | same | 2 |
+| Data Set **data**: `customers_by_country.ds.<uid>.<ip>.…`, one file per partition — 82 bytes (3 rows) on `node2`, 52 bytes (1 row) on `node3` | `/px-storage/pds_files/node2`, `node3` | 2 — `ds-px-default-…-px-storage-pvc` |
+| The rows of `customers` and `customers_by_country` | the PostgreSQL volume in `datastage-demo-db` | **3 — neither DataStage nor the DataStage blueprint** |
+
+One logical object can therefore straddle three stores: the Data Set is an **asset** in the project,
+a **descriptor** on `/ds-storage`, and **partitioned data** on `/px-storage`. The connection is
+similar: a project asset, plus a compiled copy on `/ds-storage`.
+
+> **Engine storage accumulates orphans.** Deleting a flow or a job through the API removes the
+> asset but leaves its directory under `/ds-storage/PXRuntime/Projects/<project-id>/`. After
+> deleting and recreating a flow twice, three `flows/<id>/` and three `jobs/<id>/` directories were
+> present for one flow and one job (5.2.2). Seen again on 5.4.7: one job deleted and recreated left
+> two `jobs/<id>/` directories. So the volume is not a faithful mirror of the project — it is a
+> superset that only grows. Deleting the **whole project** is different: that does remove
+> `Projects/<project-id>/` (§4.9).
+
+### 4.7 The job runs with a copy of the connection, not with the connection
+
+Compiling copies **every property of the connection** into the OSH script on `/ds-storage`, in an
+XML `<Connection>` block: `host`, `port`, `database`, `username`, `ssl`, `proxy`, and the `password`
+as a `protectedstring` (encrypted, not plain text). The flow and the job each get their own copy.
+
+Which copy does a run use? Measured by breaking the project connection on purpose:
+
+| Step | Result |
+|---|---|
+| Change the connection's `host` to a name that does not exist (`dsjob update-connection --property host=…`), then run the job **without recompiling** | **Completed**, all 4 rows rewritten. The run used the compiled copy and never read the project connection |
+| Recompile, then run | **Failed**: `Error establishing socket. Unknown host: does-not-exist…`. Compiling copied the new value in |
+
+So the project and the engine volume each hold a version of the connection, and **only compiling
+makes them agree**. Three consequences:
+
+1. **After a restore, recompile** before you trust a job. If the project and the engine volumes were
+   restored from different points in time, a job can run with credentials that nobody sees in the
+   UI.
+2. **After moving to a cluster where the database has another hostname**, editing the connection is
+   not enough: the job keeps connecting to the old host until you recompile.
+3. **Snapshots of `/ds-storage` contain database credentials**, encrypted. Protect the restore
+   points as you would protect those credentials.
+
+### 4.8 What the DataStage backup does not protect
+
+Two things in this example belong to **other** backups.
+
+**The database.** The rows of `customers` and `customers_by_country` live on the PostgreSQL volume
+in `datastage-demo-db`. Neither the DataStage blueprint nor cp4d-example touches them. Back the
+database up with a blueprint made for it: [cnpg-example](../cnpg-example/) for CloudNativePG,
+[edb-example](../edb-example/) for EDB Postgres for Kubernetes. When you plan it, note which table
+really needs protecting: `customers` is source data, while `customers_by_country` is **derived** —
+re-running the job rebuilds it.
+
+Two backups also mean **two points in time**. If a job ran between the database backup and the
+DataStage backup, the restored tables and the restored jobs do not describe the same moment. The
+simple fix after restoring both is to re-run the jobs that write derived tables.
+
+**The connection belongs to the CP4D project backup.** A connection is a project asset, so
+[cp4d-example](../cp4d-example/) protects it, with the flows and jobs. Measured on this project,
+`cpdctl asset export start --assets-all-assets` exported one each of `connection`,
+`data_intg_flow`, `job`, `data_intg_data_set`, `data_intg_project_settings` and `environment`, and
+the connection was in it **twice**:
+
+| In the export | Connection details |
+|---|---|
+| `assets/.METADATA/connection.<id>.json` | host, user, and the **password in clear text** — the export was made without `--encryption-key` |
+| the flow's `px_executables` attachment (the compiled zip) | the compiled copy of §4.7: host, and the password encrypted |
+
+The DataStage blueprint also captures the compiled copy, as a side effect of snapshotting
+`/ds-storage`. That copy is **not** the source of truth: the project is. Restore the project with
+cp4d-example, then recompile (§4.7). For the clear-text password, see cp4d-example
+[DESIGN.md § 6](../cp4d-example/DESIGN.md#6-the-data-and-credential-boundary-validated-2026-07-10):
+export with an encryption key.
+
+### 4.9 Clean up
+
+```bash
+./bin/cpdctl project delete --project-id "$PID"
+# If it answers "Cannot delete the project due to failure retrieving active jobs and runtimes",
+# run it again: we saw this once, and the second attempt succeeded.
+# The delete removes /ds-storage/PXRuntime/Projects/<PID>/, Data Set descriptor included, but NOT the
+# Data Set data on /px-storage — measured on 5.4.7. Remove it by hand,
+# only if no other project writes a Data Set with this name:
+for P in $(kubectl get pods -n cpd -o name | grep -E 'px-(runtime|compute)'); do
+  kubectl exec -n cpd ${P#pod/} -- bash -c 'rm -f /px-storage/pds_files/node*/customers_by_country.ds.*'
+done
+
+kubectl delete namespace datastage-demo-db
+```
+
+---
+
+## 5. Measurements made with the self-contained test flow
+
+The measurements below were made with the **other** example flow, `customers-etl`, the one the
+README's Kasten test uses, on CP4D 5.2.2 / DataStage 5.2.2 on 2026-09-09. It needs no database:
 
 ```
 Row_Generator_1 ──▶ Copy_1 ──┬──▶ customers_txt   (Sequential File → /px-storage/data/customers.txt)
    (5 records)               └──▶ customers_ds    (Data Set        → customers.ds)
 ```
 
-Why these four stages, and not a prettier ETL: they exercise **both** persistence paths in one run.
-The Sequential File target writes an ordinary file onto engine storage; the Data Set target writes
-the parallel engine's own format, whose descriptor and data end up in **different** places (§4.5).
-A Row Generator source keeps the flow free of any external dependency.
+Its two targets write to the engine volumes only — an ordinary file and a Data Set — which is what
+these measurements need. To build it, follow
+[README.md § Create the example data](README.md#create-the-example-data).
 
-> **The flow JSON format, and the two traps in it.** A flow is the *pipeline-flow-v3* schema
-> (`json_schema: …/pipeline-flow/pipeline-flow-v3-schema.json`) with DataStage specifics under
-> `app_data.datastage`: one entry per stage in `pipelines[0].nodes` (`op: PxRowGenerator`, `PxCopy`,
-> `PxSequentialFile`, `PxDataSet`), links declared on the **input** ports
-> (`inputs[].links[].node_id_ref` + `port_id_ref`, pointing back at the upstream node and port), and
-> column metadata in the top-level `schemas` array, referenced by `schema_ref`. The file here is
-> generated by [fixture/make-flow.py](fixture/make-flow.py) so it can be read and changed.
->
-> 1. **`metadata.item_index` is the column's nesting level, not its position.** Numbering columns
->    0, 1, 2 looks obviously right and is wrong: the compiler then emits
->    `cust_name:subrec ( country:subrec ( amount:string[6] ) )` and the *compile still succeeds*.
->    The job aborts at run time with
->    `schema contains a field "cust_name" that is a subrec or tagged; only top-level fields are accepted`.
->    Flat columns are all level `0`.
-> 2. **Each stage carries its own copy of the columns** in `parameters.inputcolProperties`
->    (`ColumnName`, `DataType`, `Length`, …). It must agree with the `schemas` entry the port
->    references, and nothing checks that for you.
->
-> Read the generated OSH when a run fails in a way the log does not explain — it is the actual
-> program, and it is on the volume:
-> `kubectl exec -n cpd <px-runtime-pod> -- cat /ds-storage/PXRuntime/Projects/<pid>/flows/<flow-id>/scripts/OshScript.osh`
+The measurements that led to design decisions — what each project export contains, whether an
+imported project runs, and why a cloned project can damage the original — are in the README:
+[Why this blueprint does not use the export commands](README.md#why-this-blueprint-does-not-use-the-export-commands).
 
-```bash
-export CPDCTL_ENABLE_DSJOB=true
-./bin/cpdctl dsjob create-flow --project-id "$PID" --name customers-etl \
-    --pipeline-file fixture/customers-etl.json
-./bin/cpdctl dsjob compile --project-id "$PID" --name customers-etl
-# customers-etl compiled successfully in 13 seconds.
-```
-
-**Compile is a real build step**, not validation: it produces `OshScript.osh` plus a `lib/`
-directory on `/ds-storage` (§4.5). A flow that is imported but never compiled cannot run.
-
-### 4.3 The job and the run
-
-A *flow* is not runnable — a **job** is. The job binds a flow to parameters and a runtime
-environment:
-
-```bash
-./bin/cpdctl dsjob create-job --project-id "$PID" --flow customers-etl --name customers-etl-job
-./bin/cpdctl dsjob run        --project-id "$PID" --job customers-etl-job --wait 300
-```
-
-The run log is the parallel engine's own log, which is worth reading once — it names each operator
-and each partition:
-
-```
-<Row_Generator_1,0> Output 0 produced 5 records.
-<Copy_1,1> Input 0 consumed 2 records.          <- partition 1 got 2 rows
-<Copy_1,0> Input 0 consumed 3 records.          <- partition 0 got 3 rows
-<APT_RealFileExportOperator in customers_txt,0> Export complete; 5 records exported successfully, 0 rejected.
-Step execution finished with status = OK.
-Current Job Status: Completed
-```
-
-The `,0` and `,1` suffixes are **partition numbers**: two compute pods, so the five rows were split
-across two players. Fine to know before reading any DataStage log in anger.
-
-### 4.4 Verifying the output
-
-```bash
-POD=$(kubectl get pods -n cpd -o name | grep px-runtime | head -1)
-kubectl exec -n cpd ${POD#pod/} -- cat /px-storage/data/customers.txt
-kubectl exec -n cpd ${POD#pod/} -- find /px-storage/pds_files -name 'customers.ds*'
-./bin/cpdctl dsjob list-datasets --project-id "$PID" --with-id
-./bin/cpdctl dsjob view-dataset  --project-id "$PID" --name customers.ds
-```
-
-```
-"aaaaaaaaaaaaaaaaaaaa","aa","aaaaaa"
-"cccccccccccccccccccc","cc","cccccc"
-"eeeeeeeeeeeeeeeeeeee","ee","eeeeee"
-"bbbbbbbbbbbbbbbbbbbb","bb","bbbbbb"
-"dddddddddddddddddddd","dd","dddddd"
-```
-
-> The Row Generator fills each `CHAR` column with a default pattern, so the content is not pretty,
-> and the row order reflects the two partitions being written back in whatever order they finished.
-> It proves rows flowed end to end, which is all the fixture needs.
-
-### 4.5 Where everything landed — measured, not assumed
-
-After exactly one compile and one run of this one flow:
-
-| What | Where | Volume |
-|---|---|---|
-| The flow, the job, the project settings, the runtime environment, the Data Set **asset** | project asset store | CP4D metadata (not a DataStage PVC) |
-| Compiled flow: `flows/<flow-id>/scripts/OshScript.osh`, `lib/`, `<flow-id>.zip` | `/ds-storage/PXRuntime/Projects/<project-id>/` | `datastage-ibm-datastage-ds-storage-pvc` |
-| Compiled job + run history: `jobs/<job-id>/runs/<run-id>/{job.log, perf.out, dynamic_config.apt, mon.log}` | same | same |
-| Data Set **descriptor**: `customers.ds`, `customers.ds.schema` | same | same |
-| Data Set **data**: `customers.ds.<uid>.<ip>.0000.0000.…` | `/px-storage/pds_files/node2`, `node3` | `ds-px-default-…-px-storage-pvc` |
-| Sequential File output: `customers.txt` (+ `.schema`) | `/px-storage/data/` | same |
-| Live engine state: `queuedJobs/`, `runningJobs/`, `WLM/` | `/px-storage/PXRuntime/` | same |
-
-One logical object can therefore straddle three stores: the Data Set is an **asset** in the project,
-a **descriptor** on `/ds-storage`, and **partitioned data** on `/px-storage`.
-
-> **Engine storage accumulates orphans.** Deleting a flow or a job through the API removes the
-> asset but leaves its directory under `/ds-storage/PXRuntime/Projects/<project-id>/`. After
-> deleting and recreating the fixture flow twice, three `flows/<id>/` and three `jobs/<id>/`
-> directories were present for one flow and one job. So the volume is not a faithful mirror of the
-> project — it is a superset that only grows.
-
-### 4.5b What a Data Set descriptor actually contains
+### 5.1 What a Data Set descriptor actually contains
 
 `customers.ds` on `/ds-storage` is **3431 bytes and holds no rows at all**. It is closer to a
 database catalog entry than to a data file. Measured by byte offset:
@@ -341,7 +522,7 @@ Three things follow, and each one matters for backup:
    width is 20+2+6), while the files on disk are 58 and 53 bytes — the Data Set format compresses.
    Visible in the raw bytes as run-length runs of the generator's fill characters.
 
-### 4.5c Why `customers.ds` is browsable in the UI and `customers.txt` is not
+### 5.2 Why `customers.ds` is browsable in the UI and `customers.txt` is not
 
 Both are written by the same flow to the same volume set, yet only one appears under **Data sets**
 in the project. The difference is a single stage property:
@@ -366,96 +547,20 @@ three menu entries are therefore three different levels of proof:
 | **View schema** | the descriptor | **yes — and reports the old row count as if nothing were wrong** |
 | **View data** | descriptor + data files + a live engine | **no — the only honest one** |
 
-### 4.6 What an export actually contains — the two different exports
-
-Two different CLIs export the same project, and they do **not** produce the same thing. Measured on
-this fixture:
-
-**A. `cpdctl dsjob export-project` — DataStage components only** (5.1 KB):
-
-```
-DataStage-README.json          manifest: project name/id, service versions, asset list
-ENCRYPTED                      marker (value "INTERNAL" when no --enc-key was given)
-data_intg_flow/customers-etl.json
-job/customers-etl-job.json
-px_executables/customers-etl/customers-etl.zip     because of --include-binaries
-```
-
-Run with `--include-data-assets --include-binaries`, it still did **not** contain the
-`customers.ds` Data Set asset, the project settings or the environment. **A `dsjob export-project`
-is not a project backup**: it follows the DataStage dependency graph outward from the flows, so
-anything the flows do not reference is left out — including data assets, which is why
-`--include-data-assets` can appear to do nothing.
-
-**B. `cpdctl asset export start --assets-all-assets` — the whole project** (160 KB zip, 94 files):
-
-```
-assets/.METADATA/{data_intg_flow, data_intg_data_set,
-                  data_intg_project_settings, environment, job}.<id>.json
-assets/<storage-id>/<asset-id>/<attachment-id>            any uploaded file's BYTES
-assets/data_intg_flow/…px_executables                     the compiled binaries
-assets/data_intg_data_set/ds-storage/PXRuntime/Projects/<pid>/customers.ds/
-        customers.ds, customers.ds.schema                 the Data Set DESCRIPTOR
-assettypes/*.json                                          type definitions (the bulk of the file count)
-assetrelationships.json
-```
-
-Neither export contains the Data Set's **data** from `/px-storage/pds_files`, nor the
-`customers.txt` the flow wrote to a file-system path. Both exports are *design + metadata*; engine
-storage is not in scope for either.
-
-### 4.7 A full round-trip: does an imported project actually run?
-
-The question that decides the whole blueprint. Export B was imported into a brand-new empty project
-with `cpdctl asset import start --import-dir …`, changing nothing else:
-
-| Check | Result |
-|---|---|
-| Assets restored | flow, job, `customers.ds` Data Set asset, project settings, runtime environment |
-| `list-flows --with-compiled` | `Compiled: true`, `Need Compilation: false` — the `px_executables` round-tripped |
-| `dsjob run` on the restored job, **without recompiling** | `Step execution finished with status = OK`, 5 records, new output written |
-| `view-dataset` on the restored Data Set | returns the five rows |
-
-So a whole-project export/import restores a **working** DataStage project, compiled binaries
-included. That is the single most important measurement in this file.
-
-> **And one consequence, observed in the same test.** A Data Set is restored as a **pointer, not a
-> copy**. That is the right behaviour for a recovery — the original is gone, or you are on another
-> cluster — but it makes **cloning** a project onto the same runtime instance dangerous. Proof,
-> from a second import into a brand-new project:
->
-> | Check | Result |
-> |---|---|
-> | `md5sum` of the descriptor in the source and in the imported project | **identical** (`5588c93…`) |
-> | `view-dataset` in the imported project, **before running any job** | returns the five rows — it is reading the source project's data files |
-> | Data files on `/px-storage/pds_files` | unchanged, one set, not duplicated |
->
-> So the imported project addresses the **original project's data files**. When the restored job
-> ran, the engine did what a Data Set write always does — it deleted the existing data files first
-> (`<delete data files in delete customers.ds> Output 0 produced 1 records`) — and so **destroyed
-> the source project's Data Set data**. Afterwards, `view-dataset` on the *original* project failed
-> with `Sample data could not be read from dataset …`, while the restored copy read back fine.
->
-> Restoring a DataStage project **next to the original, on the same cluster, then running its jobs**
-> can therefore damage the original. The design assets are project-scoped, but the engine storage
-> they point into is **shared by every project on that runtime instance**. Restoring into a
-> different cluster does not have this problem — there the Data Set data is simply absent until a
-> job rewrites it.
-
 ---
 
-## 5. CLI cheat sheet
+## 6. CLI cheat sheet
 
 The commands that come up constantly when developing or verifying a backup:
 
 ```bash
-P=datastage-demo                       # or --project-id <PID>
+P=datastage-pg-demo                    # or --project-id <PID>
 
 # design objects
 cpdctl dsjob list-flows        --project $P --with-id --with-compiled
-cpdctl dsjob get-flow          --project $P --name customers-etl --output json --file-name flow.json
-cpdctl dsjob create-flow       --project $P --name customers-etl --pipeline-file flow.json
-cpdctl dsjob compile           --project $P --name customers-etl
+cpdctl dsjob get-flow          --project $P --name customers-by-country --output json --file-name flow.json
+cpdctl dsjob create-flow       --project $P --name customers-by-country --pipeline-file flow.json
+cpdctl dsjob compile           --project $P --name customers-by-country
 cpdctl dsjob list-connections  --project $P --with-id
 cpdctl dsjob list-paramsets    --project $P
 cpdctl dsjob list-datasets     --project $P --with-id
@@ -488,10 +593,58 @@ cpdctl dsjob list-volume-files --name <vol> --path /
 
 ---
 
-## 6. Reading list
+## 7. Reading list
 
 - `dsjob` CLI reference for the exact release — pin the version:
   <https://github.com/IBM/DataStage/blob/main/dsjob/dsjob.5.2.2.md>
 - IBM: DataStage runtime storage layout (`/ds-storage`, `/px-storage`)
 - IBM: High availability and disaster recovery in DataStage — IBM's own guidance is *"back up your
   projects by exporting them"*, which is the logical-export path above.
+
+---
+
+## Appendix A — The flow JSON format, for whoever changes `customers-etl.json`
+
+You need this appendix only to modify [fixture/customers-etl.json](fixture/customers-etl.json), the
+README's test flow, which [fixture/make-flow.py](fixture/make-flow.py) writes by hand. The §4 flow
+is built differently — through IBM's SDK, by [fixture/build-flow.py](fixture/build-flow.py) —
+because its connector stages are not practical to write by hand.
+
+The `json_schema` field names the format — IBM's *pipeline-flow v3* — in the same way `apiVersion`
+names the format of a Kubernetes manifest. Nothing validates the file against that URL. The flow is
+a graph of the canvas drawing:
+
+```
+Row_Generator_1 ──Link_1──▶ Copy_1 ──┬──Link_2──▶ customers_txt
+                                     └──Link_3──▶ customers_ds
+```
+
+| Part of the file | What it holds |
+|---|---|
+| `pipelines[0].nodes` | One object per stage (box). `op` is the stage type: `PxRowGenerator`, `PxCopy`, `PxSequentialFile`, `PxDataSet`. Each node has input and output **ports**, each with an `id` |
+| `inputs[].links[]` on a node | The arrows. A link is stored by the **receiving** stage, as a reference back to the sender: `node_id_ref` (upstream node) + `port_id_ref` (its output port). The sending stage does not list where its output goes — like a Pod that names a ConfigMap, while the ConfigMap names no Pod |
+| `schemas` (top level) | The column lists, each with an `id`. A port says which list flows through it with `schema_ref` |
+| `app_data.datastage` | DataStage-specific settings. Everything under `ui_data` is canvas layout only (positions, icons, labels) |
+
+Two traps, both of which compile successfully and fail only when the job runs:
+
+1. **`metadata.item_index` is the column's nesting level, not its position.** DataStage supports
+   nested records (`subrec`), and `item_index` says how deep a column is nested inside the previous
+   one. Numbering the columns 0, 1, 2 therefore means "`country` inside `cust_name`, `amount` inside
+   `country`": the compiler emits `cust_name:subrec ( country:subrec ( amount:string[6] ) )` and the
+   job aborts with
+   `schema contains a field "cust_name" that is a subrec or tagged; only top-level fields are accepted`.
+   In a flat table every column is level `0`.
+2. **Each stage stores its own copy of the columns** in `parameters.inputcolProperties`
+   (`ColumnName`, `DataType`, `Length`, …), in addition to the `schemas` entry its port references.
+   The canvas keeps the two in step; a hand-written file must do it itself, and nothing checks it.
+   `make-flow.py` builds both from the single `COLS` list for this reason.
+
+When a run fails and the log does not explain why, read the **OSH script**. Compiling translates
+the JSON into OSH (Orchestrate Shell), the program the parallel engine actually runs — the
+relationship is the one between a Helm values file and the manifest `helm template` renders. It
+shows exactly what DataStage understood from the JSON:
+
+```bash
+kubectl exec -n cpd <px-runtime-pod> -- cat /ds-storage/PXRuntime/Projects/<pid>/flows/<flow-id>/scripts/OshScript.osh
+```

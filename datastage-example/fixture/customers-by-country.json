@@ -1,0 +1,721 @@
+{
+  "app_data": {
+    "additionalProperties": {
+      "globalAcp": true,
+      "runMode": "ETL"
+    },
+    "datastage": {
+      "version": "3.0.5"
+    }
+  },
+  "doc_type": "pipeline",
+  "id": "aac3d2c4-d8a5-462e-8872-8b707c06199b",
+  "json_schema": "https://api.dataplatform.ibm.com/schemas/common-pipeline/pipeline-flow/pipeline-flow-v3-schema.json",
+  "parameters": {
+    "local_parameters": []
+  },
+  "pipelines": [
+    {
+      "app_data": {
+        "ui_data": {
+          "comments": []
+        }
+      },
+      "description": "",
+      "id": "fd733417-4863-4273-8f96-bf5b72ed081a",
+      "nodes": [
+        {
+          "app_data": {
+            "ui_data": {
+              "image": "/data-intg/flows/graphics/palette/postgresql.svg",
+              "is_resized": true,
+              "label": "customers",
+              "resize_height": 48,
+              "resize_width": 48,
+              "x_pos": 304,
+              "y_pos": 524
+            }
+          },
+          "connection": {
+            "app_data": {},
+            "name": "customers-db",
+            "project_ref": "__PROJECT_ID__",
+            "properties": {
+              "currentOutputLinkType": "PRIMARY",
+              "enableFlowAcpControl": true,
+              "enableSchemalessDesign": false,
+              "input_count": 0,
+              "outputAcpShouldHide": true,
+              "output_count": 1,
+              "read_mode": "general",
+              "schema_name": "public",
+              "table_name": "customers"
+            },
+            "ref": "__CONNECTION_ID__"
+          },
+          "id": "3faeb96e-2005-4835-a9ba-06691dae37c7",
+          "op": "postgresql",
+          "outputs": [
+            {
+              "app_data": {
+                "datastage": {
+                  "is_source_of_link": "ca52d848-7a89-4471-8b93-0c00a85b70fd"
+                },
+                "ui_data": {
+                  "cardinality": {
+                    "max": 1,
+                    "min": 0
+                  },
+                  "label": "outPort"
+                }
+              },
+              "id": "3c08d3c4-9ab7-4d90-ad88-2c3d6a74c8de",
+              "parameters": {},
+              "schema_ref": "8248e117-2878-4627-a9ff-7647d6862aa2"
+            }
+          ],
+          "parameters": {
+            "buf_free_run": 50,
+            "disk_write_inc": 1048576,
+            "input_count": 0,
+            "max_mem_buf_size": 3145728,
+            "output_count": 1,
+            "queue_upper_size": 0
+          },
+          "type": "binding"
+        },
+        {
+          "app_data": {
+            "ui_data": {
+              "image": "/data-intg/flows/graphics/palette/PxAggregator.svg",
+              "is_resized": true,
+              "label": "by_country",
+              "resize_height": 48,
+              "resize_width": 48,
+              "x_pos": 552,
+              "y_pos": 524
+            }
+          },
+          "id": "504c8f22-98dd-46c3-a498-6f1e1faa2a49",
+          "inputs": [
+            {
+              "app_data": {
+                "ui_data": {
+                  "label": ""
+                }
+              },
+              "id": "7394f546-c0ed-483e-a4ae-8df980cd6e99",
+              "links": [
+                {
+                  "app_data": {
+                    "datastage": {},
+                    "ui_data": {
+                      "class_name": "",
+                      "decorations": []
+                    }
+                  },
+                  "id": "ca52d848-7a89-4471-8b93-0c00a85b70fd",
+                  "link_name": "Link_1",
+                  "node_id_ref": "3faeb96e-2005-4835-a9ba-06691dae37c7",
+                  "port_id_ref": "3c08d3c4-9ab7-4d90-ad88-2c3d6a74c8de",
+                  "type_attr": "PRIMARY"
+                }
+              ],
+              "parameters": {
+                "runtime_column_propagation": 0
+              },
+              "schema_ref": "8248e117-2878-4627-a9ff-7647d6862aa2"
+            }
+          ],
+          "op": "PxAggregator",
+          "outputs": [
+            {
+              "app_data": {
+                "additionalProperties": {},
+                "datastage": {
+                  "is_source_of_link": "5ac7a14a-27ef-4fe8-b341-0aef95576c1e"
+                },
+                "ui_data": {
+                  "cardinality": {
+                    "max": 1,
+                    "min": 1
+                  },
+                  "label": "outPort"
+                }
+              },
+              "id": "377fae08-c708-4fe7-9423-8168077d68ad",
+              "parameters": {
+                "valueDerivation": [
+                  {
+                    "columnName": "total_amount",
+                    "parsedExpression": "Sum(Link_1.amount)",
+                    "sourceColumn": "Link_1.amount"
+                  },
+                  {
+                    "columnName": "customer_count",
+                    "parsedExpression": "Count(Link_1.amount)",
+                    "sourceColumn": "Link_1.amount"
+                  }
+                ]
+              },
+              "schema_ref": "4878a9eb-d9ea-4dd9-b69c-da1f7f84df7a"
+            }
+          ],
+          "parameters": {
+            "buf_free_run": 50,
+            "currentOutputLinkType": "PRIMARY",
+            "disk_write_inc": 1048576,
+            "enableFlowAcpControl": true,
+            "enableSchemalessDesign": false,
+            "input_count": 1,
+            "keyProperties": [
+              {
+                "key": "country"
+              }
+            ],
+            "max_mem_buf_size": 3145728,
+            "method": "hash",
+            "outputAcpShouldHide": true,
+            "output_count": 1,
+            "queue_upper_size": 0,
+            "reduceProperties": [
+              [
+                {
+                  "reduce": "amount"
+                },
+                {
+                  "sum": "total_amount"
+                },
+                {
+                  "count": "customer_count"
+                }
+              ]
+            ],
+            "selection": "reduce"
+          },
+          "type": "execution_node"
+        },
+        {
+          "app_data": {
+            "ui_data": {
+              "image": "/data-intg/flows/graphics/palette/PxCopy.svg",
+              "is_resized": true,
+              "label": "Copy_1",
+              "resize_height": 48,
+              "resize_width": 48,
+              "x_pos": 800,
+              "y_pos": 524
+            }
+          },
+          "id": "c1891161-bbdf-49b8-9a4b-6445ebfe4c81",
+          "inputs": [
+            {
+              "app_data": {
+                "ui_data": {
+                  "label": ""
+                }
+              },
+              "id": "84b7c871-551c-4ad0-9305-fac417851195",
+              "links": [
+                {
+                  "app_data": {
+                    "datastage": {},
+                    "ui_data": {
+                      "class_name": "",
+                      "decorations": []
+                    }
+                  },
+                  "id": "5ac7a14a-27ef-4fe8-b341-0aef95576c1e",
+                  "link_name": "Link_2",
+                  "node_id_ref": "504c8f22-98dd-46c3-a498-6f1e1faa2a49",
+                  "port_id_ref": "377fae08-c708-4fe7-9423-8168077d68ad",
+                  "type_attr": "PRIMARY"
+                }
+              ],
+              "parameters": {
+                "runtime_column_propagation": 0
+              },
+              "schema_ref": "4878a9eb-d9ea-4dd9-b69c-da1f7f84df7a"
+            }
+          ],
+          "op": "PxCopy",
+          "outputs": [
+            {
+              "app_data": {
+                "additionalProperties": {},
+                "datastage": {
+                  "is_source_of_link": "3180fffe-947b-4cfa-8129-8eac6ab12f62"
+                },
+                "ui_data": {
+                  "cardinality": {
+                    "max": -1,
+                    "min": 0
+                  },
+                  "label": "outPort"
+                }
+              },
+              "id": "a6844f08-0de2-44d8-8c23-be91d6bba444",
+              "parameters": {},
+              "schema_ref": "bcd55683-6de7-4f0a-800e-7a6efcb1974d"
+            },
+            {
+              "app_data": {
+                "additionalProperties": {},
+                "datastage": {
+                  "is_source_of_link": "73e7ab56-25ca-4b4a-9abf-deb77b9f252b"
+                },
+                "ui_data": {
+                  "cardinality": {
+                    "max": -1,
+                    "min": 0
+                  },
+                  "label": "outPort"
+                }
+              },
+              "id": "a12eca1a-00a9-4add-acae-1c263826db2b",
+              "parameters": {},
+              "schema_ref": "f59783ed-76b9-4ed9-b764-e6d1b0518c8e"
+            }
+          ],
+          "parameters": {
+            "buf_free_run": 50,
+            "currentOutputLinkType": "PRIMARY",
+            "disk_write_inc": 1048576,
+            "enableFlowAcpControl": true,
+            "enableSchemalessDesign": false,
+            "input_count": 1,
+            "max_mem_buf_size": 3145728,
+            "outputAcpShouldHide": true,
+            "output_count": 2,
+            "queue_upper_size": 0
+          },
+          "type": "execution_node"
+        },
+        {
+          "app_data": {
+            "ui_data": {
+              "image": "/data-intg/flows/graphics/palette/postgresql.svg",
+              "is_resized": true,
+              "label": "customers_by_country",
+              "resize_height": 48,
+              "resize_width": 48,
+              "x_pos": 1048,
+              "y_pos": 431
+            }
+          },
+          "connection": {
+            "app_data": {},
+            "name": "customers-db",
+            "project_ref": "__PROJECT_ID__",
+            "properties": {
+              "currentOutputLinkType": "PRIMARY",
+              "enableFlowAcpControl": true,
+              "enableSchemalessDesign": false,
+              "input_count": 1,
+              "outputAcpShouldHide": true,
+              "output_count": 0,
+              "schema_name": "public",
+              "table_action": "truncate",
+              "table_name": "customers_by_country"
+            },
+            "ref": "__CONNECTION_ID__"
+          },
+          "id": "1e1e6965-b859-4b75-a023-5d68eefdb933",
+          "inputs": [
+            {
+              "app_data": {
+                "ui_data": {
+                  "label": ""
+                }
+              },
+              "id": "fd54874e-6882-40ea-a449-2b4bbd3124d0",
+              "links": [
+                {
+                  "app_data": {
+                    "datastage": {},
+                    "ui_data": {
+                      "class_name": "",
+                      "decorations": []
+                    }
+                  },
+                  "id": "3180fffe-947b-4cfa-8129-8eac6ab12f62",
+                  "link_name": "Link_3",
+                  "node_id_ref": "c1891161-bbdf-49b8-9a4b-6445ebfe4c81",
+                  "port_id_ref": "a6844f08-0de2-44d8-8c23-be91d6bba444",
+                  "type_attr": "PRIMARY"
+                }
+              ],
+              "parameters": {
+                "runtime_column_propagation": 0
+              },
+              "schema_ref": "bcd55683-6de7-4f0a-800e-7a6efcb1974d"
+            }
+          ],
+          "op": "postgresql",
+          "parameters": {
+            "buf_free_run": 50,
+            "disk_write_inc": 1048576,
+            "input_count": 1,
+            "max_mem_buf_size": 3145728,
+            "output_count": 0,
+            "queue_upper_size": 0
+          },
+          "type": "binding"
+        },
+        {
+          "app_data": {
+            "ui_data": {
+              "image": "/data-intg/flows/graphics/palette/PxDataSet.svg",
+              "is_resized": true,
+              "label": "customers_by_country_ds",
+              "resize_height": 48,
+              "resize_width": 48,
+              "x_pos": 1048,
+              "y_pos": 617
+            }
+          },
+          "id": "d01d7389-3ee1-433c-884a-a0c0ad041477",
+          "inputs": [
+            {
+              "app_data": {
+                "ui_data": {
+                  "label": ""
+                }
+              },
+              "id": "50f7f998-838a-4340-945b-8807ab104e03",
+              "links": [
+                {
+                  "app_data": {
+                    "datastage": {},
+                    "ui_data": {
+                      "class_name": "",
+                      "decorations": []
+                    }
+                  },
+                  "id": "73e7ab56-25ca-4b4a-9abf-deb77b9f252b",
+                  "link_name": "Link_4",
+                  "node_id_ref": "c1891161-bbdf-49b8-9a4b-6445ebfe4c81",
+                  "port_id_ref": "a12eca1a-00a9-4add-acae-1c263826db2b",
+                  "type_attr": "PRIMARY"
+                }
+              ],
+              "parameters": {
+                "dataset": "customers_by_country.ds",
+                "datasetmode": ">| [ds",
+                "runtime_column_propagation": 0
+              },
+              "schema_ref": "f59783ed-76b9-4ed9-b764-e6d1b0518c8e"
+            }
+          ],
+          "op": "PxDataSet",
+          "parameters": {
+            "buf_free_run": 50,
+            "currentOutputLinkType": "PRIMARY",
+            "dataset": "customers_by_country.ds",
+            "disk_write_inc": 1048576,
+            "enableFlowAcpControl": true,
+            "enableSchemalessDesign": false,
+            "input_count": 1,
+            "max_mem_buf_size": 3145728,
+            "outputAcpShouldHide": true,
+            "output_count": 0,
+            "queue_upper_size": 0
+          },
+          "type": "binding"
+        }
+      ],
+      "runtime_ref": "pxOsh"
+    }
+  ],
+  "primary_pipeline": "fd733417-4863-4273-8f96-bf5b72ed081a",
+  "schemas": [
+    {
+      "fields": [
+        {
+          "app_data": {
+            "odbc_type": "INTEGER",
+            "time_scale": 0,
+            "type_code": "INT32"
+          },
+          "metadata": {
+            "decimal_precision": 100,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 6,
+            "min_length": 0
+          },
+          "name": "id",
+          "nullable": false,
+          "type": "integer"
+        },
+        {
+          "app_data": {
+            "odbc_type": "VARCHAR",
+            "time_scale": 0,
+            "type_code": "STRING"
+          },
+          "metadata": {
+            "decimal_precision": 100,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 20,
+            "min_length": 0
+          },
+          "name": "cust_name",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "app_data": {
+            "odbc_type": "CHAR",
+            "time_scale": 0,
+            "type_code": "STRING"
+          },
+          "metadata": {
+            "decimal_precision": 0,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 2,
+            "min_length": 2
+          },
+          "name": "country",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "app_data": {
+            "odbc_type": "DECIMAL",
+            "time_scale": 0,
+            "type_code": "DECIMAL"
+          },
+          "metadata": {
+            "decimal_precision": 8,
+            "decimal_scale": 2,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 8,
+            "min_length": 0
+          },
+          "name": "amount",
+          "nullable": false,
+          "type": "double"
+        }
+      ],
+      "id": "8248e117-2878-4627-a9ff-7647d6862aa2"
+    },
+    {
+      "fields": [
+        {
+          "app_data": {
+            "odbc_type": "CHAR",
+            "time_scale": 0,
+            "type_code": "STRING"
+          },
+          "metadata": {
+            "decimal_precision": 0,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 2,
+            "min_length": 2,
+            "source_field_id": "Link_1.country"
+          },
+          "name": "country",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "app_data": {
+            "odbc_type": "DOUBLE",
+            "time_scale": 0,
+            "type_code": "DFLOAT"
+          },
+          "metadata": {
+            "decimal_precision": 100,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 6,
+            "min_length": 0
+          },
+          "name": "customer_count",
+          "nullable": false,
+          "type": "double"
+        },
+        {
+          "app_data": {
+            "odbc_type": "DOUBLE",
+            "time_scale": 0,
+            "type_code": "DFLOAT"
+          },
+          "metadata": {
+            "decimal_precision": 100,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 6,
+            "min_length": 0
+          },
+          "name": "total_amount",
+          "nullable": false,
+          "type": "double"
+        }
+      ],
+      "id": "4878a9eb-d9ea-4dd9-b69c-da1f7f84df7a"
+    },
+    {
+      "fields": [
+        {
+          "app_data": {
+            "odbc_type": "CHAR",
+            "time_scale": 0,
+            "type_code": "STRING"
+          },
+          "metadata": {
+            "decimal_precision": 0,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 2,
+            "min_length": 2,
+            "source_field_id": "Link_2.country"
+          },
+          "name": "country",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "app_data": {
+            "odbc_type": "DOUBLE",
+            "time_scale": 0,
+            "type_code": "DFLOAT"
+          },
+          "metadata": {
+            "decimal_precision": 100,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 6,
+            "min_length": 0,
+            "source_field_id": "Link_2.customer_count"
+          },
+          "name": "customer_count",
+          "nullable": false,
+          "type": "double"
+        },
+        {
+          "app_data": {
+            "odbc_type": "DOUBLE",
+            "time_scale": 0,
+            "type_code": "DFLOAT"
+          },
+          "metadata": {
+            "decimal_precision": 100,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 6,
+            "min_length": 0,
+            "source_field_id": "Link_2.total_amount"
+          },
+          "name": "total_amount",
+          "nullable": false,
+          "type": "double"
+        }
+      ],
+      "id": "bcd55683-6de7-4f0a-800e-7a6efcb1974d"
+    },
+    {
+      "fields": [
+        {
+          "app_data": {
+            "odbc_type": "CHAR",
+            "time_scale": 0,
+            "type_code": "STRING"
+          },
+          "metadata": {
+            "decimal_precision": 0,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 2,
+            "min_length": 2,
+            "source_field_id": "Link_2.country"
+          },
+          "name": "country",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "app_data": {
+            "odbc_type": "DOUBLE",
+            "time_scale": 0,
+            "type_code": "DFLOAT"
+          },
+          "metadata": {
+            "decimal_precision": 100,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 6,
+            "min_length": 0,
+            "source_field_id": "Link_2.customer_count"
+          },
+          "name": "customer_count",
+          "nullable": false,
+          "type": "double"
+        },
+        {
+          "app_data": {
+            "odbc_type": "DOUBLE",
+            "time_scale": 0,
+            "type_code": "DFLOAT"
+          },
+          "metadata": {
+            "decimal_precision": 100,
+            "decimal_scale": 0,
+            "description": "",
+            "is_key": false,
+            "is_signed": true,
+            "item_index": 0,
+            "max_length": 6,
+            "min_length": 0,
+            "source_field_id": "Link_2.total_amount"
+          },
+          "name": "total_amount",
+          "nullable": false,
+          "type": "double"
+        }
+      ],
+      "id": "f59783ed-76b9-4ed9-b764-e6d1b0518c8e"
+    }
+  ],
+  "version": "3.0"
+}
