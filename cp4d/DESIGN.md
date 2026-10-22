@@ -3,7 +3,7 @@
 This document is the **"why"** behind the blueprint: what CP4D artifacts actually are, why the API
 is the only path to them, how the design maps onto this project's blueprint patterns, and what was
 measured about `cpdctl` export/import. The **"how"** — prerequisites, deploy, restore, teardown — is
-in [README.md](README.md).
+in [README.md](5.4/README.md).
 
 ---
 
@@ -74,7 +74,7 @@ namespace.
 - **Store the export UNZIPPED.** A zip is opaque to block-level dedup: a one-cell notebook edit
   rewrites the whole archive. Unzipped, a one-cell edit rewrites one file, and the ~70 % constant
   schema mass (see §5) dedups across snapshots.
-- **Restore is decoupled from Kasten restore hooks** — a standalone [restore.sh](restore.sh) runs
+- **Restore is decoupled from Kasten restore hooks** — a standalone [restore.sh](5.4/restore.sh) runs
   the `cpdctl import`. More robust, and it fits the multi-tenant / mass-migration story where
   different users restore different projects into different namespaces.
 - **Credentials never fan out.** The CP4D API key lives in a Secret in the `cpd` namespace —
@@ -195,7 +195,7 @@ must be locked down regardless; and for any multi-tenant use the export must pas
 `--encryption-key` with the restore passing the same key. Losing the key means losing the
 credentials inside the restored connections. The operational guidance — when plaintext-plus-RBAC is
 acceptable and when encryption becomes mandatory — is in
-[README.md § Security](README.md#security--credentials-in-the-bundle-read-this).
+[README.md § Security](5.4/README.md#security--credentials-in-the-bundle-read-this).
 
 ### What `cpdctl` does not protect
 
@@ -205,7 +205,7 @@ Db2, the files on an on-prem share. Those live outside CP4D.
 
 This is a **deliberate boundary, not a defect**, and it is the same boundary `cpdbr` has: you
 protect what the tool captures, and anything external becomes an explicit, per-connection decision.
-See [README.md § The external-datasource boundary](README.md#the-external-datasource-boundary) for
+See [README.md § The external-datasource boundary](5.4/README.md#the-external-datasource-boundary) for
 how to make that decision.
 
 ---
