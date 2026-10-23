@@ -14,8 +14,8 @@ folder that matches your installation, and follow the `README.md` inside it.
 
 | CP4D / IBM Software Hub | Folder | OpenShift | Kasten | Keeper image |
 |---|---|---|---|---|
-| 5.4.0 Patch 7 | [5.4/](5.4/) | 4.21.30 | 9.0.7 | `cp4d-backup:1.10.34-1` |
-| 5.2.x | [5.2/](5.2/) | 4.18.6 | 8.5.12 | `cp4d-backup:1.8.244-3` |
+| 5.4.0 Patch 7 | [5.4/](5.4/) | 4.21.30 | 9.0.7 | `cp4d-backup:5.4-r1` |
+| 5.2.x | [5.2/](5.2/) | 4.18.6 | 8.5.12 | `cp4d-backup:5.2-r3` |
 
 A folder is a **snapshot of what was validated** on that version. It is not updated when another
 version moves on. If your version is not listed, start from the nearest folder and re-run the

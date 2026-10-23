@@ -26,7 +26,7 @@ WANT_NAME="${3:-}"
 
 CRED_NS="${CRED_NS:-cpd}"
 CRED_SECRET="${CRED_SECRET:-cp4d-backup-cpdctl-creds}"
-IMAGE="${IMAGE:-ghcr.io/kastenhq/blueprint-ai/cp4d-backup:1.8.244-3}"
+IMAGE="${IMAGE:-ghcr.io/kastenhq/blueprint-ai/cp4d-backup:5.2-r3}"
 ENCRYPTION_KEY="${ENCRYPTION_KEY:-}"
 CPDCTL="${CPDCTL:-$(dirname "$0")/bin/cpdctl}"
 

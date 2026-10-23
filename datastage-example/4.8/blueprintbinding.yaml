@@ -1,0 +1,40 @@
+# Bind datastage-engine-bp to EVERY DataStage workload: the Deployments and the px-compute
+# StatefulSet carrying icpdsupport/addOnId=datastage (10 on CP4D 4.8.9).
+#
+# Why all of them (a Kasten defect, reported to Kasten engineering): the engine volumes are RWX
+# and shared by up to 8 workloads. Kasten attributes a shared PVC to ONE of the workloads that
+# mount it, picked non-deterministically, and
+# only that workload's backupPrehook holds back the PVC's snapshot. Bound to a single workload, the
+# snapshot was measured starting in the same second as the prehook. Bound to all of them, whichever
+# workload Kasten picks has a prehook — and the lock in the blueprint makes the quiesce run once.
+#
+# policy.yaml includes the same workloads with the same label: a workload outside the backup does
+# not run its hooks, so the binding and the policy must select the same set.
+#
+# The DoesNotExist clause on the annotation is the usual escape hatch: a workload that carries
+# kanister.kasten.io/blueprint keeps its own, more specific blueprint instead of this one.
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: BlueprintBinding
+metadata:
+  name: datastage-engine-binding
+  namespace: kasten-io
+spec:
+  blueprintRef:
+    name: datastage-engine-bp
+    namespace: kasten-io
+  resources:
+    matchAll:
+      - type:
+          operator: In
+          values:
+            - group: apps
+              resource: deployments
+            - group: apps
+              resource: statefulsets
+      - labels:
+          key: icpdsupport/addOnId
+          operator: In
+          values: [datastage]
+      - annotations:
+          key: kanister.kasten.io/blueprint
+          operator: DoesNotExist

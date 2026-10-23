@@ -125,7 +125,7 @@ d.table_slide(
         ("Kasten", "9.0.7"),
         ("Cloud Pak for Data", "5.4.0 Patch 7 (Watson Studio 13.0.4)"),
         ("cpdctl", "1.10.34"),
-        ("Keeper image", "cp4d-backup:1.10.34-1"),
+        ("Keeper image", "cp4d-backup:5.4-r1"),
     ],
     col_widths=[2.7, 3.15],
     row_heights=[0.5] + [0.52] * 6,

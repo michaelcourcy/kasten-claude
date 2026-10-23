@@ -2,6 +2,16 @@
 
 > **CP4D 5.4.** This is the 5.4 version of the blueprint. Other versions are listed in [../README.md](../README.md).
 
+> ⚠️ **Known exposure — a Kasten defect with shared volumes, found
+> after this folder was validated.** This blueprint is bound to one DataStage workload (`runtime`),
+> but the engine volumes are shared by several workloads. Kasten picks one of the mounting workloads
+> for each volume, and only that workload's `backupPrehook` holds back the snapshot. So the flush can
+> run **after** a volume was snapshotted, while the backup reports `Complete`. Measured on CP4D 4.8.9
+> with this same binding: both engine snapshots started in the same second as the prehook. Here the
+> prehook takes only seconds, which narrows the window but does not close it. The
+> [4.8 folder](../4.8/README.md#why-every-datastage-workload-is-bound-and-the-lock) binds every
+> DataStage workload and coordinates them with a lock; that design was **not** validated on 5.4.
+
 Protect the **DataStage parallel-engine state** inside an existing Cloud Pak for Data (IBM Software
 Hub) installation: custom libraries, ODBC/JDBC driver configuration, compiled job artifacts, run
 history, Data Set descriptors and Data Set data. Kasten snapshots the DataStage engine volumes; the

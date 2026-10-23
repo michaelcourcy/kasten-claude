@@ -1,0 +1,400 @@
+# DataStage engine-state protection — pattern 2 (quiesce), following IBM's 4.8 backup hooks.
+#
+# Scope: the DataStage ENGINE volumes in the CP4D instance namespace — /ds-storage (custom
+# libraries, ODBC/JDBC configuration, compiled artifacts, run history, Data Set descriptors) and
+# /px-storage (Data Set and File Set data, engine and workload-manager configuration, files flows
+# write to file-system paths). The DataStage DESIGN assets — flows, jobs, connections, parameter
+# sets — are CP4D project assets and are protected by cp4d-example, not by this blueprint. See
+# README.md.
+#
+# What IBM's own backup hooks require on CP4D 4.8.9 (configmaps shipped by the install — this
+# blueprint transcribes them):
+#   - There is NO online (checkpoint) spec for DataStage: datastage-maint-aux-ckpt-cm, which the
+#     5.x blueprints transcribe, does not exist on 4.8. The only backup spec is the OFFLINE one:
+#     datastage-maint-aux-br-cm and ds-px-default-pxruntime-maint-aux-br-cm.
+#   - Their backup pre-hook is cpdbr.cpd.ibm.com/enable-maint on the DataStage CR `datastage` and
+#     on the PXRuntime CR `ds-px-default` (statusFieldName dsStatus, timeout 1800s); the post-hook
+#     is disable-maint on both, same timeout. Their managed-resources list is EMPTY, so cpdbr
+#     scales nothing down for a 4.8 backup.
+#   - Maintenance mode (spec.ignoreForMaintenance) pauses the operator; it does NOT stop pods —
+#     verified on 4.8.9: all 11 engine pods kept running, dsStatus reached InMaintenance in 67 s
+#     and returned to Completed about 5 minutes after leaving maintenance.
+#   - No PXRuntime label: IBM names ds-px-default. The blueprint loops over every PXRuntime CR in
+#     the namespace, so a second runtime instance is covered without a change.
+#
+# WHY EVERY DATASTAGE WORKLOAD IS BOUND, AND WHY THERE IS A LOCK (a Kasten defect, reported)
+#   The engine volumes are RWX and mounted by several workloads. Kasten attributes a shared PVC to
+#   ONE of the workloads that mount it, chosen non-deterministically, and only that workload's
+#   backupPrehook holds back the PVC's snapshot. Bound to a single workload, the snapshot was
+#   measured starting in the same second as the prehook, 3 minutes before the quiesce finished.
+#   So the BlueprintBinding matches every DataStage workload (icpdsupport/addOnId=datastage), and
+#   the policy includes all of them: whichever one Kasten picks has a prehook.
+#   That runs the prehook once per workload, in parallel. A lock makes the work happen once: the
+#   ConfigMap datastage-backup-lock, created with `kubectl create`, which is atomic. The prehook
+#   that creates it is the LEADER and quiesces; the others are FOLLOWERS and wait until the lock
+#   says `ready`. Since every prehook waits for the quiesce, no snapshot can start before it.
+#   The lock records the UID of the running BackupAction. Kasten labels every VolumeSnapshot of the
+#   backup with the same value (kasten_io_manifestid), which lets backupPosthook find exactly this
+#   backup's snapshots, and lets a prehook tell a dead backup's lock from the current one.
+#
+# Bind with the BlueprintBinding in blueprintbinding.yaml.
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: datastage-engine-bp
+  namespace: kasten-io
+actions:
+  backupPrehook:
+    phases:
+      - func: KubeTask
+        name: quiesceOnce
+        args:
+          namespace: kasten-io          # cluster-wide Kasten SA: read/patch CRs and exec into cpd pods
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.8
+          command:
+            - bash
+            - -c
+            - |
+              set -Eeuo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              ME="{{ .Object.kind }}/{{ .Object.metadata.name }}"
+              LOCK=datastage-backup-lock
+              LABEL=blueprint-ai/datastage-engine=true
+              TIMEOUT_SECS=1800          # IBM's enable-maint / disable-maint timeout in br-cm
+              log() { echo "$(date -u +%T) ${ME}: $*"; }
+
+              PX_LIST=$(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
+              # ---- Maintenance mode helpers (IBM's enable-maint / disable-maint) ----------
+              set_maintenance() {   # $1 = true|false
+                kubectl patch datastage datastage -n "${NS}" --type=merge -p "{\"spec\":{\"ignoreForMaintenance\":$1}}" >/dev/null
+                for px in ${PX_LIST}; do
+                  kubectl patch pxruntime "${px}" -n "${NS}" --type=merge -p "{\"spec\":{\"ignoreForMaintenance\":$1}}" >/dev/null
+                done
+              }
+              wait_status() {       # $1 = InMaintenance|Completed — IBM's builtins poll dsStatus
+                local deadline=$(( $(date +%s) + TIMEOUT_SECS )) pending s px
+                while :; do
+                  pending=""
+                  s=$(kubectl get datastage datastage -n "${NS}" -o jsonpath='{.status.dsStatus}' 2>/dev/null || true)
+                  [ "${s}" = "$1" ] || pending="DataStage=${s:-<none>}"
+                  for px in ${PX_LIST}; do
+                    s=$(kubectl get pxruntime "${px}" -n "${NS}" -o jsonpath='{.status.dsStatus}')
+                    [ "${s}" = "$1" ] || pending="${pending} ${px}=${s:-<none>}"
+                  done
+                  [ -z "${pending}" ] && return 0
+                  [ "$(date +%s)" -lt "${deadline}" ] || { log "ERROR: not $1 after ${TIMEOUT_SECS}s: ${pending}"; return 1; }
+                  log "waiting for $1: ${pending}"
+                  sleep 10
+                done
+              }
+              quiesce_in_effect() {
+                [ "$(kubectl get datastage datastage -n "${NS}" -o jsonpath='{.spec.ignoreForMaintenance}/{.status.dsStatus}')" = "true/InMaintenance" ] || return 1
+                for px in ${PX_LIST}; do
+                  [ "$(kubectl get pxruntime "${px}" -n "${NS}" -o jsonpath='{.spec.ignoreForMaintenance}/{.status.dsStatus}')" = "true/InMaintenance" ] || return 1
+                done
+              }
+
+              # ---- This backup's identity ---------------------------------------------------
+              # The UID of the BackupAction running in this namespace. Kasten labels every
+              # VolumeSnapshot of the backup with it (kasten_io_manifestid).
+              running_backups() {
+                kubectl get backupaction -n "${NS}" -o json \
+                  | jq -r '.items[] | select(.status.state=="Running" or .status.state=="Pending") | .metadata.uid'
+              }
+              mapfile -t RUNNING < <(running_backups)
+              if [ "${#RUNNING[@]}" -ne 1 ]; then
+                log "ERROR: expected exactly 1 running BackupAction in ${NS}, found ${#RUNNING[@]}."
+                log "       Two backups of this namespace at once cannot share one quiesce. Stagger the policies."
+                exit 1
+              fi
+              BACKUP_ID="${RUNNING[0]}"
+
+              # This backup's snapshot of each engine PVC, compared with the end of the quiesce.
+              # Prints: ok (all taken after it and ready) | pending | early <pvc> <time>
+              snapshots_vs() {   # $1 = readyAt
+                local pvc s created res=ok
+                for pvc in $(kubectl get pvc -n "${NS}" -l "${LABEL}" -o jsonpath='{.items[*].metadata.name}'); do
+                  s=$(kubectl get volumesnapshot -n "${NS}" -l "kasten_io_manifestid=${BACKUP_ID},kasten_io_pvc=${pvc}" -o json \
+                        | jq -c '.items | sort_by(.metadata.creationTimestamp) | last // empty')
+                  if [ -z "${s}" ]; then res=pending; continue; fi
+                  created=$(jq -r .metadata.creationTimestamp <<<"${s}")
+                  if [ -z "$1" ] || [[ "${created}" < "$1" ]]; then echo "early ${pvc} ${created}"; return; fi
+                  [ "$(jq -r '.status.readyToUse // false' <<<"${s}")" = true ] || res=pending
+                done
+                echo "${res}"
+              }
+
+              # ---- The leader's work: IBM's precheck, enable-maint, flush --------------------
+              lead() {
+                trap 'log "leader failed: marking the lock failed and leaving maintenance"
+                      kubectl patch cm "${LOCK}" -n "${NS}" --type=merge -p "{\"data\":{\"state\":\"failed\"}}" >/dev/null || true
+                      set_maintenance false || true' ERR
+                log "LEADER for backup ${BACKUP_ID}"
+
+                # 1. Health precheck. A CR that is mid-reconcile may be rewriting the very
+                #    directories about to be snapshotted.
+                wait_status Completed
+
+                # 2. IBM's enable-maint (br-cm backup pre-hook).
+                set_maintenance true
+                wait_status InMaintenance
+                log "operator in maintenance mode"
+
+                # 3. Which PVCs are in the backup, and who writes to them. The label is what the
+                #    policy selects on, so the flushed set and the snapshotted set are the same.
+                #    The name pattern is a safety net if the label was forgotten.
+                mapfile -t LABELLED < <(kubectl get pvc -n "${NS}" -l "${LABEL}" -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^$' || true)
+                log "PVCs carrying ${LABEL}: ${LABELLED[*]:-<none>}"
+                [ "${#LABELLED[@]}" -gt 0 ] || log "WARNING: no PVC carries the label; this backup probably captures NO engine volume"
+                LABEL_JSON=$(printf '%s\n' "${LABELLED[@]:-}" | jq -R . | jq -sc 'map(select(. != ""))')
+                PODS_JSON=$(kubectl get pods -n "${NS}" -o json | jq --argjson labelled "${LABEL_JSON}" '[.items[]
+                    | select(.status.phase == "Running")
+                    | select(any(.spec.volumes[]?; (.persistentVolumeClaim.claimName? // "") as $c
+                        | ($c | test("-(ds|px)-storage-pvc$")) or ($labelled | index($c) != null)))]')
+                mapfile -t PODS < <(jq -r '.[].metadata.name' <<<"${PODS_JSON}")
+                [ "${#PODS[@]}" -gt 0 ] || { log "ERROR: no running pod mounts a DataStage engine volume"; false; }
+
+                # A writer the binding does not cover is a workload Kasten may attribute an engine
+                # PVC to without running any hook (the shared-volume defect). Name it.
+                jq -r '.[] | select((.metadata.labels["icpdsupport/addOnId"] // "") != "datastage") | .metadata.name' <<<"${PODS_JSON}" \
+                  | while read -r p; do log "WARNING: pod ${p} mounts an engine PVC but is not a DataStage workload; its snapshot may not wait for this hook"; done
+                MOUNTED=$(kubectl get pods -n "${NS}" -o json | jq -r '.items[] | select(.status.phase=="Running") | .spec.volumes[]?.persistentVolumeClaim.claimName? // empty' | sort -u)
+                for pvc in "${LABELLED[@]:-}"; do
+                  [ -n "${pvc}" ] || continue
+                  grep -qxF "${pvc}" <<<"${MOUNTED}" || log "WARNING: PVC ${pvc} is labelled but no running pod mounts it; it cannot be flushed"
+                done
+
+                # 4. Jobs in flight: maintenance mode pauses the operator, not the engine. A Data Set
+                #    written during the snapshot is captured half-finished. Informational: a re-run
+                #    reproduces a Data Set.
+                running=$(kubectl exec -n "${NS}" "${PODS[0]}" -- bash -c 'ls /px-storage/PXRuntime/runningJobs 2>/dev/null | wc -l' 2>/dev/null || echo 0)
+                [ "${running:-0}" -gt 0 ] 2>/dev/null && log "WARNING: ${running} job run(s) in flight; Data Sets they write may be captured half-finished"
+
+                # 5. Flush — the last thing before `ready`. Without it a file can be snapshotted
+                #    with the right name and zero bytes.
+                for pod in "${PODS[@]}"; do kubectl exec -n "${NS}" "${pod}" -- sync; done
+                log "flushed ${#PODS[@]} pod(s)"
+
+                kubectl patch cm "${LOCK}" -n "${NS}" --type=merge \
+                  -p "{\"data\":{\"state\":\"ready\",\"readyAt\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" >/dev/null
+                trap - ERR
+                log "quiesce complete; lock ready. backupPosthook leaves maintenance."
+                exit 0
+              }
+
+              # A takeover sends the resourceVersion that was read: if anyone changed the lock in the
+              # meantime, the API server answers Conflict, so exactly one contender wins.
+              take_over() {   # $1 = resourceVersion  $2 = reason
+                if kubectl patch cm "${LOCK}" -n "${NS}" --type=merge -p "{\"metadata\":{\"resourceVersion\":\"$1\"},
+                     \"data\":{\"backupId\":\"${BACKUP_ID}\",\"state\":\"quiescing\",\"leader\":\"${ME}\",\"readyAt\":\"\",\"term\":\"$(new_term)\"}}" >/dev/null 2>&1; then
+                  log "took over the lock: $2"
+                  # Whatever the dead attempt left: hand the operator back first, so the precheck
+                  # starts from a steady state.
+                  set_maintenance false
+                  lead
+                fi
+                log "another hook took over the lock first; re-reading it"
+              }
+
+              # Each leadership gets a new term. A follower remembers the term it waited on: if THAT
+              # term fails, its own leader failed and it fails too. Only a hook that never followed
+              # the failed term (a later attempt, after Kasten retries) takes over.
+              new_term() { echo "$(date +%s%N)-${RANDOM}"; }
+              FOLLOWED=""
+
+              deadline=$(( $(date +%s) + TIMEOUT_SECS * 2 ))
+              while [ "$(date +%s)" -lt "${deadline}" ]; do
+                if kubectl create cm "${LOCK}" -n "${NS}" --from-literal=backupId="${BACKUP_ID}" \
+                     --from-literal=state=quiescing --from-literal=leader="${ME}" --from-literal=term="$(new_term)" >/dev/null 2>&1; then
+                  lead
+                fi
+                L=$(kubectl get cm "${LOCK}" -n "${NS}" -o json 2>/dev/null) || continue
+                RV=$(jq -r .metadata.resourceVersion <<<"${L}"); ID=$(jq -r .data.backupId <<<"${L}")
+                STATE=$(jq -r .data.state <<<"${L}"); LEADER=$(jq -r .data.leader <<<"${L}"); TERM=$(jq -r '.data.term // ""' <<<"${L}")
+                READY_AT=$(jq -r '.data.readyAt // ""' <<<"${L}")
+
+                if [ "${ID}" != "${BACKUP_ID}" ]; then
+                  # running_backups returned only this backup above, so the lock's owner is gone.
+                  take_over "${RV}" "left by backup ${ID}, which is no longer running"; continue
+                fi
+                case "${STATE}" in
+                  failed)
+                    if [ -n "${TERM}" ] && [ "${TERM}" = "${FOLLOWED}" ]; then log "ERROR: the leader I was waiting for (${LEADER}) failed"; exit 1; fi
+                    take_over "${RV}" "a previous attempt of this backup failed (Kasten retry)" ;;
+                  ready)
+                    if quiesce_in_effect; then log "FOLLOWER: ${LEADER} has quiesced DataStage"; exit 0; fi
+                    take_over "${RV}" "the lock is ready but DataStage is no longer in maintenance" ;;
+                  released)
+                    # Kasten runs each workload's prehook -> snapshot -> posthook on its own, and
+                    # retries the whole job when a hook is lost (an API server rollout drops every
+                    # hook's connection). So a prehook can arrive after this backup's engine PVCs
+                    # were already captured. Re-quiescing then would be pointless.
+                    if [ "$(snapshots_vs "${READY_AT}")" = ok ]; then
+                      log "every engine PVC of this backup was already snapshotted after the quiesce of ${READY_AT}; nothing to do"
+                      exit 0
+                    fi
+                    take_over "${RV}" "the quiesce was released before every engine PVC was captured" ;;
+                  *) FOLLOWED="${TERM}"; sleep 5 ;;    # quiescing: the leader is working
+                esac
+              done
+              log "ERROR: timed out waiting for the lock"; exit 1
+
+  backupPosthook:
+    phases:
+      # Release once every engine PVC has been snapshotted for this backup, after the quiesce. The
+      # posthooks do not count each other: a hook that never runs would leave the count incomplete
+      # forever. They check the snapshots themselves, and the one that finds them all releases.
+      - func: KubeTask
+        name: releaseWhenSnapshotted
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.8
+          command:
+            - bash
+            - -c
+            - |
+              set -Eeuo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              ME="{{ .Object.kind }}/{{ .Object.metadata.name }}"
+              LOCK=datastage-backup-lock
+              LABEL=blueprint-ai/datastage-engine=true
+              TIMEOUT_SECS=1800           # IBM's disable-maint timeout in br-cm
+              log() { echo "$(date -u +%T) ${ME}: $*"; }
+
+              PX_LIST=$(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+              set_maintenance_off() {
+                kubectl patch datastage datastage -n "${NS}" --type=merge -p '{"spec":{"ignoreForMaintenance":false}}' >/dev/null || true
+                for px in ${PX_LIST}; do
+                  kubectl patch pxruntime "${px}" -n "${NS}" --type=merge -p '{"spec":{"ignoreForMaintenance":false}}' >/dev/null || true
+                done
+              }
+              # The lock is not deleted: it stays as this backup's record, so a prehook that a Kasten
+              # retry runs late can see the engine PVCs were already captured. The next backup
+              # takes it over. Every exit below leaves maintenance: it must never outlive the backup.
+              mark() { kubectl patch cm "${LOCK}" -n "${NS}" --type=merge -p "{\"data\":{\"state\":\"$1\"}}" >/dev/null || true; }
+
+              BACKUP_ID=$(kubectl get backupaction -n "${NS}" -o json \
+                | jq -r '[.items[] | select(.status.state=="Running" or .status.state=="Pending") | .metadata.uid] | if length==1 then .[0] else "" end')
+              # This backup's snapshot of each engine PVC, compared with the end of the quiesce.
+              # Prints: ok (all taken after it and ready) | pending | early <pvc> <time>
+              snapshots_vs() {   # $1 = readyAt
+                local pvc s created res=ok
+                for pvc in $(kubectl get pvc -n "${NS}" -l "${LABEL}" -o jsonpath='{.items[*].metadata.name}'); do
+                  s=$(kubectl get volumesnapshot -n "${NS}" -l "kasten_io_manifestid=${BACKUP_ID},kasten_io_pvc=${pvc}" -o json \
+                        | jq -c '.items | sort_by(.metadata.creationTimestamp) | last // empty')
+                  if [ -z "${s}" ]; then res=pending; continue; fi
+                  created=$(jq -r .metadata.creationTimestamp <<<"${s}")
+                  if [ -z "$1" ] || [[ "${created}" < "$1" ]]; then echo "early ${pvc} ${created}"; return; fi
+                  [ "$(jq -r '.status.readyToUse // false' <<<"${s}")" = true ] || res=pending
+                done
+                echo "${res}"
+              }
+
+              L=$(kubectl get cm "${LOCK}" -n "${NS}" -o json 2>/dev/null || true)
+              [ -n "${L}" ] || { log "no lock: nothing to release"; set_maintenance_off; exit 0; }
+              [ "$(jq -r .data.backupId <<<"${L}")" = "${BACKUP_ID}" ] || { log "the lock belongs to another backup; not touching it"; exit 0; }
+              STATE=$(jq -r .data.state <<<"${L}"); READY_AT=$(jq -r '.data.readyAt // ""' <<<"${L}")
+
+              case "${STATE}" in
+                released)
+                  r=$(snapshots_vs "${READY_AT}")
+                  if [ "${r}" = ok ]; then log "already released by another hook; every engine PVC captured after ${READY_AT}"; exit 0; fi
+                  log "ERROR: lock released, but: ${r}"; exit 1 ;;
+                ready) ;;
+                *)  # quiescing or failed: the prehook did not finish (Kasten runs posthooks after a failed prehook)
+                  log "ERROR: the quiesce did not complete (lock state ${STATE}); leaving maintenance"
+                  mark failed; set_maintenance_off; exit 1 ;;
+              esac
+
+              # Never wait here. Kasten runs each workload's posthook right after that workload's
+              # own snapshots, in waves of a few workloads at a time. A posthook that waited for
+              # the other engine PVCs could hold a slot that the workload owning them needs.
+              # The posthook that runs after the LAST engine snapshot sees them all and releases.
+              r=$(snapshots_vs "${READY_AT}")
+              case "${r}" in
+                ok) ;;
+                pending)
+                  log "not every engine PVC is captured yet; the posthook that follows the last snapshot releases"
+                  exit 0 ;;
+                early*)
+                  # The failure this design exists to prevent. Marked failed, so a Kasten retry
+                  # that reuses this snapshot fails again instead of passing.
+                  set -- ${r}
+                  log "ERROR: $2 was snapshotted at $3, before the quiesce completed at ${READY_AT}."
+                  log "       Is a workload mounting it outside the BlueprintBinding or the policy? See README.md."
+                  mark failed; set_maintenance_off; exit 1 ;;
+              esac
+
+              mark released; set_maintenance_off
+              log "every engine PVC snapshotted after ${READY_AT}; left maintenance, lock marked released"
+              # IBM's disable-maint waits for the reconcile to finish. Only the releasing hook waits.
+              deadline=$(( $(date +%s) + TIMEOUT_SECS ))
+              sleep 15
+              while :; do
+                pending=""
+                s=$(kubectl get datastage datastage -n "${NS}" -o jsonpath='{.status.dsStatus}' 2>/dev/null || true)
+                [ "${s}" = Completed ] || pending="DataStage=${s:-<none>}"
+                for px in ${PX_LIST}; do
+                  s=$(kubectl get pxruntime "${px}" -n "${NS}" -o jsonpath='{.status.dsStatus}')
+                  [ "${s}" = Completed ] || pending="${pending} ${px}=${s:-<none>}"
+                done
+                [ -z "${pending}" ] && break
+                [ "$(date +%s)" -lt "${deadline}" ] || { log "ERROR: not Completed after ${TIMEOUT_SECS}s: ${pending}"; exit 1; }
+                log "waiting for reconciliation: ${pending}"
+                sleep 20
+              done
+              log "DataStage is out of maintenance and Completed."
+
+  restorePosthook:
+    phases:
+      # Kasten has just put the engine volumes back. The operator was parked in maintenance mode
+      # before the restore (a manual pre-restore step — see README), so nothing has been
+      # reconciling while the PVCs were replaced. This is IBM's br-cm restore post-hook:
+      # disable-maint, then wait for Completed, so the restore action does not report success
+      # while DataStage is still assembling itself. Idempotent: safe if several restored
+      # workloads run it.
+      - func: KubeTask
+        name: leaveMaintenanceAndWait
+        args:
+          namespace: kasten-io
+          image: ghcr.io/kastenhq/blueprint-ai/kasten-tools:9.0.8
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              NS="{{ .Object.metadata.namespace }}"
+              TIMEOUT_SECS=1800          # IBM's disable-maint timeout in br-cm
+
+              PX_LIST=$(kubectl get pxruntime -n "${NS}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+              kubectl patch datastage datastage -n "${NS}" --type=merge \
+                -p '{"spec":{"ignoreForMaintenance":false}}'
+              for px in ${PX_LIST}; do
+                kubectl patch pxruntime "${px}" -n "${NS}" --type=merge \
+                  -p '{"spec":{"ignoreForMaintenance":false}}'
+              done
+
+              # The operator restores the replica counts itself once it is reconciling again.
+              sleep 15
+              deadline=$(( $(date +%s) + TIMEOUT_SECS ))
+              while :; do
+                pending=""
+                s=$(kubectl get datastage datastage -n "${NS}" -o jsonpath='{.status.dsStatus}' 2>/dev/null || true)
+                [ "${s}" = "Completed" ] || pending="DataStage=${s:-<none>}"
+                for px in ${PX_LIST}; do
+                  s=$(kubectl get pxruntime "${px}" -n "${NS}" -o jsonpath='{.status.dsStatus}')
+                  [ "${s}" = "Completed" ] || pending="${pending} ${px}=${s:-<none>}"
+                done
+                [ -z "${pending}" ] && break
+                if [ "$(date +%s)" -ge "${deadline}" ]; then
+                  echo "ERROR: DataStage did not return to Completed within ${TIMEOUT_SECS}s: ${pending}"
+                  exit 1
+                fi
+                echo "waiting for reconciliation: ${pending}"
+                sleep 20
+              done
+
+              echo "DataStage is out of maintenance and Completed."
+              echo "NEXT: recompile the flows of any affected project (cpdctl dsjob compile --project <name>)"
+              echo "      and run one job as a smoke test. See README.md, Restore."

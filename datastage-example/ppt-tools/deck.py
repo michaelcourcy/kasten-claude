@@ -18,8 +18,9 @@ d.title("DATASTAGE ON CLOUD PAK FOR DATA:\nENGINE-STATE PROTECTION",
 d.agenda([
     "Three stores, and which one this protects",
     "Where the design comes from",
-    "Why there is no quiesce at backup time",
+    "What IBM asks for at backup time, per version",
     "Deriving the flush set from the policy's own selector",
+    "Shared volumes: bind every workload, coordinate with a lock",
     "What the policy captures, and how the restore frees the volumes",
     "Blueprint actions and restore prerequisites",
 ])
@@ -78,27 +79,26 @@ d.cards(
     ])
 
 d.split_dark(
-    "Why there is no quiesce at backup time",
-    "IBM's online hooks\n", "ask for a lock, nothing more.",
+    "What IBM asks for at backup time, per version",
+    "IBM's own hooks\n", "change between releases.",
     [
-        ("01", "THE CONFIGMAP SAYS SO EXPLICITLY",
-         "datastage-maint-aux-ckpt-cm has no checkpoint hooks and scales nothing down. "
-         "Since 5.4 its pre- and post-hooks create and remove a backup lock file on "
-         "/ds-storage; on 5.2.2 they were empty. The lock blocks flow edits only when "
-         "flows runs with ENABLE_BACKUP_DETECT=true — unset on a default install."),
-        ("02", "THE ONE REQUIREMENT IS A PRECHECK",
-         "The DataStage and PXRuntime custom resources must report dsStatus == "
-         "Completed, with on-error: Fail. So backupPrehook fails the backup before "
-         "anything is snapshotted if the engine is not settled."),
-        ("03", "MAINTENANCE MODE IS THE OTHER PATH",
-         "It belongs to the offline backup path and to restores, not to a routine "
-         "backup. Putting the engine into maintenance mode for every snapshot is not "
-         "what IBM's specification asks for, and it would not make the backup safer."),
+        ("01", "5.2 AND 5.4: A PRECHECK, AND SINCE 5.4 A LOCK FILE",
+         "datastage-maint-aux-ckpt-cm, IBM's online path, has no checkpoint hooks and "
+         "scales nothing down. It requires dsStatus == Completed on the DataStage and "
+         "PXRuntime custom resources, with on-error: Fail. Since 5.4 it also creates and "
+         "removes a backup lock file on /ds-storage."),
+        ("02", "4.8: MAINTENANCE MODE AROUND THE BACKUP",
+         "4.8.9 ships no online path at all. Its only backup specification, br-cm, puts "
+         "both custom resources in maintenance mode before the backup and takes them out "
+         "after. That pauses the operator, not the engine: measured, every pod kept running."),
+        ("03", "EVERY VERSION: THE RESTORE IS THE OFFLINE PATH",
+         "A Kasten restore replaces the PersistentVolumeClaims, so the workloads must be "
+         "down. That is IBM's offline situation, and its restore hook — leave maintenance, "
+         "wait for Completed — is the one the blueprint uses."),
     ],
-    left_body="One detail worth copying: the PXRuntime entry in that rule has no name "
-              "field, only a label (icpdsupport/addOnId=datastage), while the DataStage "
-              "entry is named. So it applies to every labelled PXRuntime CR. The blueprint "
-              "loops over them rather than assuming a single default instance.")
+    left_body="Read the ConfigMaps on your own cluster before adapting anything. Each "
+              "version has its own folder in the repository because the specification is "
+              "not the same from one release to the next.")
 
 d.hero(
     "WITHOUT A SYNC,", "THE FILE IS ZERO BYTES",
@@ -131,21 +131,54 @@ d.cards(
         ]),
     ])
 
+d.hero(
+    "ONE BOUND WORKLOAD", "DOES NOT HOLD THE SNAPSHOT",
+    body="The engine volumes are shared by up to seven workloads. Kasten picks one of "
+         "them for each volume, and only\nthat workload's prehook holds back the "
+         "snapshot. With the hook on another one, the snapshot starts at once.",
+    pills=["Kasten defect, reported", "Shared RWX volumes", "Waited in 5 of 9 runs"],
+    icon='error_warning', polarity='neg')
+
+d.cards(
+    "Shared volumes: bind every workload, coordinate with a lock",
+    "Whichever workload Kasten picks has a prehook, and the work still runs once",
+    [
+        ('scan_target', "BIND AND INCLUDE EVERY DATASTAGE WORKLOAD", [
+            "The BlueprintBinding and the policy select the same set: "
+            "icpdsupport/addOnId=datastage, ten workloads on 4.8.9. A workload outside "
+            "the policy runs no hook, so the two lists must stay identical.",
+            "",
+            "A ConfigMap created with kubectl create is the lock: the one prehook that "
+            "creates it quiesces and flushes, the others wait until it says ready. No "
+            "snapshot can start before the quiesce.",
+        ]),
+        ('error_warning', "SAFE AGAINST RETRIES, FAILURES AND THE DEFECT ITSELF", [
+            "The lock records the running BackupAction, whose UID Kasten also puts on "
+            "every snapshot of the backup. A retried hook sees the volumes are already "
+            "captured; a dead lock is taken over; a failed leader fails its followers.",
+            "",
+            "A snapshot taken before the quiesce makes the posthook fail the backup — "
+            "the silent case becomes a visible one. Validated end to end on 4.8.9.",
+        ]),
+    ])
+
 d.cards(
     "What the policy captures, and how the restore frees the volumes",
-    "The filter has two entries: the labelled PVCs, and the one workload the hooks are bound to",
+    "The filter has two entries: the labelled PVCs, and the workloads the hooks are bound to",
     [
-        ('scan_target', "INCLUDE THE BOUND WORKLOAD, AND ONLY IT", [
-            "The hooks are bound to the runtime Deployment. Leave it out of the filter and "
-            "the hooks never run, and Kasten does not snapshot the PVC it mounts.",
+        ('scan_target', "INCLUDE EVERY BOUND WORKLOAD", [
+            "Leave a bound workload out of the filter and its hooks never run, and Kasten "
+            "may not snapshot the PVC it picked that workload for at all.",
             "",
-            "But every included workload brings in every PVC it mounts, labelled or not. "
-            "Including all the DataStage workloads added three unlabelled PVCs, one of them "
-            "owned by another CP4D service. The runtime Deployment mounts only ds-storage.",
+            "Every included workload brings in every PVC it mounts, labelled or not: on "
+            "4.8.9 that adds ds-migration and conn-home-pvc, which belongs to another CP4D "
+            "service. They are snapshotted, never restored. The 5.x folders include the "
+            "runtime Deployment only, and are exposed to the shared-volume defect.",
         ]),
         ('error_warning', "RESTORE: STOP WHAT IBM STOPS", [
             "Kasten can only replace a PVC once no pod mounts it, and it scales down only "
-            "the workloads it restores — here, just one.",
+            "the workloads it restores — the restore filter picks only the runtime "
+            "Deployment, so the restore hook runs once.",
             "",
             "So the pre-restore script parks the operator, then scales down the three "
             "selectors IBM's own restore ConfigMap lists. After the restore, the operator "
@@ -155,36 +188,34 @@ d.cards(
 
 d.table_slide(
     "Versions and blueprint actions",
-    "The sync runs last, so nothing can dirty the page cache after it",
+    "4.8: one hook per DataStage workload; the lock decides which one does the work",
     ["Action", "What it does"],
     [
         ("backupPrehook",
-         "Runs IBM's precheck: the DataStage CR and every PXRuntime CR must report "
-         "dsStatus == Completed, or the backup fails before anything is captured. "
-         "Discovers every running pod mounting a PVC in the backup, warns if the label "
-         "matches nothing and names any labelled PVC no pod mounts, warns if a job run "
-         "is in flight, takes IBM's backup lock in the flows pod, then runs sync in "
-         "each pod — last."),
+         "Takes or follows the lock. The leader waits for dsStatus == Completed, enters "
+         "maintenance mode (IBM's enable-maint) and waits for InMaintenance, finds every "
+         "running pod mounting a labelled engine PVC, warns about gaps and jobs in "
+         "flight, runs sync in each pod — last — and marks the lock ready. Followers wait "
+         "for that, or exit at once if this backup's volumes are already captured."),
         ("backupPosthook",
-         "Releases IBM's backup lock once the snapshots exist. Idempotent. If the "
-         "flows pod is gone it only warns: flows deletes a lock older than 4 hours."),
+         "Checks this backup's snapshot of every labelled PVC. Taken before the quiesce: "
+         "fails the backup. Not all taken yet: exits without waiting. All taken: leaves "
+         "maintenance mode (disable-maint), marks the lock released, waits for Completed."),
         ("restorePosthook",
          "Sets spec.ignoreForMaintenance: false on the DataStage CR and every PXRuntime "
          "CR, idempotently, then waits up to 1800 seconds for all of them to report "
          "dsStatus == Completed — so the restore does not report success while the "
-         "engine is still assembling itself. Removes the backup lock the restored "
-         "volume contains. Prints the recompile reminder."),
+         "engine is still assembling itself. Prints the recompile reminder."),
     ],
     col_widths=[2.6, 9.7],
     row_heights=[0.5, 1.6, 0.8, 1.4],
     body_size=10.5,
     cards=[
         ('file_list', "TESTED VERSIONS", [
-            "Kubernetes 1.34.9 on OpenShift 4.21.30, Kasten 9.0.7, Cloud Pak for Data "
-            "5.4.0 Patch 7, DataStage 5.4.7 (Helm chart datastage-ent 12.0.7), Common "
-            "Core Services 13.0.6, cpdctl 1.10.34, cpd-cli 14.4.0. The ConfigMaps are "
-            "versioned, and IBM did change them between 5.2.2 and 5.4.7, so read them "
-            "on your own cluster before adapting anything."]),
+            "One folder per version. 4.8.9: OpenShift 4.18.56, Kasten 9.0.8, cpd-cli "
+            "13.1.9, nfs-csi. 5.4.0 Patch 7 with DataStage 5.4.7 and 5.2.2: OpenShift "
+            "4.21.30, Kasten 9.0.7. IBM changed its backup ConfigMaps between each of "
+            "them, so read them on your own cluster before adapting anything."]),
         ('error_warning', "RESTORE PREREQUISITES", [
             "The same DataStage and CP4D version as the backup: compiled artifacts are "
             "engine-version specific, and a Data Set descriptor embeds the engine build "

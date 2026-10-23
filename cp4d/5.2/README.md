@@ -70,7 +70,7 @@ Detected on the cluster where this blueprint was developed and tested.
 | Kasten | 8.5.12 (Helm `k10-8.5.12`) |
 | Cloud Pak for Data / IBM Software Hub | 5.2.x (Watson Studio `ws` 11.2.0) |
 | cpdctl | 1.8.244 |
-| Keeper image | `ghcr.io/kastenhq/blueprint-ai/cp4d-backup:1.8.244-3` |
+| Keeper image | `ghcr.io/kastenhq/blueprint-ai/cp4d-backup:5.2-r3` (the same image as the earlier tag `1.8.244-3`) |
 
 Detect your Kasten version:
 
@@ -109,7 +109,7 @@ cpdctl config is rendered to a tmpfs path at runtime and never persisted.
 
 ```bash
 cd images/cp4d-backup
-docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:1.8.244-3 --push .
+docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:5.2-r3 --push .
 ```
 
 > Use an **immutable tag** (or `imagePullPolicy: Always`, which the pod specs already set). A reused

@@ -18,14 +18,14 @@ actions:
         name: exportAllProjects
         args:
           namespace: kasten-io          # cluster-wide Kasten SA: read cpd cred secret + manage PVCs/pods in BACKUP_NS
-          image: ghcr.io/kastenhq/blueprint-ai/cp4d-backup:1.10.34-1
+          image: ghcr.io/kastenhq/blueprint-ai/cp4d-backup:5.4-r1
           command:
             - bash
             - -c
             - |
               set -euo pipefail
               export BACKUP_NS="{{ .Namespace.Name }}"          # = cp4d-projects-backup (the namespace being backed up)
-              export IMAGE="ghcr.io/kastenhq/blueprint-ai/cp4d-backup:1.10.34-1"
+              export IMAGE="ghcr.io/kastenhq/blueprint-ai/cp4d-backup:5.4-r1"
               export STORAGE_CLASS="ocs-storagecluster-ceph-rbd" # cluster-specific CSI snapshot class (see README)
               export KEEPER_SA="cp4d-backup-keeper"
               export CRED_NS="cpd"                              # credential secret lives OUTSIDE the backed-up ns

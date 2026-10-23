@@ -9,9 +9,10 @@ FROM --platform=linux/amd64 debian:bookworm-slim
 ARG CPDCTL_VERSION=v1.8.244
 ARG KUBECTL_VERSION=v1.31.6
 
-# Image revision, bumped when the image changes without a cpdctl version change.
-# The published tag is <CPDCTL_VERSION without the leading v>-<IMAGE_REVISION>,
-# derived from these two ARGs by .github/workflows/cp4d-backup-image.yaml.
+# Image revision. Bump it on ANY change to this folder: the Dockerfile, a script, or a
+# cpdctl / kubectl version. The published tag is <CP4D version folder>-r<IMAGE_REVISION>
+# (for example 5.4-r1), set by .github/workflows/cp4d-backup-image.yaml. That workflow
+# refuses to overwrite a tag that a blueprint on main already uses.
 ARG IMAGE_REVISION=3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
