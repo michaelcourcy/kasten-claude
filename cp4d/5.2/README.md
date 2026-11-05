@@ -53,7 +53,7 @@ unit of granularity = unit of multi-tenant restore**.
   ~70% constant schema mass dedups across snapshots.
 - **Restore is decoupled from Kasten restore hooks** — a standalone [restore.sh](restore.sh) does
   the `cpdctl import`. Robust, and it fits the multi-tenant / mass-migration story.
-- **Credentials never fan out**: the CP4D API key lives in a Secret in the `cpd` namespace (NOT
+- **Credentials never fan out**: the CP4D API key lives in a Secret in the CP4D instance namespace (`cpd` by default; NOT
   the backed-up namespace), read cross-namespace by the keeper SA, and rendered into an ephemeral
   `emptyDir`/tmpfs cpdctl config — so it is never captured in any restore point.
 
@@ -100,6 +100,31 @@ helm ls -n kasten-io                 # Helm
 
 ## Prerequisites
 
+> **CP4D instance namespace — `CPD_NS`.** The CP4D instance (the namespace that holds the `cpd`
+> route, the platform Secrets and the `ZenService` CR) is called `cpd` on our test cluster. Many
+> installs use another name, for example `ibm-cpd` or `cpd-instance`. Every command in this README
+> uses the shell variable `CPD_NS` instead of a fixed name. Set it once, in the shell you use for
+> all the steps below:
+>
+> ```bash
+> oc get zenservice -A                # the NAMESPACE column is your CP4D instance namespace
+> export CPD_NS=cpd                   # replace cpd with that namespace, for example ibm-cpd
+> ```
+>
+> The blueprint and `restore.sh` cannot read your shell, so they receive the value explicitly:
+>
+> | Where | How it gets `CPD_NS` |
+> |---|---|
+> | Commands in this README | `-n "${CPD_NS}"` |
+> | [blueprint.yaml](blueprint.yaml) (`export CRED_NS="cpd"`) | [Deploy](#deploy) step 1 replaces `cpd` with `${CPD_NS}` when it applies the blueprint |
+> | [restore.sh](restore.sh) (`CRED_NS`, default `cpd`) | Run it as `CRED_NS="${CPD_NS}" ./restore.sh …` |
+>
+> If you forget one of them, the keeper or `restore.sh` looks for the credential Secret in `cpd`
+> and fails with `secrets "cp4d-backup-cpdctl-creds" not found`.
+>
+> The route is named `cpd` by default whatever the namespace is called. Only if your install uses
+> a custom route name, replace `cpd` in `oc get route cpd`.
+
 ### 1. Build the keeper image
 
 The blueprint and restore both use one self-contained image (Dockerfile committed at
@@ -116,10 +141,10 @@ docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:5.2-r3
 > mutable tag can leave stale layers cached on some nodes → `executable ... not found` errors.
 > Update the image reference in [blueprint.yaml](blueprint.yaml) and [restore.sh](restore.sh).
 
-### 2. CP4D credentials — the `cpadmin` API key in the `cpd` namespace
+### 2. CP4D credentials — the `cpadmin` API key in the CP4D instance namespace
 
 The keeper runs as the built-in administrator **`cpadmin`**. It authenticates headlessly with
-`cpadmin`'s **platform API key**, which is stored in a Secret **in `cpd`** — deliberately *outside*
+`cpadmin`'s **platform API key**, which is stored in a Secret **in the CP4D instance namespace (`CPD_NS`)** — deliberately *outside*
 the backed-up namespace, so it is never captured in a restore point.
 
 > **Why `cpadmin` and not a dedicated service user.** On Software Hub 5.2 with the Identity
@@ -183,9 +208,9 @@ All calls go to the `cpd` route. Nothing is typed by hand: the `cpadmin` credent
 the platform's own Secret.
 
 ```bash
-CPD_HOST=$(oc get route cpd -n cpd -o jsonpath='{.spec.host}')
-SVC_USER=$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_username}' | base64 -d)
-SVC_PW=$(oc  get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_password}' | base64 -d)
+CPD_HOST=$(oc get route cpd -n "${CPD_NS}" -o jsonpath='{.spec.host}')
+SVC_USER=$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n "${CPD_NS}" -o jsonpath='{.data.admin_username}' | base64 -d)
+SVC_PW=$(oc  get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n "${CPD_NS}" -o jsonpath='{.data.admin_password}' | base64 -d)
 echo "SVC_USER=${SVC_USER}"     # cpadmin
 
 # 1. Exchange username + password for a bearer token.
@@ -250,7 +275,7 @@ curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/${SVC_USER}" \
 
 # 7. Store url + username + apikey + uid for the keeper to read cross-namespace.
 #    create --dry-run | apply makes this re-runnable (it replaces an existing Secret).
-kubectl create secret generic cp4d-backup-cpdctl-creds -n cpd \
+kubectl create secret generic cp4d-backup-cpdctl-creds -n "${CPD_NS}" \
   --from-literal=url="https://${CPD_HOST}" \
   --from-literal=username="${SVC_USER}" \
   --from-literal=apikey="${APIKEY}" \
@@ -282,10 +307,10 @@ three keys (`url`, `username`, `apikey`) and runs the same two `cpdctl config` c
 
 ```bash
 ./bin/cpdctl config user set svc \
-  --username "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.username}' | base64 -d)" \
-  --apikey   "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.apikey}'   | base64 -d)"
+  --username "$(kubectl get secret cp4d-backup-cpdctl-creds -n "${CPD_NS}" -o jsonpath='{.data.username}' | base64 -d)" \
+  --apikey   "$(kubectl get secret cp4d-backup-cpdctl-creds -n "${CPD_NS}" -o jsonpath='{.data.apikey}'   | base64 -d)"
 ./bin/cpdctl config profile set svc-check \
-  --url "$(kubectl get secret cp4d-backup-cpdctl-creds -n cpd -o jsonpath='{.data.url}' | base64 -d)" --user svc
+  --url "$(kubectl get secret cp4d-backup-cpdctl-creds -n "${CPD_NS}" -o jsonpath='{.data.url}' | base64 -d)" --user svc
 ./bin/cpdctl config profile use svc-check
 ./bin/cpdctl project list          # must list EVERY project, including ones cpadmin is not a member of
 ```
@@ -355,7 +380,7 @@ If enrolment fails, the prehook aborts **before any data moves** with
 ### 3. Namespace, keeper ServiceAccount, and scoped RBAC
 
 ```bash
-kubectl apply -f - <<'EOF'
+kubectl apply -f - <<EOF          # unquoted: ${CPD_NS} must expand
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -367,10 +392,10 @@ apiVersion: v1
 kind: ServiceAccount
 metadata: { name: cp4d-backup-keeper, namespace: cp4d-projects-backup }
 ---
-# cpd: keeper SA may GET only the one credential secret (read cross-namespace, never mounted)
+# CP4D instance namespace: keeper SA may GET only the one credential secret (read cross-namespace, never mounted)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
-metadata: { name: cp4d-backup-read-creds, namespace: cpd }
+metadata: { name: cp4d-backup-read-creds, namespace: ${CPD_NS} }
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -379,7 +404,7 @@ rules:
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
-metadata: { name: cp4d-backup-read-creds, namespace: cpd }
+metadata: { name: cp4d-backup-read-creds, namespace: ${CPD_NS} }
 subjects: [ { kind: ServiceAccount, name: cp4d-backup-keeper, namespace: cp4d-projects-backup } ]
 roleRef: { kind: Role, name: cp4d-backup-read-creds, apiGroup: rbac.authorization.k8s.io }
 ---
@@ -418,8 +443,9 @@ kubectl get profile <name> -n kasten-io -o jsonpath='{.spec.type}'   # must prin
 ## Deploy
 
 ```bash
-# 1. blueprint (kasten-io)
-kubectl apply -f blueprint.yaml
+# 1. blueprint (kasten-io), with CRED_NS set to your CP4D instance namespace
+sed "s/export CRED_NS=\"cpd\"/export CRED_NS=\"${CPD_NS}\"/" blueprint.yaml | kubectl apply -f -
+kubectl get blueprint cp4d-projects-backup-bp -n kasten-io -o yaml | grep 'export CRED_NS'   # must show ${CPD_NS}
 
 # 2. policy targeting the cp4d-projects-backup namespace, wired to the action hook
 kubectl apply -f - <<'EOF'
@@ -505,10 +531,10 @@ EOF
 ### Step 2 — recreate the CP4D project from the restored PVC
 
 ```bash
-./restore.sh <namespace> <pvc> [project-name]
+CRED_NS="${CPD_NS}" ./restore.sh <namespace> <pvc> [project-name]
 
 # example:
-./restore.sh john-cp4d-restore cp4d-my-new-project-21a0ff72 "my project (restored)"
+CRED_NS="${CPD_NS}" ./restore.sh john-cp4d-restore cp4d-my-new-project-21a0ff72 "my project (restored)"
 ```
 
 - If `[project-name]` is omitted, the original name stored in the bundle is used.
@@ -516,7 +542,7 @@ EOF
   must **type the exact name to confirm** delete-and-replace (never silent).
 - Requirements on the machine running it: `kubectl` + `cpdctl` (default `./bin/cpdctl` — see
   [Get `cpdctl` on your workstation](#1-get-cpdctl-on-your-workstation); or point `CPDCTL` at your
-  own binary). It reads the CP4D credentials straight from the `cpd` Secret, so no profile setup is
+  own binary). It reads the CP4D credentials straight from the Secret in `CRED_NS`, so no profile setup is
   needed.
 
 ### Guard rail (recommended)
@@ -564,9 +590,9 @@ step is only needed for the fixture and verification commands below.
 
 ```bash
 # CP4D web URL and the bootstrap admin credentials
-oc get route cpd -n cpd -o jsonpath='https://{.spec.host}{"\n"}'
-oc get secret platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_username}' | base64 -d; echo
-oc get secret platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_password}' | base64 -d; echo
+oc get route cpd -n "${CPD_NS}" -o jsonpath='https://{.spec.host}{"\n"}'
+oc get secret platform-auth-idp-credentials -n "${CPD_NS}" -o jsonpath='{.data.admin_username}' | base64 -d; echo
+oc get secret platform-auth-idp-credentials -n "${CPD_NS}" -o jsonpath='{.data.admin_password}' | base64 -d; echo
 
 # keep the config file next to the binary and OUT of git (cp4d/bin/ is ignored)
 export CPDCONFIG=$PWD/bin/.cpdctl.config.json
@@ -687,7 +713,7 @@ Consequences:
 - **V1 (this blueprint): plaintext bundle, protected by RBAC.** `ENCRYPTION_KEY=""`. Acceptable
   under a **single backup admin** with the backup namespace locked down. The bundle PVCs and the
   namespace **must** be tightly RBAC-restricted. The CP4D API key is *not* in the bundle (it lives
-  in `cpd`, read cross-namespace, rendered to tmpfs) — only the *connection* credentials inside
+  in the CP4D instance namespace, read cross-namespace, rendered to tmpfs) — only the *connection* credentials inside
   exported projects are.
 - **Hardening / multi-tenant: encrypt.** Set `ENCRYPTION_KEY` (a managed secret) in the blueprint
   and pass the same key to `restore.sh` (`ENCRYPTION_KEY=… ./restore.sh …`). cpdctl encrypts the
@@ -791,15 +817,15 @@ kubectl delete blueprint cp4d-projects-backup-bp -n kasten-io
 kubectl delete ns cp4d-projects-backup
 kubectl delete ns john-cp4d-restore
 
-# credential secret + RBAC in cpd
-kubectl delete secret cp4d-backup-cpdctl-creds -n cpd
-kubectl delete role,rolebinding cp4d-backup-read-creds -n cpd
+# credential secret + RBAC in the CP4D instance namespace
+kubectl delete secret cp4d-backup-cpdctl-creds -n "${CPD_NS}"
+kubectl delete role,rolebinding cp4d-backup-read-creds -n "${CPD_NS}"
 
 # optional: take manage_project away from cpadmin again (removes the Backup Reader role;
 # same PUT rules as in Prerequisite 2 — the body must repeat "username")
-CPD_HOST=$(oc get route cpd -n cpd -o jsonpath='{.spec.host}')
+CPD_HOST=$(oc get route cpd -n "${CPD_NS}" -o jsonpath='{.spec.host}')
 TOKEN=$(curl -sSk -X POST "https://${CPD_HOST}/icp4d-api/v1/authorize" -H 'Content-Type: application/json' \
-  -d "{\"username\":\"cpadmin\",\"password\":\"$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n cpd -o jsonpath='{.data.admin_password}' | base64 -d)\"}" | jq -r .token)
+  -d "{\"username\":\"cpadmin\",\"password\":\"$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n "${CPD_NS}" -o jsonpath='{.data.admin_password}' | base64 -d)\"}" | jq -r .token)
 ROLE_ID=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/roles" -H "Authorization: Bearer ${TOKEN}" \
   | jq -r '.rows[] | select(.doc.role_name=="Backup Reader") | .id')
 ROLES=$(curl -sSk "https://${CPD_HOST}/usermgmt/v1/user/cpadmin" -H "Authorization: Bearer ${TOKEN}" \
