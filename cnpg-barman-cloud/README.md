@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/cnpg-barman-cloud-example). Use that one: fixes are no longer copied here.
+
 # CNPG Barman Cloud **Plugin** Blueprint (Pattern 5 — MinIO Keeper)
 
 Kasten blueprint for CloudNativePG clusters that archive WAL and base backups to a **local MinIO

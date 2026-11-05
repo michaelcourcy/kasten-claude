@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/cnpg-example). Use that one: fixes are no longer copied here.
+
 # CNPG (CloudNativePG) — Kasten Blueprint
 
 Backup and restore for [CloudNativePG](https://cloudnative-pg.io/) PostgreSQL clusters using

@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/cockroachdb-example). Use that one: fixes are no longer copied here.
+
 # CockroachDB Blueprint — Pattern 5 (local MinIO keeper)
 
 Backup and restore a [CockroachDB](https://www.cockroachlabs.com/) cluster running on Kubernetes

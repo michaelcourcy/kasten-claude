@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/cnpg-barman-example). Use that one: fixes are no longer copied here.
+
 # CNPG Barman Blueprint (Pattern 5 — MinIO Keeper)
 
 Kasten blueprint for CloudNativePG clusters that use **barman-cloud WAL archiving to a local MinIO instance**. Kasten snapshots the MinIO PVC (which contains the full barman archive), enabling Point-In-Time Recovery (PITR) from any Kasten restore point.

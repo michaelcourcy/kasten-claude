@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/cass-operator-example/consistency-perf-test). Use that one: fixes are no longer copied here.
+
 # Consistency test under heavy load
 
 This test answers one question: **if Kasten backs up the Cassandra datacenter while the cluster is

@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/cp4d-example). Use that one: fixes are no longer copied here.
+
 # CP4D artifact-level backup with Kasten
 
 Back up **Cloud Pak for Data analytics projects** (notebooks, jobs, data assets, connections) at the

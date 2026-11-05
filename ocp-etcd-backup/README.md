@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/ocp-etcd-backup-example). Use that one: fixes are no longer copied here.
+
 # OpenShift etcd backup with Kasten — permanent keeper PVC
 
 Back up an **OpenShift control-plane etcd** with Kasten, writing the etcd snapshot

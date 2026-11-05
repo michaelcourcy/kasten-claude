@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/aerospike-abs-example). Use that one: fixes are no longer copied here.
+
 # Aerospike — partitioned, incremental logical backup on keeper PVCs with `absctl`
 
 Kasten blueprint for Aerospike Enterprise clusters managed by the Aerospike Kubernetes Operator

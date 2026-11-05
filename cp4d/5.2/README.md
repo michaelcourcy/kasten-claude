@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/cp4d-example/5.2). Use that one: fixes are no longer copied here.
+
 # CP4D artifact-level backup with Kasten
 
 > **CP4D 5.2.** This is the 5.2 version of the blueprint. Other versions are listed in [../README.md](../README.md). This folder is the revision last validated on 5.2 (the content of the `cp4d-5.2` git tag, with links adjusted to this layout); later improvements made on 5.4 are not carried back.

@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/images/kasten-tools). Use that one: fixes are no longer copied here.
+
 # kasten-tools — shared tool image
 
 `michaelcourcy/kasten-tools` is Kasten's standard `gcr.io/kasten-images/kanister-tools`

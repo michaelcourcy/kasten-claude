@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/sts-echo-example). Use that one: fixes are no longer copied here.
+
 # ConfigMap Echo Blueprint
 
 Minimal demo blueprint that echoes every label key/value pair from a StatefulSet during `backupPrehook`, using a Go template range loop over `.Object.metadata.labels`.

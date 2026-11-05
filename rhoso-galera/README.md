@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/rhoso-galera-example). Use that one: fixes are no longer copied here.
+
 # RHOSO Galera — Kasten blueprint (Pattern 4: dump on a permanent Keeper PVC)
 
 > ⚠️ **NOT YET VALIDATED.** This blueprint was built by speculation from the Red Hat

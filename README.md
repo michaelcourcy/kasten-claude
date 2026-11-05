@@ -1,3 +1,5 @@
+> **This repository is no longer maintained.** The blueprints have moved to [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai). Use that repository: fixes and new blueprints are no longer copied here.
+
 # Goal 
 
 Generate Kasten blueprint with Claude Code 

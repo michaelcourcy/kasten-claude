@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/db2u-maximo-example). Use that one: fixes are no longer copied here.
+
 # DB2u / IBM Maximo — Kasten Blueprint
 
 Kasten blueprint for backing up and restoring IBM DB2 running under the DB2u operator inside an

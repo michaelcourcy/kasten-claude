@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/edb-example). Use that one: fixes are no longer copied here.
+
 # EDB Postgres for Kubernetes — Kasten Blueprint
 
 Backup and restore for **EDB Postgres for Kubernetes** clusters

@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/grafana-mimir-example). Use that one: fixes are no longer copied here.
+
 # Grafana Mimir — Kasten Blueprint
 
 Backup and restore [Grafana Mimir](https://grafana.com/docs/mimir/latest/) deployed with the

@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/mysql-bitnami-standalone-example). Use that one: fixes are no longer copied here.
+
 # Kasten Blueprint — Bitnami MySQL (standalone)
 
 Application-consistent backup/restore for **MySQL deployed with the Bitnami Helm chart** in

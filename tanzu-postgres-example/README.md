@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/tanzu-postgres-example). Use that one: fixes are no longer copied here.
+
 # VMware Tanzu for Postgres on Kubernetes — Blueprint (Pattern 5, MinIO keeper)
 
 Kasten blueprint for [VMware Tanzu for Postgres on Kubernetes 4.5](https://techdocs.broadcom.com/us/en/vmware-tanzu/data-solutions/tanzu-for-postgres-on-kubernetes/4-5/tnz-postgres-k8s/index.html)

@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/psmdb-percona-operator-pbm-example). Use that one: fixes are no longer copied here.
+
 # PSMDB pbm Blueprint (Pattern 5 — MinIO Keeper)
 
 Kasten blueprint for **sharded** Percona Server for MongoDB (PSMDB) clusters that use

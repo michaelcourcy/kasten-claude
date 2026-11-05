@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/ocp-etcd-backup-hosted-control-plane-example). Use that one: fixes are no longer copied here.
+
 # Hosted Control Plane (HCP) fleet etcd backup with Kasten — one keeper, all guests
 
 Back up the **etcd of every hosted (guest) OpenShift cluster** — HyperShift / MCE

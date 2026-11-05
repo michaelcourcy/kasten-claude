@@ -1,3 +1,5 @@
+> **This copy is no longer maintained.** The maintained version is in [kastenhq/blueprint-ai](https://github.com/kastenhq/blueprint-ai/tree/main/datastage-example/4.8). Use that one: fixes are no longer copied here.
+
 # DataStage on Cloud Pak for Data — engine-state protection with Kasten
 
 > **CP4D 4.8.** This is the 4.8 version of the blueprint. Other versions are listed in [../README.md](../README.md).
