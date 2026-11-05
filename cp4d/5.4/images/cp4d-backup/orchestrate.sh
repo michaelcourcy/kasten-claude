@@ -165,6 +165,8 @@ spec:
         - { name: PID,            value: "${pid}" }
         - { name: PROJECT_NAME,   value: "${name}" }
         - { name: ENCRYPTION_KEY, value: "${ENCRYPTION_KEY}" }
+        - { name: CRED_NS,        value: "${CRED_NS}" }       # else cpdctl-login.sh falls back to "cpd"
+        - { name: CRED_SECRET,    value: "${CRED_SECRET}" }
       volumeMounts: [ { name: backup, mountPath: /backup } ]
   volumes:
     - name: backup

@@ -74,7 +74,7 @@ revision validated on CP4D 5.2 is the git tag [`cp4d-5.2`](https://github.com/ka
 | Cloud Pak for Data / IBM Software Hub | 5.4.0 Patch 7 (`ibmcpd-cr` 5.10.7, Watson Studio `ws` 13.0.4, Common Core Services 13.0.6) |
 | cpdctl | 1.10.34 |
 | kubectl (in the keeper image) | 1.34.9 |
-| Keeper image | `ghcr.io/kastenhq/blueprint-ai/cp4d-backup:5.4-r1` (the same image as the earlier tag `1.10.34-1`) |
+| Keeper image | `ghcr.io/kastenhq/blueprint-ai/cp4d-backup:5.4-r2` (built from [images/cp4d-backup/](images/cp4d-backup/); `-r1` and earlier did not pass `CRED_NS` / `CRED_SECRET` to the export pods, so they read the credential Secret from `cpd` whatever the blueprint set) |
 
 Detect your Kasten version:
 
@@ -138,7 +138,7 @@ cpdctl config is rendered to a tmpfs path at runtime and never persisted.
 
 ```bash
 cd images/cp4d-backup
-docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:5.4-r1 --push .
+docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:5.4-r2 --push .
 ```
 
 > Use an **immutable tag** (or `imagePullPolicy: Always`, which the pod specs already set). A reused

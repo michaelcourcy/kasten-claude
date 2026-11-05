@@ -13,7 +13,7 @@ ARG KUBECTL_VERSION=v1.31.6
 # cpdctl / kubectl version. The published tag is <CP4D version folder>-r<IMAGE_REVISION>
 # (for example 5.4-r1), set by .github/workflows/cp4d-backup-image.yaml. That workflow
 # refuses to overwrite a tag that a blueprint on main already uses.
-ARG IMAGE_REVISION=3
+ARG IMAGE_REVISION=4
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl jq unzip bash tar gzip \

@@ -74,7 +74,7 @@ Detected on the cluster where this blueprint was tested (2026-10-22).
 | Cloud Pak for Data | 4.8.9 (`ibmcpd-cr` 4.8.9, Zen 5.1.15, Watson Studio `ws` 8.9.0, Common Core Services 8.9.0) |
 | cpdctl | 1.10.34 |
 | kubectl (in the keeper image) | 1.34.9 |
-| Keeper image | `ghcr.io/kastenhq/blueprint-ai/cp4d-backup:4.8-r1` (built from [images/cp4d-backup/](images/cp4d-backup/); the same image as the earlier tag `1.10.34-1`, which was built from the identical 5.4 folder) |
+| Keeper image | `ghcr.io/kastenhq/blueprint-ai/cp4d-backup:4.8-r2` (built from [images/cp4d-backup/](images/cp4d-backup/); `-r1` and earlier did not pass `CRED_NS` / `CRED_SECRET` to the export pods, so they read the credential Secret from `cpd` whatever the blueprint set) |
 
 > **CP4D 4.8 is out of IBM support** (end of support 31 July 2025). OpenShift 4.17 and 4.18 are
 > supported only from the 4.8.9 refresh.
@@ -141,7 +141,7 @@ cpdctl config is rendered to a tmpfs path at runtime and never persisted.
 
 ```bash
 cd images/cp4d-backup
-docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:4.8-r1 --push .
+docker buildx build --platform linux/amd64 -t <your-registry>/cp4d-backup:4.8-r2 --push .
 ```
 
 > Use an **immutable tag** (or `imagePullPolicy: Always`, which the pod specs already set). A reused
